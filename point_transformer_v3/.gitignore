@@ -1,0 +1,9 @@
+*.json
+*.txt
+*.log
+*.nsys-rep
+../panoptic_segmentation/ptv3
+/tests/fvdb-test-data
+!requirements.txt
+/tests
+/data
