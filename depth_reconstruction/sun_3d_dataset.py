@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 
-import imageio.v3 as imageio
+import cv2
 import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
@@ -84,8 +84,8 @@ class Sun3dDataset(Dataset):
 
         # Load the raw data
         frame_name = self._frame_names[index]
-        rgb_np = imageio.imread(os.path.join(self._sequence_path, f"{frame_name}.color.png"))
-        depth_np = imageio.imread(os.path.join(self._sequence_path, f"{frame_name}.depth.png"))
+        rgb_np = cv2.imread(os.path.join(self._sequence_path, f"{frame_name}.color.png"))
+        depth_np = cv2.imread(os.path.join(self._sequence_path, f"{frame_name}.depth.png"), cv2.IMREAD_UNCHANGED)
         pose_np = np.loadtxt(os.path.join(self._sequence_path, f"{frame_name}.pose.txt"))
 
         # Color
