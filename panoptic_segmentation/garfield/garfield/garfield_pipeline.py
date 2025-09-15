@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 import typing
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Type

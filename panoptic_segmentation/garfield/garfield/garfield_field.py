@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type

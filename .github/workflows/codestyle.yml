@@ -31,7 +31,6 @@ jobs:
     - uses: actions/checkout@v4
     - uses: DoozyX/clang-format-lint-action@v0.18.2
       with:
-        source: 'src/'
         extensions: 'h,cpp,cc,cu,cuh'
         clangFormatVersion: 18
         style: file
@@ -42,8 +41,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - uses: swahtz/include-guards-check-action@master
-      with:
-        path: 'src/'
 
   check-spdx-identifiers:
     name: Check SPDX identifiers
@@ -55,6 +52,7 @@ jobs:
       with:
         licenses: |-
           Apache-2.0
+          MIT
 
   # Search the git repository for any trailing spaces excluding auto-generated wlt files
   # NOTE: Migrated from openvdb whitespace.yml

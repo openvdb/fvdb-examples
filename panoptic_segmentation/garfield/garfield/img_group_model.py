@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 """
 Quick wrapper for Segment Anything Model
 """

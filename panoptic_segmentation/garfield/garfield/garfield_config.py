@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 from garfield.garfield_datamanager import GarfieldDataManagerConfig
 from garfield.garfield_field import GarfieldFieldConfig
 from garfield.garfield_gaussian_pipeline import GarfieldGaussianPipelineConfig

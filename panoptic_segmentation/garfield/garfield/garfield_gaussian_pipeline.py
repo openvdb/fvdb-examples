@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 import time
 import typing
 from dataclasses import dataclass, field

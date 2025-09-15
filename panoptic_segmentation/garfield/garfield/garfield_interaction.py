@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 """Helper functions for interacting/visualization with GARField model."""
 
 from typing import List, Optional, Tuple, Union

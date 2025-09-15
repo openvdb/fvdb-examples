@@ -1,3 +1,6 @@
+# Copyright UC Berkeley
+# SPDX-License-Identifier: MIT
+#
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Mapping, Tuple, Type
