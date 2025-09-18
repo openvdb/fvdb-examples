@@ -200,92 +200,133 @@ class PTV3_Attention(torch.nn.Module):
         qkv = self.qkv(feats_j)  # (num_voxels, 3 * hidden_size)
 
         if self.sliding_window_attention and self.patch_size > 0:
-            # Perform sliding window attention using flash attention
+            # Perform sliding window attention per-grid using flash attention
             num_voxels = feats_j.shape[0]
-            qkv = qkv.view(1, num_voxels, 3, self.num_heads, self.head_dim)  # (1, num_voxels, 3, num_heads, head_dim)
-
-            window_size = (self.patch_size // 2, self.patch_size // 2)
-
-            feats_out_j = flash_attn.flash_attn_qkvpacked_func(
-                qkv.half(), dropout_p=0.0, softmax_scale=1.0, window_size=window_size
-            ).reshape(num_voxels, self.hidden_size)
+            H = self.num_heads
+            D = self.head_dim
+            offsets = feats.joffsets.to(device=qkv.device, dtype=torch.int64)
+            outputs = []
+            for b in range(offsets.numel() - 1):
+                start = int(offsets[b].item())
+                end = int(offsets[b + 1].item())
+                Li = end - start
+                if Li <= 0:
+                    continue
+                qkv_b = qkv[start:end].view(1, Li, 3, H, D)
+                window_size = (self.patch_size // 2, self.patch_size // 2)
+                out_b = flash_attn.flash_attn_qkvpacked_func(
+                    qkv_b.half(), dropout_p=0.0, softmax_scale=1.0, window_size=window_size
+                ).reshape(Li, self.hidden_size)
+                outputs.append(out_b)
+            if len(outputs) == 0:
+                feats_out_j = torch.empty_like(qkv[:, : self.hidden_size])
+            else:
+                feats_out_j = torch.cat(outputs, dim=0)
 
             feats_out_j = feats_out_j.to(feats_j.dtype)
 
         elif self.patch_size > 0:
-            # Perform attention within each patch_size window.
+            # Perform attention within each patch_size window per-grid using varlen API
             num_voxels = feats_j.shape[0]
-            qkv = qkv.view(-1, 3, self.num_heads, self.head_dim)  # (num_voxels, 3, num_heads, head_dim)
-            cu_seqlens = torch.cat(
-                [
-                    torch.arange(0, num_voxels, self.patch_size, device=qkv.device, dtype=torch.int32),
-                    torch.tensor([num_voxels], device=qkv.device, dtype=torch.int32),
-                ]
-            )
+            H = self.num_heads
+            D = self.head_dim
+            qkv = qkv.view(-1, 3, H, D)  # (num_voxels, 3, num_heads, head_dim)
 
-            feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half(), cu_seqlens, max_seqlen=self.patch_size, dropout_p=0.0, softmax_scale=1.0
-            ).reshape(num_voxels, self.hidden_size)
+            # Build cu_seqlens as concatenation of per-grid patches so we never cross grid boundaries
+            offsets = feats.joffsets.to(device=qkv.device, dtype=torch.int64)
+            lengths = []
+            for b in range(offsets.numel() - 1):
+                start = int(offsets[b].item())
+                end = int(offsets[b + 1].item())
+                Li = end - start
+                if Li <= 0:
+                    continue
+                full = Li // self.patch_size
+                rem = Li % self.patch_size
+                if full > 0:
+                    lengths.extend([self.patch_size] * full)
+                if rem > 0:
+                    lengths.append(rem)
+            if len(lengths) == 0:
+                feats_out_j = torch.empty((0, self.hidden_size), device=qkv.device, dtype=feats_j.dtype)
+            else:
+                cu_seqlens = torch.zeros(len(lengths) + 1, device=qkv.device, dtype=torch.int32)
+                cu_seqlens[1:] = torch.as_tensor(lengths, device=qkv.device, dtype=torch.int32).cumsum(dim=0)
 
-            if self.cross_patch_attention:
-                num_complete_patches = num_voxels // self.patch_size
-                remaining_voxels = num_voxels % self.patch_size
+                feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
+                    qkv.half(), cu_seqlens, max_seqlen=self.patch_size, dropout_p=0.0, softmax_scale=1.0
+                ).reshape(num_voxels, self.hidden_size)
 
-                if num_complete_patches > 1:  # Only do cross-patch if we have multiple patches
-                    complete_voxels = num_complete_patches * self.patch_size
-                    qkv_complete = qkv[:complete_voxels]  # (complete_voxels, 3, num_heads, head_dim)
+                if self.cross_patch_attention:
+                    # Apply cross-patch attention per-grid and add to feats_out_j
+                    add_buf = torch.zeros_like(feats_out_j)
+                    for b in range(offsets.numel() - 1):
+                        start = int(offsets[b].item())
+                        end = int(offsets[b + 1].item())
+                        Li = end - start
+                        if Li <= 0:
+                            continue
+                        num_complete_patches = Li // self.patch_size
+                        remaining_voxels = Li % self.patch_size
 
-                    qkv_patches = qkv_complete.view(
-                        num_complete_patches, self.patch_size, 3, self.num_heads, self.head_dim
-                    )
+                        qkv_b = qkv[start:end]  # (Li, 3, H, D)
+                        if num_complete_patches > 0:
+                            complete_voxels = num_complete_patches * self.patch_size
+                            qkv_complete = qkv_b[:complete_voxels]
+                            qkv_patches = qkv_complete.view(num_complete_patches, self.patch_size, 3, H, D)
+                            if self.cross_patch_pooling == "mean":
+                                qkv_pooled = qkv_patches.mean(dim=1)
+                            elif self.cross_patch_pooling == "max":
+                                qkv_pooled = qkv_patches.max(dim=1)[0]
+                            else:
+                                raise ValueError(f"Unsupported pooling method: {self.cross_patch_pooling}")
+                        else:
+                            qkv_pooled = None
+                            complete_voxels = 0
 
-                    if self.cross_patch_pooling == "mean":
-                        qkv_pooled = qkv_patches.mean(dim=1)  # (num_complete_patches, 3, num_heads, head_dim)
-                    elif self.cross_patch_pooling == "max":
-                        qkv_pooled = qkv_patches.max(dim=1)[0]  # (num_complete_patches, 3, num_heads, head_dim)
-                    else:
-                        raise ValueError(f"Unsupported pooling method: {self.cross_patch_pooling}")
-
-                    if remaining_voxels > 0:
-                        qkv_remaining = qkv[complete_voxels:]  # (remaining_voxels, 3, num_heads, head_dim)
-                        if self.cross_patch_pooling == "mean":
-                            qkv_remaining_pooled = qkv_remaining.mean(
-                                dim=0, keepdim=True
-                            )  # (1, 3, num_heads, head_dim)
-                        else:  # max pooling
-                            qkv_remaining_pooled = qkv_remaining.max(dim=0, keepdim=True)[
-                                0
-                            ]  # (1, 3, num_heads, head_dim)
-                        qkv_pooled = torch.cat(
-                            [qkv_pooled, qkv_remaining_pooled], dim=0
-                        )  # (num_complete_patches + 1, 3, num_heads, head_dim)
-                        num_total_patches = num_complete_patches + 1
-                    else:
                         num_total_patches = num_complete_patches
+                        if remaining_voxels > 0:
+                            qkv_remaining = qkv_b[complete_voxels:]
+                            if self.cross_patch_pooling == "mean":
+                                qkv_remaining_pooled = qkv_remaining.mean(dim=0, keepdim=True)
+                            else:
+                                qkv_remaining_pooled = qkv_remaining.max(dim=0, keepdim=True)[0]
+                            qkv_pooled = (
+                                qkv_remaining_pooled
+                                if qkv_pooled is None
+                                else torch.cat([qkv_pooled, qkv_remaining_pooled], dim=0)
+                            )
+                            num_total_patches += 1
 
-                    qkv_pooled_unsqueezed = qkv_pooled.unsqueeze(0)
-                    cross_attn_out = flash_attn.flash_attn_qkvpacked_func(
-                        qkv_pooled_unsqueezed.half(), dropout_p=0.0, softmax_scale=1.0
-                    ).reshape(num_total_patches, self.hidden_size)
+                        if num_total_patches > 0:
+                            # qkv_pooled must be defined here because num_total_patches > 0
+                            assert qkv_pooled is not None
+                            cross_attn_out = flash_attn.flash_attn_qkvpacked_func(
+                                qkv_pooled.unsqueeze(0).half(), dropout_p=0.0, softmax_scale=1.0
+                            ).reshape(num_total_patches, self.hidden_size)
 
-                    cross_attn_complete = cross_attn_out[:num_complete_patches]
-                    cross_attn_expanded = cross_attn_complete.unsqueeze(1).expand(
-                        -1, self.patch_size, -1
-                    )  # (num_complete_patches, patch_size, hidden_size)
-                    cross_attn_flat = cross_attn_expanded.reshape(
-                        complete_voxels, self.hidden_size
-                    )  # (complete_voxels, hidden_size)
+                            cross_attn_all_b = torch.zeros(
+                                (Li, self.hidden_size), device=qkv.device, dtype=cross_attn_out.dtype
+                            )
+                            if num_complete_patches > 0:
+                                cross_attn_complete = cross_attn_out[:num_complete_patches]
+                                cross_attn_expanded = cross_attn_complete.unsqueeze(1).expand(-1, self.patch_size, -1)
+                                cross_attn_flat = cross_attn_expanded.reshape(complete_voxels, self.hidden_size)
+                                cross_attn_all_b[:complete_voxels] = cross_attn_flat
+                            if remaining_voxels > 0:
+                                cross_attn_all_b[complete_voxels:] = (
+                                    cross_attn_out[-1].unsqueeze(0).expand(remaining_voxels, -1)
+                                )
 
-                    cross_attn_all = torch.zeros_like(feats_out_j)
-                    cross_attn_all[:complete_voxels] = cross_attn_flat.to(feats_out_j.dtype)
-                    if remaining_voxels > 0:
-                        cross_attn_all[complete_voxels:] = cross_attn_out[-1].unsqueeze(0).expand(remaining_voxels, -1)
+                            add_buf[start:end] = cross_attn_all_b.to(add_buf.dtype)
 
-                    feats_out_j = feats_out_j + cross_attn_all
-
-            feats_out_j = feats_out_j.to(feats_j.dtype)
+                    # Apply cross-patch addition across the whole batch
+                    feats_out_j = (feats_out_j + add_buf.to(feats_out_j.dtype)).to(feats_j.dtype)
         else:
-            assert False, "Only sliding window attention and patch attention are supported now. "
+            feats_out_j = qkv[:, : self.hidden_size].contiguous()
+
+        # Ensure dtype matches original features before linear projection
+        feats_out_j = feats_out_j.to(feats_j.dtype)
 
         feats_out_j = self.proj(feats_out_j)
         feats_out_j = self.drop(feats_out_j)
@@ -524,30 +565,34 @@ class PTV3(torch.nn.Module):
             sliding_window_attention and cross_patch_attention
         ), "sliding_window_attention and cross_patch_attention should not be used together."
 
-        self.embedding = PTV3_Embedding(input_dim, enc_channels[0])
+        if len(enc_channels) > 0:
+            self.embedding = PTV3_Embedding(input_dim, enc_channels[0])
+        else:
+            self.embedding = None
 
         self.num_stages = len(enc_depths)
-        self.enc = torch.nn.ModuleList()
-        enc_drop_path = [x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))]
-        for i in range(self.num_stages):
-            if i > 0:
+        if self.num_stages > 0:
+            self.enc = torch.nn.ModuleList()
+            enc_drop_path = [x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))]
+            for i in range(self.num_stages):
+                if i > 0:
+                    self.enc.append(
+                        PTV3_Pooling(kernel_size=2, in_channels=enc_channels[i - 1], out_channels=enc_channels[i])
+                    )
                 self.enc.append(
-                    PTV3_Pooling(kernel_size=2, in_channels=enc_channels[i - 1], out_channels=enc_channels[i])
+                    PTV3_Encoder(
+                        enc_channels[i],
+                        enc_depths[i],
+                        enc_num_heads[i],
+                        enc_drop_path[sum(enc_depths[:i]) : sum(enc_depths[: i + 1])],
+                        proj_drop,
+                        patch_size,
+                        no_conv_in_cpe,
+                        cross_patch_attention,
+                        cross_patch_pooling,
+                        sliding_window_attention,
+                    )
                 )
-            self.enc.append(
-                PTV3_Encoder(
-                    enc_channels[i],
-                    enc_depths[i],
-                    enc_num_heads[i],
-                    enc_drop_path[sum(enc_depths[:i]) : sum(enc_depths[: i + 1])],
-                    proj_drop,
-                    patch_size,
-                    no_conv_in_cpe,
-                    cross_patch_attention,
-                    cross_patch_pooling,
-                    sliding_window_attention,
-                )
-            )
 
         # create decoder
         self.num_dec_stages = len(dec_depths)
@@ -590,6 +635,9 @@ class PTV3(torch.nn.Module):
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Forward")
+
+        if self.embedding is None:
+            return grid, feats
 
         grid, feats = self.embedding(grid, feats)
 

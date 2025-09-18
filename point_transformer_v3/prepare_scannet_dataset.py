@@ -274,12 +274,12 @@ def main():
     parser = argparse.ArgumentParser(description="Export ScanNet dataset samples")
     parser.add_argument("--data-root", required=True, help="ScanNet dataset root directory")
     parser.add_argument("--output", required=True, help="Output JSON file path")
-    parser.add_argument("--num-samples", type=int, default=10, help="Number of samples to export")
+    parser.add_argument("--num-samples", type=int, default=16, help="Number of samples to export")
     parser.add_argument("--split", default="train", choices=["train", "val", "test"], help="Dataset split to use")
-    parser.add_argument("--min-points", type=int, default=2048, help="Minimum points per sample")
-    parser.add_argument("--max-points", type=int, default=4096, help="Maximum points per sample")
-    parser.add_argument("--patch-size", type=int, default=0, help="Maximum points per sample")
-    parser.add_argument("--voxel-size", type=float, default=0.1, help="Voxel size for grid sampling")
+    parser.add_argument("--min-points", type=int, default=50000, help="Minimum points per sample")
+    parser.add_argument("--max-points", type=int, default=100000, help="Maximum points per sample")
+    parser.add_argument("--patch-size", type=int, default=1024, help="Maximum points per sample")
+    parser.add_argument("--voxel-size", type=float, default=0.02, help="Voxel size for grid sampling")
 
     args = parser.parse_args()
 
@@ -305,7 +305,8 @@ if __name__ == "__main__":
     main()
 
 # Create scannet_samples_small.json
-# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output tests/data/scannet_samples_small.json --num-samples 3 --split train --min-points 2048 --max-points 4096 --voxel-size 0.1 --patch-size 1024
+# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output data/scannet_samples_small.json --num-samples 8 --split train --min-points 2048 --max-points 4096 --voxel-size 0.1 --patch-size 1024
 
 # Create scannet_samples_large.json
-# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output tests/data/scannet_samples_large.json --num-samples 3 --split train --min-points 50000 --max-points 100000 --voxel-size 0.02 --patch-size 1024
+# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output data/scannet_samples_large.json --num-samples 4 --split train --min-points 50000 --max-points 100000 --voxel-size 0.02 --patch-size 1024
+
