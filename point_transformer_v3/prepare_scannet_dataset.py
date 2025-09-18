@@ -309,4 +309,3 @@ if __name__ == "__main__":
 
 # Create scannet_samples_large.json
 # python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output data/scannet_samples_large.json --num-samples 4 --split train --min-points 50000 --max-points 100000 --voxel-size 0.02 --patch-size 1024
-
