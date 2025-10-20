@@ -1,7 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union, List
 
 # Add NVTX import for profiling
 import flash_attn
@@ -9,6 +9,7 @@ import torch
 import torch.nn
 import torch.nn.functional as F
 from timm.layers import DropPath
+from functools import partial
 
 import fvdb
 
@@ -34,22 +35,60 @@ class PTV3_Embedding(torch.nn.Module):
     PTV3_Embedding for 3D point cloud embedding.
     """
 
-    def __init__(self, in_channels, embed_channels):
+    def __init__(self, in_channels, embed_channels, norm_layer_module: torch.nn.Module = torch.nn.LayerNorm, embedding_mode: str = "linear"):
         """
         Args:
             in_channels (int): Number of channels in the input features.
             embed_channels (int): Number of channels in the output features.
+            norm_layer_module (torch.nn.Module): Normalization layer module.
+            embedding_mode (str): Mode for the embedding layer, "linear" or "conv3x3", "conv5x5".
         """
         super().__init__()
-        self.linear = torch.nn.Linear(in_channels, embed_channels)
-        self.norm = torch.nn.LayerNorm(embed_channels)
+        self.embedding_mode = embedding_mode
+        if embedding_mode == "linear":
+            self.embed = torch.nn.Linear(in_channels, embed_channels)
+        elif embedding_mode == "conv3x3":
+            # use fvdb's convolution
+            self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=3, stride=1, bias=False)            
+        elif embedding_mode == "conv5x5":
+            # version 1: 3x3 + 3x3
+            # Total Params: 27 × in_channels × embed_channels + 27 × embed_channels^2
+            self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=3, stride=1, bias=False)
+            self.embed_conv3x3_2 = fvdb.nn.SparseConv3d(embed_channels, embed_channels, kernel_size=3, stride=1, bias=False)
+            # version 2: 5x5 (unsupported yet)
+            # Total Params: 125 × in_channels × embed_channels
+            # self.embed_conv5x5_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=5, stride=1)
+        else:
+            raise ValueError(f"Unsupported embedding mode: {embedding_mode}")
+        self.norm_layer = norm_layer_module(embed_channels)
         self.act_layer = torch.nn.GELU()
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Embedding")
-        jfeats = feats.jdata
-        jfeats = self.linear(jfeats)
-        jfeats = self.norm(jfeats)
+        
+        # Initialize kmap if not present
+        if not hasattr(grid, "kmap"):
+            grid.kmap = None
+        
+        if self.embedding_mode == "linear":
+            jfeats = feats.jdata
+            jfeats = self.embed(jfeats)
+        elif self.embedding_mode == "conv3x3":
+            # Use fvdb convolution with kmap handling
+            grid, feats, out_kmap = self.embed_conv3x3_1._dispatch_conv(feats, grid, grid.kmap, grid)
+            grid.kmap = out_kmap  # update the kmap
+            jfeats = feats.jdata
+            # There is no bias in the convolution-based embedding layer. 
+        elif self.embedding_mode == "conv5x5":
+            # First 3x3 convolution
+            grid, feats, out_kmap = self.embed_conv3x3_1._dispatch_conv(feats, grid, grid.kmap, grid)
+            grid.kmap = out_kmap  # update the kmap
+            # Second 3x3 convolution
+            grid, feats, out_kmap = self.embed_conv3x3_2._dispatch_conv(feats, grid, grid.kmap, grid)
+            grid.kmap = out_kmap  # update the kmap
+            jfeats = feats.jdata
+
+        jfeats = self.norm_layer(jfeats)
         jfeats = self.act_layer(jfeats)
 
         feats = feats.jagged_like(jfeats)
@@ -58,7 +97,7 @@ class PTV3_Embedding(torch.nn.Module):
 
 
 class PTV3_Pooling(torch.nn.Module):
-    def __init__(self, kernel_size: int = 2, in_channels: int = 64, out_channels: int = 64):
+    def __init__(self, kernel_size: int = 2, in_channels: int = 64, out_channels: int = 64, norm_layer_module: torch.nn.Module = torch.nn.LayerNorm):
         """
         Args:
             kernel_size (int): Kernel size for the pooling operation.
@@ -68,7 +107,7 @@ class PTV3_Pooling(torch.nn.Module):
         super().__init__()
         self.kernel_size = kernel_size
         self.proj = torch.nn.Linear(in_channels, out_channels)
-        self.ln_layer = torch.nn.LayerNorm(out_channels)
+        self.norm_layer = norm_layer_module(out_channels)
         self.act_layer = torch.nn.GELU()
 
     def forward(self, grid, feats):
@@ -78,7 +117,7 @@ class PTV3_Pooling(torch.nn.Module):
 
         ds_feature, ds_grid = grid.max_pool(self.kernel_size, feats, stride=self.kernel_size, coarse_grid=None)
         ds_feature_j = ds_feature.jdata
-        ds_feature_j = self.ln_layer(ds_feature_j)
+        ds_feature_j = self.norm_layer(ds_feature_j)
         ds_feature_j = self.act_layer(ds_feature_j)
         ds_feature = ds_feature.jagged_like(ds_feature_j)
         nvtx.range_pop()
@@ -87,7 +126,7 @@ class PTV3_Pooling(torch.nn.Module):
 
 
 class PTV3_Unpooling(torch.nn.Module):
-    def __init__(self, kernel_size: int = 2, in_channels: int = 64, out_channels: int = 64, skip_channels: int = 64):
+    def __init__(self, kernel_size: int = 2, in_channels: int = 64, out_channels: int = 64, skip_channels: int = 64, norm_layer_module: torch.nn.Module = torch.nn.LayerNorm):
         """
         Args:
             kernel_size (int): Kernel size for the pooling operation.
@@ -102,10 +141,10 @@ class PTV3_Unpooling(torch.nn.Module):
         self.out_channels = out_channels
 
         self.proj = torch.nn.Linear(in_channels, out_channels)
-        self.norm = torch.nn.LayerNorm(out_channels)
+        self.norm = norm_layer_module(out_channels)
         self.act_layer = torch.nn.GELU()
         self.proj_skip = torch.nn.Linear(skip_channels, out_channels)
-        self.norm_skip = torch.nn.LayerNorm(out_channels)
+        self.norm_skip = norm_layer_module(out_channels)
         self.act_layer_skip = torch.nn.GELU()
 
     def forward(self, grid, feats, last_grid, last_feats):
@@ -165,6 +204,7 @@ class PTV3_Attention(torch.nn.Module):
         cross_patch_attention: bool = False,
         cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
+        order_type: str = "vdb",
     ):
         """
         Args:
@@ -175,6 +215,7 @@ class PTV3_Attention(torch.nn.Module):
             cross_patch_attention (bool): Whether to use cross-patch attention.
             cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
+            order_type (str): The type of order of the points, "vdb" or "z".
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -186,16 +227,36 @@ class PTV3_Attention(torch.nn.Module):
         self.proj = torch.nn.Linear(hidden_size, hidden_size)
         self.drop = torch.nn.Dropout(proj_drop)
         self.patch_size = patch_size
-
+        self.order_type = order_type
         self.cross_patch_attention = cross_patch_attention
         self.cross_patch_pooling = cross_patch_pooling  # "mean" or "max"
 
         # Sliding window attention parameter
         self.sliding_window_attention = sliding_window_attention
 
+    def _permute(self, grid, order_type):
+        if order_type == "z":
+            return grid.permutation_morton()
+        elif order_type == "z-trans":
+            return grid.permutation_morton_zyx()
+        elif order_type == "hilbert":
+            return grid.permutation_hilbert()
+        elif order_type == "hilbert-trans":
+            return grid.permutation_hilbert_zyx()
+        else:
+            raise ValueError(f"Unsupported order type: {order_type}")
+
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Attention")
         feats_j = feats.jdata
+
+        # import pdb; pdb.set_trace()
+
+        if self.order_type != "vdb":
+            perm = self._permute(grid, self.order_type).jdata.squeeze(-1) # [num_voxels]
+            # Use torch.gather for permutation: expand perm to match feats_j dimensions
+            perm_expanded = perm.unsqueeze(-1).expand(-1, feats_j.shape[-1]) # [num_voxels, hidden_size]
+            feats_j = torch.gather(feats_j, 0, perm_expanded)
 
         qkv = self.qkv(feats_j)  # (num_voxels, 3 * hidden_size)
 
@@ -328,6 +389,12 @@ class PTV3_Attention(torch.nn.Module):
         # Ensure dtype matches original features before linear projection
         feats_out_j = feats_out_j.to(feats_j.dtype)
 
+        if self.order_type != "vdb":
+            perm_reverse = torch.empty_like(perm)
+            perm_reverse[perm] = torch.arange(perm.shape[0], device=perm.device) # [num_voxels]
+            perm_reverse_expanded = perm_reverse.unsqueeze(-1).expand(-1, feats_out_j.shape[-1]) # [num_voxels, hidden_size]
+            feats_out_j = torch.gather(feats_out_j, 0, perm_reverse_expanded)
+
         feats_out_j = self.proj(feats_out_j)
         feats_out_j = self.drop(feats_out_j)
         feats_out = grid.jagged_like(feats_out_j)
@@ -365,6 +432,7 @@ class PTV3_CPE(torch.nn.Module):
             grid.kmap = None
 
         if not self.no_conv_in_cpe:
+            # import pdb; pdb.set_trace()
             grid, out_feature, out_kmap = self.cpe[0]._dispatch_conv(feats, grid, grid.kmap, grid)
             grid.kmap = out_kmap  # update the kmap
             if self.cpe[0].bias is not None:
@@ -393,6 +461,7 @@ class PTV3_Block(torch.nn.Module):
         cross_patch_attention: bool = False,
         cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
+        order_type: str = "vdb",
     ):
         """
         Args:
@@ -405,6 +474,7 @@ class PTV3_Block(torch.nn.Module):
             cross_patch_attention (bool): Whether to use cross-patch attention.
             cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
+            order_type (str): The type of order of the points: "vdb", "z", "z-trans", "hilbert", "hilbert-trans".
         """
         super().__init__()
         # one attention and one mlp
@@ -418,8 +488,10 @@ class PTV3_Block(torch.nn.Module):
             cross_patch_attention,
             cross_patch_pooling,
             sliding_window_attention,
+            order_type,
         )
         self.norm2 = torch.nn.Sequential(torch.nn.LayerNorm(hidden_size))  # norm2.0
+        self.order_type = order_type
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else torch.nn.Identity()
 
@@ -465,6 +537,7 @@ class PTV3_Encoder(torch.nn.Module):
         cross_patch_attention: bool = False,
         cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
+        order_type: str = "vdb",
     ):
         """
         Args:
@@ -478,6 +551,7 @@ class PTV3_Encoder(torch.nn.Module):
             cross_patch_attention (bool): Whether to use cross-patch attention.
             cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
+            order_type (str): The type of order of the points, "vdb" or "z".
         """
         super().__init__()
         self.depth = depth
@@ -493,11 +567,12 @@ class PTV3_Encoder(torch.nn.Module):
                     cross_patch_attention,
                     cross_patch_pooling,
                     sliding_window_attention,
+                    order_type,
                 )
                 for i in range(depth)
             ]
         )
-
+        self.order_type = order_type
     def forward(self, grid, feats):
         for block in self.blocks:
             grid, feats = block(grid, feats)
@@ -525,10 +600,13 @@ class PTV3(torch.nn.Module):
         patch_size: int = 0,
         drop_path: float = 0.3,
         proj_drop: float = 0.0,
+        enable_batch_norm: bool = False,
+        embedding_mode: str = "linear",
         no_conv_in_cpe: bool = False,
         cross_patch_attention: bool = False,
         cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
+        order_type: Union[str, List[str]] = "vdb",
     ) -> None:
         """
         ptv3 for 3D point cloud segmentation.
@@ -546,10 +624,15 @@ class PTV3(torch.nn.Module):
             patch_size (int): Patch size for patch attention.
             drop_path (float): Drop path rate for regularization.
             proj_drop (float): Dropout rate for MLP layers.
+            enable_batch_norm (bool): Whether to use batch normalization for the embedding, down pooling, and up pooling.
+            embedding_mode (bool): the mode for the embedding layer, "linear" or "conv3x3", "conv5x5".
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             cross_patch_attention (bool): Whether to use cross-patch attention.
             cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
+            order_type (Union[str, List[str]]): The type of order of the points. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans") 
+                for all layers, or a list of strings for different layers. Each encoder and decoder stage will use 
+                order_type[i % len(order_type)] where i is the stage index.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -559,6 +642,18 @@ class PTV3(torch.nn.Module):
         self.cross_patch_attention = cross_patch_attention
         self.cross_patch_pooling = cross_patch_pooling
         self.sliding_window_attention = sliding_window_attention
+        
+        # Handle order_type: convert to list for uniform processing
+        if isinstance(order_type, str):
+            self.order_type_list = [order_type]
+        else:
+            self.order_type_list = order_type
+        self.order_type = order_type  # Keep original for backward compatibility
+
+        if not enable_batch_norm:
+            self.norm_layer = torch.nn.LayerNorm
+        else:
+            self.norm_layer = partial(torch.nn.BatchNorm1d, eps=1e-3, momentum=0.01)
 
         # sliding_window_attention and cross_patch_attention should not be used together.
         assert not (
@@ -566,7 +661,7 @@ class PTV3(torch.nn.Module):
         ), "sliding_window_attention and cross_patch_attention should not be used together."
 
         if len(enc_channels) > 0:
-            self.embedding = PTV3_Embedding(input_dim, enc_channels[0])
+            self.embedding = PTV3_Embedding(input_dim, enc_channels[0], norm_layer_module=self.norm_layer, embedding_mode=embedding_mode)
         else:
             self.embedding = None
 
@@ -577,8 +672,10 @@ class PTV3(torch.nn.Module):
             for i in range(self.num_stages):
                 if i > 0:
                     self.enc.append(
-                        PTV3_Pooling(kernel_size=2, in_channels=enc_channels[i - 1], out_channels=enc_channels[i])
+                        PTV3_Pooling(kernel_size=2, in_channels=enc_channels[i - 1], out_channels=enc_channels[i], norm_layer_module=self.norm_layer)
                     )
+                # Select order_type for this encoder stage using modulo
+                stage_order_type = self.order_type_list[i % len(self.order_type_list)]
                 self.enc.append(
                     PTV3_Encoder(
                         enc_channels[i],
@@ -591,6 +688,7 @@ class PTV3(torch.nn.Module):
                         cross_patch_attention,
                         cross_patch_pooling,
                         sliding_window_attention,
+                        stage_order_type,
                     )
                 )
 
@@ -616,8 +714,13 @@ class PTV3(torch.nn.Module):
                         in_channels=last_channels,
                         out_channels=dec_channels[i],
                         skip_channels=enc_channels[self.num_stages - 2 - i],
+                        norm_layer_module=self.norm_layer,
                     )
                 )
+                # Select order_type for this decoder stage using modulo
+                # Use reverse order for decoder (from last encoder stage backwards)
+                dec_stage_idx = self.num_stages - 1 - i
+                stage_order_type = self.order_type_list[dec_stage_idx % len(self.order_type_list)]
                 self.dec.append(
                     PTV3_Encoder(
                         dec_channels[i],
@@ -630,6 +733,7 @@ class PTV3(torch.nn.Module):
                         cross_patch_attention,
                         cross_patch_pooling,
                         sliding_window_attention,
+                        stage_order_type,
                     )
                 )
 
