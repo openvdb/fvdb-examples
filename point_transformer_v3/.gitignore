@@ -8,3 +8,4 @@ fvdb-test-data
 !requirements.txt
 /tests
 /data
+/__pycache__/

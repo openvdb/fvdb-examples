@@ -233,8 +233,6 @@ class PTV3_Attention(torch.nn.Module):
         num_heads: int,
         proj_drop: float = 0.0,
         patch_size: int = 0,
-        cross_patch_attention: bool = False,
-        cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
         order_type: str = "vdb",
     ):
@@ -244,8 +242,6 @@ class PTV3_Attention(torch.nn.Module):
             num_heads (int): Number of attention heads in each block.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
-            cross_patch_attention (bool): Whether to use cross-patch attention.
-            cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (str): The type of order of the points, "vdb" or "z".
         """
@@ -260,8 +256,6 @@ class PTV3_Attention(torch.nn.Module):
         self.drop = torch.nn.Dropout(proj_drop)
         self.patch_size = patch_size
         self.order_type = order_type
-        self.cross_patch_attention = cross_patch_attention
-        self.cross_patch_pooling = cross_patch_pooling  # "mean" or "max"
 
         # Sliding window attention parameter
         self.sliding_window_attention = sliding_window_attention
@@ -289,8 +283,6 @@ class PTV3_Attention(torch.nn.Module):
             feats_j = torch.gather(feats_j, 0, perm_expanded)
 
         qkv = self.qkv(feats_j)  # (num_voxels, 3 * hidden_size)
-
-        # TODO: only keep the sliding window attention and the default window attention.
 
         if self.sliding_window_attention and self.patch_size > 0:
             # Perform sliding window attention per-grid using flash attention
@@ -350,71 +342,7 @@ class PTV3_Attention(torch.nn.Module):
                     qkv.half(), cu_seqlens, max_seqlen=self.patch_size, dropout_p=0.0, softmax_scale=1.0
                 ).reshape(num_voxels, self.hidden_size)
 
-                if self.cross_patch_attention:
-                    # Apply cross-patch attention per-grid and add to feats_out_j
-                    add_buf = torch.zeros_like(feats_out_j)
-                    for b in range(offsets.numel() - 1):
-                        start = int(offsets[b].item())
-                        end = int(offsets[b + 1].item())
-                        Li = end - start
-                        if Li <= 0:
-                            continue
-                        num_complete_patches = Li // self.patch_size
-                        remaining_voxels = Li % self.patch_size
-
-                        qkv_b = qkv[start:end]  # (Li, 3, H, D)
-                        if num_complete_patches > 0:
-                            complete_voxels = num_complete_patches * self.patch_size
-                            qkv_complete = qkv_b[:complete_voxels]
-                            qkv_patches = qkv_complete.view(num_complete_patches, self.patch_size, 3, H, D)
-                            if self.cross_patch_pooling == "mean":
-                                qkv_pooled = qkv_patches.mean(dim=1)
-                            elif self.cross_patch_pooling == "max":
-                                qkv_pooled = qkv_patches.max(dim=1)[0]
-                            else:
-                                raise ValueError(f"Unsupported pooling method: {self.cross_patch_pooling}")
-                        else:
-                            qkv_pooled = None
-                            complete_voxels = 0
-
-                        num_total_patches = num_complete_patches
-                        if remaining_voxels > 0:
-                            qkv_remaining = qkv_b[complete_voxels:]
-                            if self.cross_patch_pooling == "mean":
-                                qkv_remaining_pooled = qkv_remaining.mean(dim=0, keepdim=True)
-                            else:
-                                qkv_remaining_pooled = qkv_remaining.max(dim=0, keepdim=True)[0]
-                            qkv_pooled = (
-                                qkv_remaining_pooled
-                                if qkv_pooled is None
-                                else torch.cat([qkv_pooled, qkv_remaining_pooled], dim=0)
-                            )
-                            num_total_patches += 1
-
-                        if num_total_patches > 0:
-                            # qkv_pooled must be defined here because num_total_patches > 0
-                            assert qkv_pooled is not None
-                            cross_attn_out = flash_attn.flash_attn_qkvpacked_func(
-                                qkv_pooled.unsqueeze(0).half(), dropout_p=0.0, softmax_scale=1.0
-                            ).reshape(num_total_patches, self.hidden_size)
-
-                            cross_attn_all_b = torch.zeros(
-                                (Li, self.hidden_size), device=qkv.device, dtype=cross_attn_out.dtype
-                            )
-                            if num_complete_patches > 0:
-                                cross_attn_complete = cross_attn_out[:num_complete_patches]
-                                cross_attn_expanded = cross_attn_complete.unsqueeze(1).expand(-1, self.patch_size, -1)
-                                cross_attn_flat = cross_attn_expanded.reshape(complete_voxels, self.hidden_size)
-                                cross_attn_all_b[:complete_voxels] = cross_attn_flat
-                            if remaining_voxels > 0:
-                                cross_attn_all_b[complete_voxels:] = (
-                                    cross_attn_out[-1].unsqueeze(0).expand(remaining_voxels, -1)
-                                )
-
-                            add_buf[start:end] = cross_attn_all_b.to(add_buf.dtype)
-
-                    # Apply cross-patch addition across the whole batch
-                    feats_out_j = (feats_out_j + add_buf.to(feats_out_j.dtype)).to(feats_j.dtype)
+                feats_out_j = feats_out_j.to(feats_j.dtype)
         else:
             feats_out_j = qkv[:, : self.hidden_size].contiguous()
 
@@ -491,8 +419,6 @@ class PTV3_Block(torch.nn.Module):
         proj_drop: float = 0.0,
         patch_size: int = 0,
         no_conv_in_cpe: bool = False,
-        cross_patch_attention: bool = False,
-        cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
         order_type: str = "vdb",
     ):
@@ -504,8 +430,6 @@ class PTV3_Block(torch.nn.Module):
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
-            cross_patch_attention (bool): Whether to use cross-patch attention.
-            cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (str): The type of order of the points: "vdb", "z", "z-trans", "hilbert", "hilbert-trans".
         """
@@ -518,8 +442,6 @@ class PTV3_Block(torch.nn.Module):
             num_heads,
             proj_drop,
             patch_size,
-            cross_patch_attention,
-            cross_patch_pooling,
             sliding_window_attention,
             order_type,
         )
@@ -567,8 +489,6 @@ class PTV3_Encoder(torch.nn.Module):
         proj_drop: float = 0.0,
         patch_size: int = 0,
         no_conv_in_cpe: bool = False,
-        cross_patch_attention: bool = False,
-        cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
         order_type: str = "vdb",
     ):
@@ -581,8 +501,6 @@ class PTV3_Encoder(torch.nn.Module):
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
-            cross_patch_attention (bool): Whether to use cross-patch attention.
-            cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (str): The type of order of the points, "vdb" or "z".
         """
@@ -597,8 +515,6 @@ class PTV3_Encoder(torch.nn.Module):
                     proj_drop,
                     patch_size,
                     no_conv_in_cpe,
-                    cross_patch_attention,
-                    cross_patch_pooling,
                     sliding_window_attention,
                     order_type,
                 )
@@ -637,8 +553,6 @@ class PTV3(torch.nn.Module):
         enable_batch_norm: bool = False,
         embedding_mode: str = "linear",
         no_conv_in_cpe: bool = False,
-        cross_patch_attention: bool = False,
-        cross_patch_pooling: str = "mean",
         sliding_window_attention: bool = False,
         order_type: Union[str, List[str]] = "vdb",
     ) -> None:
@@ -661,8 +575,6 @@ class PTV3(torch.nn.Module):
             enable_batch_norm (bool): Whether to use batch normalization for the embedding, down pooling, and up pooling.
             embedding_mode (bool): the mode for the embedding layer, "linear" or "conv3x3", "conv5x5".
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
-            cross_patch_attention (bool): Whether to use cross-patch attention.
-            cross_patch_pooling (str): Pooling method for cross-patch attention ("mean" or "max").
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (Union[str, List[str]]): The type of order of the points. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans")
                 for all layers, or a list of strings for different layers. Each encoder and decoder stage will use
@@ -673,8 +585,6 @@ class PTV3(torch.nn.Module):
         self.drop_path = drop_path
         self.proj_drop = proj_drop
         self.no_conv_in_cpe = no_conv_in_cpe
-        self.cross_patch_attention = cross_patch_attention
-        self.cross_patch_pooling = cross_patch_pooling
         self.sliding_window_attention = sliding_window_attention
 
         # Handle order_type: convert to list for uniform processing
@@ -688,11 +598,6 @@ class PTV3(torch.nn.Module):
             self.norm_layer = torch.nn.LayerNorm
         else:
             self.norm_layer = partial(torch.nn.BatchNorm1d, eps=1e-3, momentum=0.01)
-
-        # sliding_window_attention and cross_patch_attention should not be used together.
-        assert not (
-            sliding_window_attention and cross_patch_attention
-        ), "sliding_window_attention and cross_patch_attention should not be used together."
 
         if len(enc_channels) > 0:
             self.embedding = PTV3_Embedding(
@@ -726,8 +631,6 @@ class PTV3(torch.nn.Module):
                         proj_drop,
                         patch_size,
                         no_conv_in_cpe,
-                        cross_patch_attention,
-                        cross_patch_pooling,
                         sliding_window_attention,
                         stage_order_type,
                     )
@@ -771,8 +674,6 @@ class PTV3(torch.nn.Module):
                         proj_drop,
                         patch_size,
                         no_conv_in_cpe,
-                        cross_patch_attention,
-                        cross_patch_pooling,
                         sliding_window_attention,
                         stage_order_type,
                     )
