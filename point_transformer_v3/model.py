@@ -210,7 +210,7 @@ class PTV3_MLP(torch.nn.Module):
         self.fc1 = torch.nn.Linear(hidden_size, hidden_size * 4)
         self.act = torch.nn.GELU()
         self.fc2 = torch.nn.Linear(hidden_size * 4, hidden_size)
-        self.drop = torch.nn.Dropout(proj_drop)  # simplified setting: no dropout now.
+        self.drop = torch.nn.Dropout(proj_drop)
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_MLP")
@@ -301,7 +301,9 @@ class PTV3_Attention(torch.nn.Module):
                 window_size = (self.patch_size // 2, self.patch_size // 2)
                 out_b = flash_attn.flash_attn_qkvpacked_func(
                     qkv_b.half(), dropout_p=0.0, softmax_scale=1.0, window_size=window_size
-                ).reshape(Li, self.hidden_size)
+                ).reshape(
+                    Li, self.hidden_size
+                )  # dtype: float16
                 outputs.append(out_b)
             if len(outputs) == 0:
                 feats_out_j = torch.empty_like(qkv[:, : self.hidden_size])
@@ -340,14 +342,13 @@ class PTV3_Attention(torch.nn.Module):
 
                 feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
                     qkv.half(), cu_seqlens, max_seqlen=self.patch_size, dropout_p=0.0, softmax_scale=1.0
-                ).reshape(num_voxels, self.hidden_size)
+                ).reshape(
+                    num_voxels, self.hidden_size
+                )  # dtype: float16
 
                 feats_out_j = feats_out_j.to(feats_j.dtype)
         else:
             feats_out_j = qkv[:, : self.hidden_size].contiguous()
-
-        # Ensure dtype matches original features before linear projection
-        feats_out_j = feats_out_j.to(feats_j.dtype)
 
         if self.order_type != "vdb":
             perm_reverse = torch.empty_like(perm)
@@ -374,16 +375,15 @@ class PTV3_CPE(torch.nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.no_conv_in_cpe = no_conv_in_cpe
-        # Wrap components in Sequential to match parameter naming convention
         self.cpe = torch.nn.ModuleList(
             [
                 (
                     fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1)
                     if not no_conv_in_cpe
                     else torch.nn.Identity()
-                ),  # cpe.0
-                torch.nn.Linear(hidden_size, hidden_size),  # cpe.1
-                torch.nn.LayerNorm(hidden_size),  # cpe.2
+                ),
+                torch.nn.Linear(hidden_size, hidden_size),
+                torch.nn.LayerNorm(hidden_size),
             ]
         )
 
@@ -436,7 +436,7 @@ class PTV3_Block(torch.nn.Module):
         super().__init__()
 
         self.cpe = PTV3_CPE(hidden_size, no_conv_in_cpe)
-        self.norm1 = torch.nn.Sequential(torch.nn.LayerNorm(hidden_size))  # norm1.0
+        self.norm1 = torch.nn.LayerNorm(hidden_size)
         self.attn = PTV3_Attention(
             hidden_size,
             num_heads,
@@ -445,7 +445,7 @@ class PTV3_Block(torch.nn.Module):
             sliding_window_attention,
             order_type,
         )
-        self.norm2 = torch.nn.Sequential(torch.nn.LayerNorm(hidden_size))  # norm2.0
+        self.norm2 = torch.nn.LayerNorm(hidden_size)
         self.order_type = order_type
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else torch.nn.Identity()
@@ -599,12 +599,9 @@ class PTV3(torch.nn.Module):
         else:
             self.norm_layer = partial(torch.nn.BatchNorm1d, eps=1e-3, momentum=0.01)
 
-        if len(enc_channels) > 0:
-            self.embedding = PTV3_Embedding(
-                input_dim, enc_channels[0], norm_layer_module=self.norm_layer, embedding_mode=embedding_mode
-            )
-        else:
-            self.embedding = None
+        self.embedding = PTV3_Embedding(
+            input_dim, enc_channels[0], norm_layer_module=self.norm_layer, embedding_mode=embedding_mode
+        )
 
         self.num_stages = len(enc_depths)
         if self.num_stages > 0:
@@ -681,9 +678,6 @@ class PTV3(torch.nn.Module):
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Forward")
-
-        if self.embedding is None:
-            return grid, feats
 
         grid, feats = self.embedding(grid, feats)
 
