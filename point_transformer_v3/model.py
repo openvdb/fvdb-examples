@@ -260,15 +260,84 @@ class PTV3_Attention(torch.nn.Module):
         # Sliding window attention parameter
         self.sliding_window_attention = sliding_window_attention
 
+    def _compute_permutation(self, grid, curve_codes):
+        """
+        Get permutation indices to sort voxels by space-filling curve order.
+
+        Takes pre-computed space-filling curve codes (e.g., from morton(), hilbert(), etc.)
+        and returns the permutation indices that would sort voxels according to those codes.
+        This is useful for spatially coherent data access patterns and cache optimization.
+
+        Args:
+            grid: The grid batch containing voxel information.
+            curve_codes (JaggedTensor): Space-filling curve codes for each voxel.
+                Shape: `[num_grids, -1, 1]`. Typically obtained from morton(), morton_zyx(),
+                hilbert(), or hilbert_zyx() methods.
+
+        Returns:
+            JaggedTensor: A JaggedTensor of shape `[num_grids, -1, 1]` containing
+                the permutation indices. Use these indices to reorder voxel data for spatial coherence.
+        """
+        # Get the curve codes as a flat tensor
+        curve_data = curve_codes.jdata.squeeze(-1)  # Shape: [total_voxels]
+
+        # Create output tensor for permutation indices
+        permutation_indices = torch.empty_like(curve_data, dtype=torch.long)
+
+        # Sort curve codes and get permutation indices for each grid
+        offset = 0
+        for grid_idx in range(grid.grid_count):
+            num_voxels = grid.num_voxels_at(grid_idx)
+            if num_voxels == 0:
+                continue
+
+            # Extract curve codes for this grid
+            grid_curve_codes = curve_data[offset : offset + num_voxels]
+
+            # Sort and get indices
+            _, indices = torch.sort(grid_curve_codes, dim=0)
+
+            # Store indices with offset
+            permutation_indices[offset : offset + num_voxels] = indices + offset
+
+            offset += num_voxels
+
+        # Return as JaggedTensor with the same structure as the input
+        return grid.jagged_like(permutation_indices.unsqueeze(-1))
+
+    def _permutation_morton(self, grid):
+        """
+        Return permutation indices to sort voxels by Morton curve order.
+        """
+        return self._compute_permutation(grid, grid.morton())
+
+    def _permutation_morton_zyx(self, grid):
+        """
+        Return permutation indices to sort voxels by transposed Morton curve order.
+        """
+        return self._compute_permutation(grid, grid.morton_zyx())
+
+    def _permutation_hilbert(self, grid):
+        """
+        Return permutation indices to sort voxels by Hilbert curve order.
+        """
+        return self._compute_permutation(grid, grid.hilbert())
+
+    def _permutation_hilbert_zyx(self, grid):
+        """
+        Return permutation indices to sort voxels by transposed Hilbert curve order.
+        """
+        return self._compute_permutation(grid, grid.hilbert_zyx())
+
     def _permute(self, grid, order_type):
         if order_type == "z":
-            return grid.permutation_morton()
+            return self._permutation_morton(grid)
         elif order_type == "z-trans":
-            return grid.permutation_morton_zyx()
+            return self._permutation_morton_zyx(grid)
         elif order_type == "hilbert":
-            return grid.permutation_hilbert()
+            return self._permutation_hilbert(grid)
         elif order_type == "hilbert-trans":
-            return grid.permutation_hilbert_zyx()
+            return self._permutation_hilbert_zyx(grid)
         else:
             raise ValueError(f"Unsupported order type: {order_type}")
 
