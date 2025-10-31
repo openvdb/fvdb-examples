@@ -41,6 +41,7 @@ class PTV3_Embedding(torch.nn.Module):
         embed_channels,
         norm_layer_module: torch.nn.Module = torch.nn.LayerNorm,
         embedding_mode: str = "linear",
+        shared_plan_cache: Dict = None,
     ):
         """
         Args:
@@ -48,9 +49,11 @@ class PTV3_Embedding(torch.nn.Module):
             embed_channels (int): Number of channels in the output features.
             norm_layer_module (torch.nn.Module): Normalization layer module.
             embedding_mode (str): The type of embedding layer, "linear" or "conv3x3", "conv5x5".
+            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.embedding_mode = embedding_mode
+        self.shared_plan_cache = shared_plan_cache
 
         if embedding_mode == "linear":
             self.embed = torch.nn.Linear(in_channels, embed_channels)
@@ -80,34 +83,43 @@ class PTV3_Embedding(torch.nn.Module):
         self.norm_layer = norm_layer_module(embed_channels)
         self.act_layer = torch.nn.GELU()
 
+    def _get_plan(self, grid, kernel_size, stride):
+        """Get or create a ConvolutionPlan from shared cache."""
+        cache_key = (grid.address, kernel_size, stride)
+        if cache_key not in self.shared_plan_cache:
+            self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
+                kernel_size=kernel_size,
+                stride=stride,
+                source_grid=grid,
+                target_grid=grid
+            )
+        return self.shared_plan_cache[cache_key]
+
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Embedding")
-
-        # Initialize kernel map (kmap) for sparse convolution operations
-        # kmap tracks the mapping between input and output features during sparse convolutions
-        if not hasattr(grid, "kmap"):
-            grid.kmap = None
 
         if self.embedding_mode == "linear":
             jfeats = feats.jdata
             jfeats = self.embed(jfeats)
         elif self.embedding_mode == "conv3x3":
-            # Apply 3x3 sparse convolution while maintaining kernel mapping
-            # Note: Bias is intentionally disabled to maintain consistency with standard transformer architectures
-            grid, feats, out_kmap = self.embed_conv3x3_1._dispatch_conv(feats, grid, grid.kmap, grid)
-            grid.kmap = out_kmap
+            # Apply 3x3 sparse convolution using shared ConvolutionPlan cache
+            plan = self._get_plan(grid, kernel_size=3, stride=1)
+            feats = self.embed_conv3x3_1(feats, plan)
             jfeats = feats.jdata
         elif self.embedding_mode == "conv5x5":
-            grid, feats, out_kmap = self.embed_conv3x3_1._dispatch_conv(feats, grid, grid.kmap, grid)
-            grid.kmap = out_kmap
-            grid, feats, out_kmap = self.embed_conv3x3_2._dispatch_conv(feats, grid, grid.kmap, grid)
-            grid.kmap = out_kmap
+            # First 3x3 convolution
+            plan1 = self._get_plan(grid, kernel_size=3, stride=1)
+            feats = self.embed_conv3x3_1(feats, plan1)
+            
+            # Second 3x3 convolution (same grid since stride=1, in-place)
+            plan2 = self._get_plan(grid, kernel_size=3, stride=1)
+            feats = self.embed_conv3x3_2(feats, plan2)
             jfeats = feats.jdata
 
         jfeats = self.norm_layer(jfeats)
         jfeats = self.act_layer(jfeats)
 
-        feats = feats.jagged_like(jfeats)
+        feats = grid.jagged_like(jfeats)
         nvtx.range_pop()
         return grid, feats
 
@@ -135,15 +147,14 @@ class PTV3_Pooling(torch.nn.Module):
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Pooling")
         feats_j = self.proj(feats.jdata)
-        feats = feats.jagged_like(feats_j)
+        feats = grid.jagged_like(feats_j)
 
         ds_feature, ds_grid = grid.max_pool(self.kernel_size, feats, stride=self.kernel_size, coarse_grid=None)
         ds_feature_j = ds_feature.jdata
         ds_feature_j = self.norm_layer(ds_feature_j)
         ds_feature_j = self.act_layer(ds_feature_j)
-        ds_feature = ds_feature.jagged_like(ds_feature_j)
+        ds_feature = ds_grid.jagged_like(ds_feature_j)
         nvtx.range_pop()
-        ds_grid.kmap = None
         return ds_grid, ds_feature
 
 
@@ -188,13 +199,10 @@ class PTV3_Unpooling(torch.nn.Module):
         last_feats_j = self.norm_skip(last_feats_j)
         last_feats_j = self.act_layer_skip(last_feats_j)
 
-        feats, _ = grid.subdivide(self.kernel_size, grid.jagged_like(feats_j), fine_grid=last_grid)
+        feats, _ = grid.refine(self.kernel_size, grid.jagged_like(feats_j), fine_grid=last_grid)
         feats_j = feats.jdata
 
         new_feats_j = last_feats_j + feats_j
-        last_grid.kmap = (
-            None  # Because of the pooling operation, the previous kmap for convolution is not valid anymore.
-        )
         return last_grid, last_grid.jagged_like(new_feats_j)
 
 
@@ -221,7 +229,7 @@ class PTV3_MLP(torch.nn.Module):
         feats_j = self.drop(feats_j)
         feats_j = self.fc2(feats_j)
         feats_j = self.drop(feats_j)
-        feats = feats.jagged_like(feats_j)
+        feats = grid.jagged_like(feats_j)
         nvtx.range_pop()
         return grid, feats
 
@@ -435,15 +443,17 @@ class PTV3_Attention(torch.nn.Module):
 
 
 class PTV3_CPE(torch.nn.Module):
-    def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False):
+    def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False, shared_plan_cache: Dict = None):
         """
         Args:
             hidden_size (int): Number of channels in the input features.
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
+            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.hidden_size = hidden_size
         self.no_conv_in_cpe = no_conv_in_cpe
+        self.shared_plan_cache = shared_plan_cache
         self.cpe = torch.nn.ModuleList(
             [
                 (
@@ -456,17 +466,26 @@ class PTV3_CPE(torch.nn.Module):
             ]
         )
 
+    def _get_plan(self, grid, kernel_size, stride):
+        """Get or create a ConvolutionPlan from shared cache."""
+        cache_key = (grid.address, kernel_size, stride)
+        if cache_key not in self.shared_plan_cache:
+            self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
+                kernel_size=kernel_size,
+                stride=stride,
+                source_grid=grid,
+                target_grid=grid
+            )
+        return self.shared_plan_cache[cache_key]
+
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_CPE")
 
-        if not hasattr(grid, "kmap"):
-            grid.kmap = None
-
         if not self.no_conv_in_cpe:
-            grid, out_feature, out_kmap = self.cpe[0]._dispatch_conv(feats, grid, grid.kmap, grid)
-            grid.kmap = out_kmap  # update the kmap
-            if self.cpe[0].bias is not None:
-                out_feature.jdata = out_feature.jdata + self.cpe[0].bias
+            # Apply 3x3 sparse convolution using shared ConvolutionPlan cache
+            plan = self._get_plan(grid, kernel_size=3, stride=1)
+            out_feature = self.cpe[0](feats, plan)
+            # Note: bias is already handled inside SparseConv3d.forward()
         else:
             out_feature = feats
 
@@ -490,6 +509,7 @@ class PTV3_Block(torch.nn.Module):
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
         order_type: str = "vdb",
+        shared_plan_cache: Dict = None,
     ):
         """
         Args:
@@ -501,10 +521,11 @@ class PTV3_Block(torch.nn.Module):
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (str): The type of order of the points: "vdb", "z", "z-trans", "hilbert", "hilbert-trans".
+            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
 
-        self.cpe = PTV3_CPE(hidden_size, no_conv_in_cpe)
+        self.cpe = PTV3_CPE(hidden_size, no_conv_in_cpe, shared_plan_cache)
         self.norm1 = torch.nn.LayerNorm(hidden_size)
         self.attn = PTV3_Attention(
             hidden_size,
@@ -522,27 +543,27 @@ class PTV3_Block(torch.nn.Module):
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Block")
         grid, feats_out = self.cpe(grid, feats)
-        feats = feats.jagged_like(feats.jdata + feats_out.jdata)
+        feats = grid.jagged_like(feats.jdata + feats_out.jdata)
         short_cut = feats.jdata
 
-        feats = feats.jagged_like(self.norm1(feats.jdata))
+        feats = grid.jagged_like(self.norm1(feats.jdata))
 
         grid, feats_out = self.attn(grid, feats)
-        feats_out = feats.jagged_like(
+        feats_out = grid.jagged_like(
             self.drop_path(feats_out.jdata)
         )  # This drop_path is applied to each point independently.
 
-        feats = feats.jagged_like(short_cut + feats_out.jdata)
+        feats = grid.jagged_like(short_cut + feats_out.jdata)
         short_cut = feats.jdata
 
-        feats = feats.jagged_like(self.norm2(feats.jdata))
+        feats = grid.jagged_like(self.norm2(feats.jdata))
 
         grid, feats_out = self.mlp(grid, feats)
-        feats_out = feats.jagged_like(
+        feats_out = grid.jagged_like(
             self.drop_path(feats_out.jdata)
         )  # This drop_path is applied to each point independently.
 
-        feats = feats.jagged_like(short_cut + feats_out.jdata)
+        feats = grid.jagged_like(short_cut + feats_out.jdata)
 
         nvtx.range_pop()
         return grid, feats
@@ -560,6 +581,7 @@ class PTV3_Encoder(torch.nn.Module):
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
         order_type: str = "vdb",
+        shared_plan_cache: Dict = None,
     ):
         """
         Args:
@@ -572,6 +594,7 @@ class PTV3_Encoder(torch.nn.Module):
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_type (str): The type of order of the points, "vdb" or "z".
+            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.depth = depth
@@ -586,6 +609,7 @@ class PTV3_Encoder(torch.nn.Module):
                     no_conv_in_cpe,
                     sliding_window_attention,
                     order_type,
+                    shared_plan_cache,
                 )
                 for i in range(depth)
             ]
@@ -668,8 +692,13 @@ class PTV3(torch.nn.Module):
         else:
             self.norm_layer = partial(torch.nn.BatchNorm1d, eps=1e-3, momentum=0.01)
 
+        # Shared ConvolutionPlan cache across all layers to avoid redundant computation.
+        # Cache is cleared at the end of each forward pass to prevent OOM.
+        self.shared_plan_cache = {}
+
         self.embedding = PTV3_Embedding(
-            input_dim, enc_channels[0], norm_layer_module=self.norm_layer, embedding_mode=embedding_mode
+            input_dim, enc_channels[0], norm_layer_module=self.norm_layer, 
+            embedding_mode=embedding_mode, shared_plan_cache=self.shared_plan_cache
         )
 
         self.num_stages = len(enc_depths)
@@ -699,6 +728,7 @@ class PTV3(torch.nn.Module):
                         no_conv_in_cpe,
                         sliding_window_attention,
                         stage_order_type,
+                        self.shared_plan_cache,
                     )
                 )
 
@@ -742,6 +772,7 @@ class PTV3(torch.nn.Module):
                         no_conv_in_cpe,
                         sliding_window_attention,
                         stage_order_type,
+                        self.shared_plan_cache,
                     )
                 )
 
@@ -777,6 +808,10 @@ class PTV3(torch.nn.Module):
                 grid, feats = self.dec[layer_id](grid, feats)
                 nvtx.range_pop()
                 layer_id += 1
+
+        # Clear cache after forward pass to prevent OOM between batches
+        # Plans are shared across layers during this forward pass, but won't be needed for next batch
+        self.shared_plan_cache.clear()
 
         nvtx.range_pop()
         return grid, feats

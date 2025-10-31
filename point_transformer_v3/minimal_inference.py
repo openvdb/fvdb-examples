@@ -122,6 +122,8 @@ def create_ptv3_model(args, device, num_classes):
             patch_size=args.patch_size,
             proj_drop=0.0,
             drop_path=0.3,
+            # no_conv_in_cpe=True,
+            # embedding_mode="linear",
         ).to(device)
     return model
 
@@ -150,8 +152,12 @@ def prepare_batched_inputs_from_scannet_points(batch_samples, voxel_size=0.1, de
     color_jagged = fvdb.JaggedTensor(colors_list)
     color_vdb_order = grid.inject_from_ijk(coords_jagged, color_jagged)
     jfeats = color_vdb_order.jdata
-    jfeats = fvdb.jcat([grid.ijk.float(), jfeats], dim=1)
+    # jfeats = fvdb.jcat([grid.ijk.float(), jfeats], dim=1)
+    jfeats = fvdb.jcat([grid.ijk.float(), color_vdb_order], dim=1)
     return grid, jfeats
+    # import pdb; pdb.set_trace()
+    # jfeats = torch.cat([grid.ijk.float(), jfeats], dim=1)
+    # return grid, fvdb.JaggedTensor(jfeats)
 
 
 def main():

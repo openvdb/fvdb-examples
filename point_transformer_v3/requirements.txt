@@ -1,2 +1,2 @@
-flash_attn==2.7.2.post1
+flash-attn==2.7.4.post1
 timm
