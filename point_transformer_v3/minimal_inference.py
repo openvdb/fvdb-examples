@@ -122,6 +122,7 @@ def create_ptv3_model(args, device, num_classes):
             patch_size=args.patch_size,
             proj_drop=0.0,
             drop_path=0.3,
+            order_type=("z", "z-trans", "hilbert", "hilbert-trans"),
             # no_conv_in_cpe=True,
             # embedding_mode="linear",
         ).to(device)

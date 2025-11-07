@@ -222,7 +222,7 @@ class PTV3_MLP(torch.nn.Module):
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_MLP")
-        feats_j = feats.jdata
+        feats_j = feats.jdata # TODO: deprecate the .jdata usage. 
 
         feats_j = self.fc1(feats_j)
         feats_j = self.act(feats_j)
@@ -241,8 +241,10 @@ class PTV3_Attention(torch.nn.Module):
         num_heads: int,
         proj_drop: float = 0.0,
         patch_size: int = 0,
+        qk_scale: float = None,
         sliding_window_attention: bool = False,
-        order_type: str = "vdb",
+        order_index: int = 0,
+        order_types: tuple = ("vdb",),
     ):
         """
         Args:
@@ -250,8 +252,10 @@ class PTV3_Attention(torch.nn.Module):
             num_heads (int): Number of attention heads in each block.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
+            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
-            order_type (str): The type of order of the points, "vdb" or "z".
+            order_index (int): Index into order_types to select which order to use for this block.
+            order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -259,11 +263,15 @@ class PTV3_Attention(torch.nn.Module):
         self.head_dim = hidden_size // num_heads
         assert self.head_dim * num_heads == hidden_size, "hidden_size must be divisible by num_heads"
 
+        self.scale = qk_scale or (self.head_dim) ** -0.5
         self.qkv = torch.nn.Linear(hidden_size, hidden_size * 3)  # Combined QKV projection
         self.proj = torch.nn.Linear(hidden_size, hidden_size)
         self.drop = torch.nn.Dropout(proj_drop)
         self.patch_size = patch_size
-        self.order_type = order_type
+        self.order_index = order_index
+        self.order_types = order_types
+
+        # TODO: Add attention dropout
 
         # Sliding window attention parameter
         self.sliding_window_attention = sliding_window_attention
@@ -353,11 +361,20 @@ class PTV3_Attention(torch.nn.Module):
         nvtx.range_push("PTV3_Attention")
         feats_j = feats.jdata
 
-        if self.order_type != "vdb":
-            perm = self._permute(grid, self.order_type).jdata.squeeze(-1)  # [num_voxels]
+        # Get the shuffled order from grid metadata if available, otherwise use default order_types
+        # This allows for order shuffling per forward pass (matching reference implementation)
+        active_order_types = grid._shuffled_order
+        
+        # Get the order type for this block using the order index
+        order_type = active_order_types[self.order_index % len(active_order_types)]
+        
+        if order_type != "vdb":
+            perm = self._permute(grid, order_type).jdata.squeeze(-1)  # [num_voxels]
             # Use torch.gather for permutation: expand perm to match feats_j dimensions
             perm_expanded = perm.unsqueeze(-1).expand(-1, feats_j.shape[-1])  # [num_voxels, hidden_size]
             feats_j = torch.gather(feats_j, 0, perm_expanded)
+
+        # import pdb; pdb.set_trace()
 
         qkv = self.qkv(feats_j)  # (num_voxels, 3 * hidden_size)
 
@@ -377,7 +394,10 @@ class PTV3_Attention(torch.nn.Module):
                 qkv_b = qkv[start:end].view(1, Li, 3, H, D)
                 window_size = (self.patch_size // 2, self.patch_size // 2)
                 out_b = flash_attn.flash_attn_qkvpacked_func(
-                    qkv_b.half(), dropout_p=0.0, softmax_scale=1.0, window_size=window_size
+                    qkv_b.half(), 
+                    dropout_p=0.0, 
+                    softmax_scale=self.scale, 
+                    window_size=window_size
                 ).reshape(
                     Li, self.hidden_size
                 )  # dtype: float16
@@ -418,7 +438,11 @@ class PTV3_Attention(torch.nn.Module):
                 cu_seqlens[1:] = torch.as_tensor(lengths, device=qkv.device, dtype=torch.int32).cumsum(dim=0)
 
                 feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
-                    qkv.half(), cu_seqlens, max_seqlen=self.patch_size, dropout_p=0.0, softmax_scale=1.0
+                    qkv.half(), 
+                    cu_seqlens, 
+                    max_seqlen=self.patch_size, 
+                    dropout_p=0.0, # TODO: implement attention dropout in the future. By default, it is 0.
+                    softmax_scale=self.scale
                 ).reshape(
                     num_voxels, self.hidden_size
                 )  # dtype: float16
@@ -427,7 +451,7 @@ class PTV3_Attention(torch.nn.Module):
         else:
             feats_out_j = qkv[:, : self.hidden_size].contiguous()
 
-        if self.order_type != "vdb":
+        if order_type != "vdb":
             perm_reverse = torch.empty_like(perm)
             perm_reverse[perm] = torch.arange(perm.shape[0], device=perm.device)  # [num_voxels]
             perm_reverse_expanded = perm_reverse.unsqueeze(-1).expand(
@@ -457,7 +481,7 @@ class PTV3_CPE(torch.nn.Module):
         self.cpe = torch.nn.ModuleList(
             [
                 (
-                    fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1)
+                    fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1) # by default, bias is True. 
                     if not no_conv_in_cpe
                     else torch.nn.Identity()
                 ),
@@ -506,9 +530,11 @@ class PTV3_Block(torch.nn.Module):
         drop_path: float,
         proj_drop: float = 0.0,
         patch_size: int = 0,
+        qk_scale: float = None,
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
-        order_type: str = "vdb",
+        order_index: int = 0,
+        order_types: tuple = ("vdb",),
         shared_plan_cache: Dict = None,
     ):
         """
@@ -518,9 +544,11 @@ class PTV3_Block(torch.nn.Module):
             drop_path (float): Drop path rate for regularization.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
+            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
-            order_type (str): The type of order of the points: "vdb", "z", "z-trans", "hilbert", "hilbert-trans".
+            order_index (int): Index into order_types to select which order to use for this block.
+            order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
             shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
@@ -532,18 +560,20 @@ class PTV3_Block(torch.nn.Module):
             num_heads,
             proj_drop,
             patch_size,
+            qk_scale,
             sliding_window_attention,
-            order_type,
+            order_index,
+            order_types,
         )
         self.norm2 = torch.nn.LayerNorm(hidden_size)
-        self.order_type = order_type
+        self.order_index = order_index
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else torch.nn.Identity()
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Block")
         grid, feats_out = self.cpe(grid, feats)
-        feats = grid.jagged_like(feats.jdata + feats_out.jdata)
+        feats = grid.jagged_like(feats.jdata + feats_out.jdata) # Is this a potential issue? 
         short_cut = feats.jdata
 
         feats = grid.jagged_like(self.norm1(feats.jdata))
@@ -578,9 +608,10 @@ class PTV3_Encoder(torch.nn.Module):
         drop_path,  # drop_path is a list of drop path rates for each block.
         proj_drop: float = 0.0,
         patch_size: int = 0,
+        qk_scale: float = None,
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
-        order_type: str = "vdb",
+        order_types: tuple = ("vdb",),
         shared_plan_cache: Dict = None,
     ):
         """
@@ -591,9 +622,10 @@ class PTV3_Encoder(torch.nn.Module):
             drop_path (list): Drop path rates for each block.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
+            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
-            order_type (str): The type of order of the points, "vdb" or "z".
+            order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
             shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
@@ -606,15 +638,17 @@ class PTV3_Encoder(torch.nn.Module):
                     drop_path[i],
                     proj_drop,
                     patch_size,
+                    qk_scale,
                     no_conv_in_cpe,
                     sliding_window_attention,
-                    order_type,
+                    i % len(order_types),  # order_index cycles through available order types
+                    order_types,
                     shared_plan_cache,
                 )
                 for i in range(depth)
             ]
         )
-        self.order_type = order_type
+        self.order_types = order_types
 
     def forward(self, grid, feats):
         for block in self.blocks:
@@ -643,11 +677,13 @@ class PTV3(torch.nn.Module):
         patch_size: int = 0,
         drop_path: float = 0.3,
         proj_drop: float = 0.0,
+        qk_scale: float = None,
         enable_batch_norm: bool = False,
         embedding_mode: str = "linear",
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
-        order_type: Union[str, List[str]] = "vdb",
+        order_type: Union[str, tuple] = ("z", "z-trans"),
+        shuffle_orders: bool = True,
     ) -> None:
         """
         ptv3 for 3D point cloud segmentation.
@@ -665,27 +701,26 @@ class PTV3(torch.nn.Module):
             patch_size (int): Patch size for patch attention.
             drop_path (float): Drop path rate for regularization.
             proj_drop (float): Dropout rate for MLP layers.
+            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             enable_batch_norm (bool): Whether to use batch normalization for the embedding, down pooling, and up pooling.
             embedding_mode (bool): the mode for the embedding layer, "linear" or "conv3x3", "conv5x5".
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
-            order_type (Union[str, List[str]]): The type of order of the points. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans")
-                for all layers, or a list of strings for different layers. Each encoder and decoder stage will use
-                order_type[i % len(order_type)] where i is the stage index.
+            order (Union[str, tuple]): The type(s) of point ordering. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans")
+                or a tuple of strings (e.g., ("z", "z-trans")). Each block within a stage cycles through the order types.
+            shuffle_orders (bool): Whether to shuffle the order of order types at the beginning of each forward pass and after each pooling.
         """
         super().__init__()
         self.num_classes = num_classes
         self.drop_path = drop_path
         self.proj_drop = proj_drop
+        self.qk_scale = qk_scale
         self.no_conv_in_cpe = no_conv_in_cpe
         self.sliding_window_attention = sliding_window_attention
+        self.shuffle_orders = shuffle_orders
 
-        # Handle order_type: convert to list for uniform processing
-        if isinstance(order_type, str):
-            self.order_type_list = [order_type]
-        else:
-            self.order_type_list = order_type
-        self.order_type = order_type  # Keep original for backward compatibility
+        # Handle order: convert to tuple for uniform processing (matching reference implementation)
+        self.order_type = tuple([order_type]) if isinstance(order_type, str) else tuple(order_type)
 
         if not enable_batch_norm:
             self.norm_layer = torch.nn.LayerNorm
@@ -713,10 +748,9 @@ class PTV3(torch.nn.Module):
                             in_channels=enc_channels[i - 1],
                             out_channels=enc_channels[i],
                             norm_layer_module=self.norm_layer,
-                        )
                     )
-                # Select order_type for this encoder stage using modulo
-                stage_order_type = self.order_type_list[i % len(self.order_type_list)]
+                )
+                # All encoder stages share the same order types; blocks within each stage cycle through them
                 self.enc.append(
                     PTV3_Encoder(
                         enc_channels[i],
@@ -725,9 +759,10 @@ class PTV3(torch.nn.Module):
                         enc_drop_path[sum(enc_depths[:i]) : sum(enc_depths[: i + 1])],
                         proj_drop,
                         patch_size,
+                        qk_scale,
                         no_conv_in_cpe,
                         sliding_window_attention,
-                        stage_order_type,
+                        self.order_type,
                         self.shared_plan_cache,
                     )
                 )
@@ -757,10 +792,7 @@ class PTV3(torch.nn.Module):
                         norm_layer_module=self.norm_layer,
                     )
                 )
-                # Select order_type for this decoder stage using modulo
-                # Use reverse order for decoder (from last encoder stage backwards)
-                dec_stage_idx = self.num_stages - 1 - i
-                stage_order_type = self.order_type_list[dec_stage_idx % len(self.order_type_list)]
+                # All decoder stages share the same order types; blocks within each stage cycle through them
                 self.dec.append(
                     PTV3_Encoder(
                         dec_channels[i],
@@ -769,25 +801,50 @@ class PTV3(torch.nn.Module):
                         dec_drop_path_,
                         proj_drop,
                         patch_size,
+                        qk_scale,
                         no_conv_in_cpe,
                         sliding_window_attention,
-                        stage_order_type,
+                        self.order_type,
                         self.shared_plan_cache,
                     )
                 )
 
+    def _shuffle_order(self):
+        """
+        Randomly shuffle the order tuple to create variation across forward passes.
+        Returns a new shuffled tuple of order types.
+        """
+        if self.shuffle_orders:
+            indices = torch.randperm(len(self.order_type))
+            return tuple(self.order_type[i] for i in indices)
+        else:
+            return self.order_type
+
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Forward")
+
+        # Shuffle order at the beginning of forward pass (matching reference implementation)
+        shuffled_order = self._shuffle_order()
+        
+        # Store shuffled order in grid metadata so all blocks can access it
+        grid._shuffled_order = shuffled_order
 
         grid, feats = self.embedding(grid, feats)
 
         layer_id = 0
-        stack = []
+        stack = []  # Stack stores (grid, feats, shuffled_order) tuples
         for i in range(self.num_stages):
             if i > 0:
                 nvtx.range_push(f"PTV3_Pooling_{layer_id}")
-                stack.append((grid, feats))
+                # Push grid, feats, AND the current shuffled_order to stack
+                # The decoder will reuse this exact shuffled order for the corresponding stage
+                stack.append((grid, feats, shuffled_order))
                 grid, feats = self.enc[layer_id](grid, feats)
+                
+                # Shuffle order after pooling for the next (downsampled) stage
+                shuffled_order = self._shuffle_order()
+                grid._shuffled_order = shuffled_order
+                
                 nvtx.range_pop()
                 layer_id += 1
             nvtx.range_push(f"PTV3_Encoder_{layer_id}")
@@ -799,12 +856,20 @@ class PTV3(torch.nn.Module):
             layer_id = 0
             for i in range(self.num_dec_stages):
                 nvtx.range_push(f"PTV3_Unpooling_{layer_id}")
-                last_grid, last_feats = stack.pop()
+                # Pop grid, feats, AND the shuffled_order from the corresponding encoder stage
+                last_grid, last_feats, last_shuffled_order = stack.pop()
+                
+                # Restore the shuffled order from the encoder stage to the grids
+                # This ensures decoder blocks use the SAME order as the corresponding encoder blocks
+                last_grid._shuffled_order = last_shuffled_order
+                
                 grid, feats = self.dec[layer_id](grid, feats, last_grid, last_feats)
+                # After unpooling, grid becomes last_grid with the restored shuffled order
                 nvtx.range_pop()
                 layer_id += 1
 
                 nvtx.range_push(f"PTV3_Decoder_{layer_id}")
+                # Decoder blocks use grid with the restored shuffled order from encoder
                 grid, feats = self.dec[layer_id](grid, feats)
                 nvtx.range_pop()
                 layer_id += 1
