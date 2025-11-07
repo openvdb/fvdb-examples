@@ -4,15 +4,19 @@ This repository contains a minimal implementation of Point Transformer V3 using 
 
 ## Environment
 
-Use the FVDB default development environment:
+Use the FVDB default development environment and install FVDB package:
 
 ```bash
+cd fvdb/
 conda env create -f env/dev_environment.yml
+conda activate fvdb
+./build.sh
 ```
 
 Next, activate the environment and install additional dependancies specifically for the point transformer project.
 
 ```bash
+cd fvdb/projects/point_transformer_v3
 pip install -r requirements.txt
 ```
 
@@ -28,7 +32,7 @@ pip install -r requirements.txt
 
 **Usage**:
 ```bash
-python prepare_scannet_dataset.py --data_root /path/to/scannet --output_file scannet_samples.json --num_samples 10
+python prepare_scannet_dataset.py --data_root /path/to/scannet --output_file scannet_samples.json --num_samples 16
 ```
 
 **What it does**:
@@ -116,10 +120,10 @@ Run the PT-v3 model inference on the downloaded samples:
 
 ```bash
 # Test with small dataset
-python minimal_inference.py --data-path data/scannet_samples_small.json --voxel-size 0.1 --patch-size 1024
+python minimal_inference.py --data-path data/scannet_samples_small.json --voxel-size 0.1 --patch-size 1024 --batch-size 1
 
 # Test with large dataset
-python minimal_inference.py --data-path data/scannet_samples_large.json --voxel-size 0.02 --patch-size 1024
+python minimal_inference.py --data-path data/scannet_samples_large.json --voxel-size 0.02 --patch-size 1024 --batch-size 1
 ```
 
 This will:
