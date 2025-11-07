@@ -88,10 +88,7 @@ class PTV3_Embedding(torch.nn.Module):
         cache_key = (grid.address, kernel_size, stride)
         if cache_key not in self.shared_plan_cache:
             self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
-                kernel_size=kernel_size,
-                stride=stride,
-                source_grid=grid,
-                target_grid=grid
+                kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
             )
         return self.shared_plan_cache[cache_key]
 
@@ -110,7 +107,7 @@ class PTV3_Embedding(torch.nn.Module):
             # First 3x3 convolution
             plan1 = self._get_plan(grid, kernel_size=3, stride=1)
             feats = self.embed_conv3x3_1(feats, plan1)
-            
+
             # Second 3x3 convolution (same grid since stride=1, in-place)
             plan2 = self._get_plan(grid, kernel_size=3, stride=1)
             feats = self.embed_conv3x3_2(feats, plan2)
@@ -222,7 +219,7 @@ class PTV3_MLP(torch.nn.Module):
 
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_MLP")
-        feats_j = feats.jdata # TODO: deprecate the .jdata usage. 
+        feats_j = feats.jdata  # TODO: deprecate the .jdata usage.
 
         feats_j = self.fc1(feats_j)
         feats_j = self.act(feats_j)
@@ -364,10 +361,10 @@ class PTV3_Attention(torch.nn.Module):
         # Get the shuffled order from grid metadata if available, otherwise use default order_types
         # This allows for order shuffling per forward pass (matching reference implementation)
         active_order_types = grid._shuffled_order
-        
+
         # Get the order type for this block using the order index
         order_type = active_order_types[self.order_index % len(active_order_types)]
-        
+
         if order_type != "vdb":
             perm = self._permute(grid, order_type).jdata.squeeze(-1)  # [num_voxels]
             # Use torch.gather for permutation: expand perm to match feats_j dimensions
@@ -394,10 +391,7 @@ class PTV3_Attention(torch.nn.Module):
                 qkv_b = qkv[start:end].view(1, Li, 3, H, D)
                 window_size = (self.patch_size // 2, self.patch_size // 2)
                 out_b = flash_attn.flash_attn_qkvpacked_func(
-                    qkv_b.half(), 
-                    dropout_p=0.0, 
-                    softmax_scale=self.scale, 
-                    window_size=window_size
+                    qkv_b.half(), dropout_p=0.0, softmax_scale=self.scale, window_size=window_size
                 ).reshape(
                     Li, self.hidden_size
                 )  # dtype: float16
@@ -438,11 +432,11 @@ class PTV3_Attention(torch.nn.Module):
                 cu_seqlens[1:] = torch.as_tensor(lengths, device=qkv.device, dtype=torch.int32).cumsum(dim=0)
 
                 feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
-                    qkv.half(), 
-                    cu_seqlens, 
-                    max_seqlen=self.patch_size, 
-                    dropout_p=0.0, # TODO: implement attention dropout in the future. By default, it is 0.
-                    softmax_scale=self.scale
+                    qkv.half(),
+                    cu_seqlens,
+                    max_seqlen=self.patch_size,
+                    dropout_p=0.0,  # TODO: implement attention dropout in the future. By default, it is 0.
+                    softmax_scale=self.scale,
                 ).reshape(
                     num_voxels, self.hidden_size
                 )  # dtype: float16
@@ -481,7 +475,7 @@ class PTV3_CPE(torch.nn.Module):
         self.cpe = torch.nn.ModuleList(
             [
                 (
-                    fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1) # by default, bias is True. 
+                    fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1)  # by default, bias is True.
                     if not no_conv_in_cpe
                     else torch.nn.Identity()
                 ),
@@ -495,10 +489,7 @@ class PTV3_CPE(torch.nn.Module):
         cache_key = (grid.address, kernel_size, stride)
         if cache_key not in self.shared_plan_cache:
             self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
-                kernel_size=kernel_size,
-                stride=stride,
-                source_grid=grid,
-                target_grid=grid
+                kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
             )
         return self.shared_plan_cache[cache_key]
 
@@ -573,7 +564,7 @@ class PTV3_Block(torch.nn.Module):
     def forward(self, grid, feats):
         nvtx.range_push("PTV3_Block")
         grid, feats_out = self.cpe(grid, feats)
-        feats = grid.jagged_like(feats.jdata + feats_out.jdata) # Is this a potential issue? 
+        feats = grid.jagged_like(feats.jdata + feats_out.jdata)  # Is this a potential issue?
         short_cut = feats.jdata
 
         feats = grid.jagged_like(self.norm1(feats.jdata))
@@ -732,8 +723,11 @@ class PTV3(torch.nn.Module):
         self.shared_plan_cache = {}
 
         self.embedding = PTV3_Embedding(
-            input_dim, enc_channels[0], norm_layer_module=self.norm_layer, 
-            embedding_mode=embedding_mode, shared_plan_cache=self.shared_plan_cache
+            input_dim,
+            enc_channels[0],
+            norm_layer_module=self.norm_layer,
+            embedding_mode=embedding_mode,
+            shared_plan_cache=self.shared_plan_cache,
         )
 
         self.num_stages = len(enc_depths)
@@ -748,8 +742,8 @@ class PTV3(torch.nn.Module):
                             in_channels=enc_channels[i - 1],
                             out_channels=enc_channels[i],
                             norm_layer_module=self.norm_layer,
+                        )
                     )
-                )
                 # All encoder stages share the same order types; blocks within each stage cycle through them
                 self.enc.append(
                     PTV3_Encoder(
@@ -825,7 +819,7 @@ class PTV3(torch.nn.Module):
 
         # Shuffle order at the beginning of forward pass (matching reference implementation)
         shuffled_order = self._shuffle_order()
-        
+
         # Store shuffled order in grid metadata so all blocks can access it
         grid._shuffled_order = shuffled_order
 
@@ -840,11 +834,11 @@ class PTV3(torch.nn.Module):
                 # The decoder will reuse this exact shuffled order for the corresponding stage
                 stack.append((grid, feats, shuffled_order))
                 grid, feats = self.enc[layer_id](grid, feats)
-                
+
                 # Shuffle order after pooling for the next (downsampled) stage
                 shuffled_order = self._shuffle_order()
                 grid._shuffled_order = shuffled_order
-                
+
                 nvtx.range_pop()
                 layer_id += 1
             nvtx.range_push(f"PTV3_Encoder_{layer_id}")
@@ -858,11 +852,11 @@ class PTV3(torch.nn.Module):
                 nvtx.range_push(f"PTV3_Unpooling_{layer_id}")
                 # Pop grid, feats, AND the shuffled_order from the corresponding encoder stage
                 last_grid, last_feats, last_shuffled_order = stack.pop()
-                
+
                 # Restore the shuffled order from the encoder stage to the grids
                 # This ensures decoder blocks use the SAME order as the corresponding encoder blocks
                 last_grid._shuffled_order = last_shuffled_order
-                
+
                 grid, feats = self.dec[layer_id](grid, feats, last_grid, last_feats)
                 # After unpooling, grid becomes last_grid with the restored shuffled order
                 nvtx.range_pop()
