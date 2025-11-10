@@ -16,9 +16,17 @@ conda activate fvdb
 Next, activate the environment and install additional dependancies specifically for the point transformer project.
 
 ```bash
-cd fvdb/projects/point_transformer_v3
+cd fvdb-examples/point_transformer_v3
 pip install -r requirements.txt
 ```
+
+In order to train on Scannet dataset with pointcept codebase, we need to additionally install:
+
+```bash
+cd fvdb-examples/point_transformer_v3
+pip install -r requirements_pointcept.txt
+```
+
 
 
 ## Files Overview
@@ -149,4 +157,64 @@ This will:
 - Compute average absolute and relative deviations
 - Report differences in output features, sums, and last elements
 - Expect only small numerical differences (typically < 1e-5) due to floating-point precision.
+
+## Training on ScanNet Dataset
+
+This section describes how to train PT-v3 models on the ScanNet dataset using the minimal Pointcept training codebase, using either their ptv3 implementation and our fVDB implementation. 
+
+### Environment Setup
+
+Follow the **Environment** section above to set up the development environment and install all required dependencies.
+
+### ScanNet Dataset Preparation
+
+The preprocessing pipeline supports semantic and instance segmentation for `ScanNet20`, `ScanNet200`, and `ScanNet Data Efficient` benchmarks.
+
+1. **Download the dataset**: Obtain the [ScanNet v2 dataset](http://www.scan-net.org/) (requires registration and approval).
+
+2. **Preprocess the raw data**: Run the preprocessing script to convert the raw ScanNet data into the required format:
+
+```bash
+# RAW_SCANNET_DIR: the directory containing the downloaded ScanNet v2 raw dataset
+# PROCESSED_SCANNET_DIR: the output directory for the processed ScanNet dataset
+python pointcept_minimal/pointcept/datasets/preprocessing/scannet/preprocess_scannet.py \
+    --dataset_root ${RAW_SCANNET_DIR} \
+    --output_root ${PROCESSED_SCANNET_DIR}
+```
+
+3. **Alternative**: Download preprocessed data directly from [HuggingFace](https://huggingface.co/datasets/Pointcept/scannet-compressed). Please ensure you agree to the official ScanNet license before downloading.
+
+4. **Link the processed dataset** to the codebase data directory:
+
+```bash
+# PROCESSED_SCANNET_DIR: the directory containing the processed ScanNet dataset
+mkdir -p pointcept_minimal/data
+ln -s ${PROCESSED_SCANNET_DIR} pointcept_minimal/data/scannet
+```
+
+### Training Scripts
+
+To train the PT-v3 models with different configurations, use the following commands from the `pointcept_minimal` directory:
+
+```bash
+# Train PT-v3 with FVDB backend (8 GPUs)
+sh scripts/train.sh -g 8 -d scannet -c semseg-pt-v3m1-0-fvdb-test -n semseg-pt-v3m1-0-fvdb-test
+
+# Train PT-v3 with standard backend (8 GPUs)
+sh scripts/train.sh -g 8 -d scannet -c semseg-pt-v3m1-0-test -n semseg-pt-v3m1-0-test
+```
+
+You should launch the above scripts within `point_transformer_v3/pointcept_minimal` folder. 
+
+### Configuration Files
+
+The training configurations are located at:
+- `pointcept_minimal/configs/scannet/semseg-pt-v3m1-0-fvdb-test.py` - FVDB-based implementation
+- `pointcept_minimal/configs/scannet/semseg-pt-v3m1-0-test.py` - Standard implementation
+
+### Model Implementation
+
+The model implementations can be found in the following files:
+- `pointcept_minimal/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py` - Base PT-v3 implementation
+- `pointcept_minimal/pointcept/models/point_transformer_v3/point_transformer_v3m1_fvdb.py` - FVDB-accelerated PT-v3 implementation
 
