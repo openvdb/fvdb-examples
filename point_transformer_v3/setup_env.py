@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Setup script for point_transformer_v3 project.
 
@@ -22,18 +25,20 @@ from pathlib import Path
 # Get the directory containing this script (point_transformer_v3)
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
+
 def setup_paths():
     """Add necessary paths to sys.path for imports."""
     paths_to_add = [
         str(PROJECT_ROOT),  # For importing fvdb_extensions
         str(PROJECT_ROOT / "external" / "pointcept"),  # For importing pointcept
     ]
-    
+
     for path in paths_to_add:
         if path not in sys.path:
             sys.path.insert(0, path)
-    
+
     return paths_to_add
+
 
 def get_pythonpath():
     """Get PYTHONPATH string for shell export."""
@@ -42,6 +47,7 @@ def get_pythonpath():
         str(PROJECT_ROOT / "external" / "pointcept"),
     ]
     return os.pathsep.join(paths)
+
 
 if __name__ == "__main__":
     # When run as script, print export command
@@ -52,4 +58,3 @@ if __name__ == "__main__":
 else:
     # When imported, automatically set up paths
     setup_paths()
-

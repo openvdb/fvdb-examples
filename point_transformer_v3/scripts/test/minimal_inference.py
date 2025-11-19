@@ -48,9 +48,7 @@ except ImportError:
     nvtx = DummyNVTX()
 
 
-def create_ptv3_model(
-    args: argparse.Namespace, device: torch.device | str, num_classes: int
-) -> torch.nn.Module:
+def create_ptv3_model(args: argparse.Namespace, device: torch.device | str, num_classes: int) -> torch.nn.Module:
     """Create a PT-v3 model.
 
     Args:
