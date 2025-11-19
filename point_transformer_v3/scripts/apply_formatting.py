@@ -53,13 +53,13 @@ def main():
 
     try:
         result = subprocess.run(cmd, check=True)
-        print("\n✓ Formatting applied successfully!")
+        print("\n[OK] Formatting applied successfully!")
         return 0
     except subprocess.CalledProcessError as e:
-        print(f"\n✗ Formatting failed with exit code {e.returncode}")
+        print(f"\n[FAIL] Formatting failed with exit code {e.returncode}")
         return e.returncode
     except FileNotFoundError:
-        print("\n✗ Error: black not found. Please install it:")
+        print("\n[FAIL] Error: black not found. Please install it:")
         print("  pip install black~=24.0")
         return 1
 

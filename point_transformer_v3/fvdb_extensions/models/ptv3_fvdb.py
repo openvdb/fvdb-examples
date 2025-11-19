@@ -78,7 +78,7 @@ class PTV3_Embedding(torch.nn.Module):
         elif embedding_mode == "conv5x5":
             ## Implementation Option 1: Cascaded 3x3 convolutions
             # This approach uses two 3x3 convs to achieve a 5x5 receptive field with fewer parameters
-            # Parameters: (27 × in_channels × embed_channels) + (27 × embed_channels²)
+            # Parameters: (27 x in_channels x embed_channels) + (27 x embed_channels^2)
             self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(
                 in_channels, embed_channels, kernel_size=3, stride=1, bias=False
             )
@@ -88,7 +88,7 @@ class PTV3_Embedding(torch.nn.Module):
 
             ## Implementation Option 2: Direct 5x5 convolution
             # TODO: Implementation pending - requires additional sparse convolution support from fVDB-core.
-            # Expected parameters: 125 × in_channels × embed_channels
+            # Expected parameters: 125 x in_channels x embed_channels
             # self.embed_conv5x5_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=5, stride=1)
         else:
             raise ValueError(f"Unsupported embedding mode: {embedding_mode}")
