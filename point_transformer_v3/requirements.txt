@@ -18,3 +18,6 @@ torch-cluster
 # Sparse convolution - spconv-cu129 not available, try cu124 (usually compatible with 12.9)
 # If this fails, install from source: https://github.com/traveller59/spconv
 spconv-cu124
+
+# Development
+black~=24.0

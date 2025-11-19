@@ -12,15 +12,16 @@ import sys
 from pathlib import Path
 
 # Extensions to check
-EXTENSIONS = {'.py', '.cpp', '.h', '.cu', '.cuh', '.sh'}
+EXTENSIONS = {".py", ".cpp", ".h", ".cu", ".cuh", ".sh"}
 
 # Directories to exclude
-EXCLUDES = {'external', '__pycache__', '.git', '.github', '.vscode', '.idea'}
+EXCLUDES = {"external", "__pycache__", ".git", ".github", ".vscode", ".idea"}
+
 
 def check_file(filepath):
     """Check if file contains SPDX-License-Identifier."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             # Read first 20 lines
             for _ in range(20):
                 line = f.readline()
@@ -32,6 +33,7 @@ def check_file(filepath):
         print(f"Error reading {filepath}: {e}")
         return False
     return False
+
 
 def main():
     script_dir = Path(__file__).parent.resolve()
@@ -65,6 +67,6 @@ def main():
     print("\nAll files have SPDX identifiers.")
     return 0
 
+
 if __name__ == "__main__":
     sys.exit(main())
-
