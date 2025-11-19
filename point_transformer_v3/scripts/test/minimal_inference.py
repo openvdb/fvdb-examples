@@ -8,15 +8,26 @@ This script demonstrates how to:
 2. Load and run the PT-v3 model
 """
 
+from __future__ import annotations
+
 import argparse
 import gc
 import json
 import logging
 import os
+import sys
+from pathlib import Path
+from typing import Any
+
+# Setup paths for imports
+# Script is in scripts/test/, so go up two levels to get project root
+_project_root = Path(__file__).parent.parent.parent.resolve()
+sys.path.insert(0, str(_project_root))
+sys.path.insert(0, str(_project_root / "external" / "pointcept"))
 
 import numpy as np
 import torch
-from model import PTV3
+from fvdb_extensions.models.ptv3_fvdb import PTV3
 
 import fvdb
 
@@ -37,7 +48,7 @@ except ImportError:
     nvtx = DummyNVTX()
 
 
-def create_ptv3_model(args, device, num_classes):
+def create_ptv3_model(args: argparse.Namespace, device: torch.device | str, num_classes: int) -> torch.nn.Module:
     """Create a PT-v3 model.
 
     Args:
@@ -129,7 +140,9 @@ def create_ptv3_model(args, device, num_classes):
     return model
 
 
-def prepare_batched_inputs_from_scannet_points(batch_samples, voxel_size=0.1, device="cuda"):
+def prepare_batched_inputs_from_scannet_points(
+    batch_samples: list[dict[str, Any]], voxel_size: float = 0.1, device: torch.device | str = "cuda"
+) -> tuple[fvdb.GridBatch, fvdb.JaggedTensor]:
     """Prepare batched inputs from a list of ScanNet-like samples.
 
     Args:
@@ -165,7 +178,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Minimal inference script for PT-v3 on ScanNet point cloud data")
     parser.add_argument(
-        "--data-path", type=str, default="scannet_samples.json", help="Path to the scannet samples json file"
+        "--data-path", type=str, default="data/scannet_samples.json", help="Path to the scannet samples json file"
     )
     parser.add_argument("--voxel-size", type=float, default=0.02, help="Voxel size for grid sampling")
     parser.add_argument("--patch-size", type=int, default=1024, help="Maximum points per sample")
@@ -342,8 +355,6 @@ if __name__ == "__main__":
     main()
 
 ## Example commands:
-# scannet_samples_small.json
-# python minimal_inference.py --data-path data/scannet_samples_small.json --voxel-size 0.1 --patch-size 1024 --batch-size 1
-
-# scannet_samples_large.json
-# python minimal_inference.py --data-path data/scannet_samples_large.json --voxel-size 0.02 --patch-size 1024 --batch-size 1
+# Run from point_transformer_v3/ directory:
+# python scripts/test/minimal_inference.py --data-path data/scannet_samples_small.json --voxel-size 0.1 --patch-size 1024 --batch-size 1
+# python scripts/test/minimal_inference.py --data-path data/scannet_samples_large.json --voxel-size 0.02 --patch-size 1024 --batch-size 1

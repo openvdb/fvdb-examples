@@ -1,6 +1,8 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -15,7 +17,9 @@ def download_example_data(file_name: str, logger: logging.Logger):
     """
     raw_url = f"https://raw.githubusercontent.com/voxel-foundation/fvdb-test-data/scannet/unit_tests/ptv3/{file_name}"
 
-    data_dir = Path("data")
+    # Script is in scripts/data/, so go up one level to get project root
+    project_root = Path(__file__).parent.parent.parent.resolve()
+    data_dir = project_root / "data"
     data_dir.mkdir(exist_ok=True)
 
     output_file = data_dir / file_name

@@ -1,4 +1,6 @@
+# Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
+
 """
 Modified from https://github.com/Pointcept/Pointcept.git
 
@@ -9,13 +11,15 @@ and development purposes. It performs grid sampling to reduce point density and
 ensures consistent point counts per sample.
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -192,7 +196,8 @@ def export_scannet_samples(
     # Randomly sample scenes
     np.random.seed(42)
     # create a permutation of the scene paths
-    selected_paths = np.random.permutation(scene_paths)
+    selected_paths = np.array(scene_paths)
+    selected_paths = selected_paths[np.random.permutation(len(selected_paths))]
 
     # Initialize dataset
     dataset = ScanNetDataset(data_root=data_root, split=split)
@@ -304,8 +309,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Create scannet_samples_small.json
-# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output data/scannet_samples_small.json --num-samples 8 --split train --min-points 2048 --max-points 4096 --voxel-size 0.1 --patch-size 1024
-
-# Create scannet_samples_large.json
-# python prepare_scannet_dataset.py --data-root /home/hexuz/openvdb/fvdb/projects/sparse_attention/Pointcept/data/scannet --output data/scannet_samples_large.json --num-samples 4 --split train --min-points 50000 --max-points 100000 --voxel-size 0.02 --patch-size 1024
+# Run from point_transformer_v3/ directory:
+# python scripts/data/prepare_scannet_dataset.py --data-root /path/to/scannet --output data/scannet_samples_small.json --num-samples 8 --split train --min-points 2048 --max-points 4096 --voxel-size 0.1 --patch-size 1024
+# python scripts/data/prepare_scannet_dataset.py --data-root /path/to/scannet --output data/scannet_samples_large.json --num-samples 4 --split train --min-points 50000 --max-points 100000 --voxel-size 0.02 --patch-size 1024

@@ -1,0 +1,29 @@
+# Generated version file
+fvdb/version.py
+
+# Generated compile_commands.json symlink
+compile_commands.json
+
+# Top-level build files
+/build/*
+
+# Top-level directories
+dist
+.cache
+.idea
+.eggs
+cmake-build-debug
+external
+trash
+scratch
+_build
+releases/
+/data/
+/data/*
+lightning_logs
+logs
+
+# Top-level config files
+.polyscope.ini
+imgui.ini
+.vscode/launch.json
