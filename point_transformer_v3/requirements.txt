@@ -1,2 +1,20 @@
-flash-attn==2.7.4.post1
+# Core dependencies for PT-v3 FVDB implementation
 timm
+requests
+
+# flash-attn is only needed when patch_size > 0 (default config uses patch_size=1024)
+# While PyTorch 2.8+ has built-in flash attention, flash-attn provides optimized varlen functions
+# that are faster for variable-length sequences. The build is slow but worth it for performance.
+#
+# If pip install freezes or is very slow, try installing separately with:
+#   MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+# Or check for pre-built wheels at: https://github.com/Dao-AILab/flash-attention/releases
+flash-attn==2.7.4.post1
+
+# Pointcept framework dependencies (only needed when using point_transformer_v3m1_fvdb.py)
+# Install from PyG wheels for PyTorch 2.8.0 + CUDA 12.9
+--find-links https://data.pyg.org/whl/torch-2.8.0+cu129.html
+torch-cluster
+# Sparse convolution - spconv-cu129 not available, try cu124 (usually compatible with 12.9)
+# If this fails, install from source: https://github.com/traveller59/spconv
+spconv-cu124
