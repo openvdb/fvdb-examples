@@ -1,18 +1,31 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Tuple, Union, List
+"""
+PTV3 FVDB Implementation
 
-# Add NVTX import for profiling
-import flash_attn
+This module contains the core Point Transformer V3 implementation using FVDB.
+It works directly with FVDB GridBatch and JaggedTensor types.
+
+For pointcept framework integration, see point_transformer_v3m1_fvdb.py
+"""
+
+from typing import Any, Callable, cast
+
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
+
+from functools import partial
+
+import fvdb
 import torch
 import torch.nn
 import torch.nn.functional as F
 from timm.layers import DropPath
-from functools import partial
 
-import fvdb
-
+# Add NVTX import for profiling
 try:
     import torch.cuda.nvtx as nvtx
 
@@ -39,21 +52,21 @@ class PTV3_Embedding(torch.nn.Module):
         self,
         in_channels,
         embed_channels,
-        norm_layer_module: torch.nn.Module = torch.nn.LayerNorm,
+        norm_layer_module: type[torch.nn.Module] | Callable = torch.nn.LayerNorm,
         embedding_mode: str = "linear",
-        shared_plan_cache: Dict = None,
+        shared_plan_cache: dict | None = None,
     ):
         """
         Args:
             in_channels (int): Number of channels in the input features.
             embed_channels (int): Number of channels in the output features.
-            norm_layer_module (torch.nn.Module): Normalization layer module.
+            norm_layer_module (type[torch.nn.Module] | Callable): Normalization layer module.
             embedding_mode (str): The type of embedding layer, "linear" or "conv3x3", "conv5x5".
-            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
+            shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.embedding_mode = embedding_mode
-        self.shared_plan_cache = shared_plan_cache
+        self.shared_plan_cache = shared_plan_cache if shared_plan_cache is not None else {}
 
         if embedding_mode == "linear":
             self.embed = torch.nn.Linear(in_channels, embed_channels)
@@ -65,7 +78,7 @@ class PTV3_Embedding(torch.nn.Module):
         elif embedding_mode == "conv5x5":
             ## Implementation Option 1: Cascaded 3x3 convolutions
             # This approach uses two 3x3 convs to achieve a 5x5 receptive field with fewer parameters
-            # Parameters: (27 × in_channels × embed_channels) + (27 × embed_channels²)
+            # Parameters: (27 x in_channels x embed_channels) + (27 x embed_channels^2)
             self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(
                 in_channels, embed_channels, kernel_size=3, stride=1, bias=False
             )
@@ -75,7 +88,7 @@ class PTV3_Embedding(torch.nn.Module):
 
             ## Implementation Option 2: Direct 5x5 convolution
             # TODO: Implementation pending - requires additional sparse convolution support from fVDB-core.
-            # Expected parameters: 125 × in_channels × embed_channels
+            # Expected parameters: 125 x in_channels x embed_channels
             # self.embed_conv5x5_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=5, stride=1)
         else:
             raise ValueError(f"Unsupported embedding mode: {embedding_mode}")
@@ -127,7 +140,7 @@ class PTV3_Pooling(torch.nn.Module):
         kernel_size: int = 2,
         in_channels: int = 64,
         out_channels: int = 64,
-        norm_layer_module: torch.nn.Module = torch.nn.LayerNorm,
+        norm_layer_module: type[torch.nn.Module] | Callable = torch.nn.LayerNorm,
     ):
         """
         Args:
@@ -162,7 +175,7 @@ class PTV3_Unpooling(torch.nn.Module):
         in_channels: int = 64,
         out_channels: int = 64,
         skip_channels: int = 64,
-        norm_layer_module: torch.nn.Module = torch.nn.LayerNorm,
+        norm_layer_module: type[torch.nn.Module] | Callable = torch.nn.LayerNorm,
     ):
         """
         Args:
@@ -238,7 +251,7 @@ class PTV3_Attention(torch.nn.Module):
         num_heads: int,
         proj_drop: float = 0.0,
         patch_size: int = 0,
-        qk_scale: float = None,
+        qk_scale: float | None = None,
         sliding_window_attention: bool = False,
         order_index: int = 0,
         order_types: tuple = ("vdb",),
@@ -249,7 +262,7 @@ class PTV3_Attention(torch.nn.Module):
             num_heads (int): Number of attention heads in each block.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
-            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
+            qk_scale (float | None): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_index (int): Index into order_types to select which order to use for this block.
             order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
@@ -377,6 +390,9 @@ class PTV3_Attention(torch.nn.Module):
 
         if self.sliding_window_attention and self.patch_size > 0:
             # Perform sliding window attention per-grid using flash attention
+            assert (
+                flash_attn is not None
+            ), "flash_attn is required for sliding_window_attention. Install with: pip install flash-attn"
             num_voxels = feats_j.shape[0]
             H = self.num_heads
             D = self.head_dim
@@ -390,8 +406,11 @@ class PTV3_Attention(torch.nn.Module):
                     continue
                 qkv_b = qkv[start:end].view(1, Li, 3, H, D)
                 window_size = (self.patch_size // 2, self.patch_size // 2)
-                out_b = flash_attn.flash_attn_qkvpacked_func(
-                    qkv_b.half(), dropout_p=0.0, softmax_scale=self.scale, window_size=window_size
+                out_b = cast(
+                    Any,
+                    flash_attn.flash_attn_qkvpacked_func(
+                        qkv_b.half(), dropout_p=0.0, softmax_scale=self.scale, window_size=window_size
+                    ),
                 ).reshape(
                     Li, self.hidden_size
                 )  # dtype: float16
@@ -405,6 +424,9 @@ class PTV3_Attention(torch.nn.Module):
 
         elif self.patch_size > 0:
             # Perform attention within each patch_size window per-grid using varlen API
+            assert (
+                flash_attn is not None
+            ), "flash_attn is required when patch_size > 0. Install with: pip install flash-attn"
             num_voxels = feats_j.shape[0]
             H = self.num_heads
             D = self.head_dim
@@ -431,12 +453,15 @@ class PTV3_Attention(torch.nn.Module):
                 cu_seqlens = torch.zeros(len(lengths) + 1, device=qkv.device, dtype=torch.int32)
                 cu_seqlens[1:] = torch.as_tensor(lengths, device=qkv.device, dtype=torch.int32).cumsum(dim=0)
 
-                feats_out_j = flash_attn.flash_attn_varlen_qkvpacked_func(
-                    qkv.half(),
-                    cu_seqlens,
-                    max_seqlen=self.patch_size,
-                    dropout_p=0.0,  # TODO: implement attention dropout in the future. By default, it is 0.
-                    softmax_scale=self.scale,
+                feats_out_j = cast(
+                    Any,
+                    flash_attn.flash_attn_varlen_qkvpacked_func(
+                        qkv.half(),
+                        cu_seqlens,
+                        max_seqlen=self.patch_size,
+                        dropout_p=0.0,  # TODO: implement attention dropout in the future. By default, it is 0.
+                        softmax_scale=self.scale,
+                    ),
                 ).reshape(
                     num_voxels, self.hidden_size
                 )  # dtype: float16
@@ -461,17 +486,17 @@ class PTV3_Attention(torch.nn.Module):
 
 
 class PTV3_CPE(torch.nn.Module):
-    def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False, shared_plan_cache: Dict = None):
+    def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False, shared_plan_cache: dict | None = None):
         """
         Args:
             hidden_size (int): Number of channels in the input features.
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
-            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
+            shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.hidden_size = hidden_size
         self.no_conv_in_cpe = no_conv_in_cpe
-        self.shared_plan_cache = shared_plan_cache
+        self.shared_plan_cache = shared_plan_cache if shared_plan_cache is not None else {}
         self.cpe = torch.nn.ModuleList(
             [
                 (
@@ -521,12 +546,12 @@ class PTV3_Block(torch.nn.Module):
         drop_path: float,
         proj_drop: float = 0.0,
         patch_size: int = 0,
-        qk_scale: float = None,
+        qk_scale: float | None = None,
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
         order_index: int = 0,
         order_types: tuple = ("vdb",),
-        shared_plan_cache: Dict = None,
+        shared_plan_cache: dict | None = None,
     ):
         """
         Args:
@@ -535,12 +560,12 @@ class PTV3_Block(torch.nn.Module):
             drop_path (float): Drop path rate for regularization.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
-            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
+            qk_scale (float | None): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_index (int): Index into order_types to select which order to use for this block.
             order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
-            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
+            shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
 
@@ -599,11 +624,11 @@ class PTV3_Encoder(torch.nn.Module):
         drop_path,  # drop_path is a list of drop path rates for each block.
         proj_drop: float = 0.0,
         patch_size: int = 0,
-        qk_scale: float = None,
+        qk_scale: float | None = None,
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
         order_types: tuple = ("vdb",),
-        shared_plan_cache: Dict = None,
+        shared_plan_cache: dict | None = None,
     ):
         """
         Args:
@@ -613,11 +638,11 @@ class PTV3_Encoder(torch.nn.Module):
             drop_path (list): Drop path rates for each block.
             proj_drop (float): Dropout rate for MLP layers.
             patch_size (int): Patch size for patch attention.
-            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
+            qk_scale (float | None): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
             order_types (tuple): Tuple of order type strings (e.g., ("z", "z-trans")).
-            shared_plan_cache (Dict): Shared cache for ConvolutionPlans across all layers.
+            shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.depth = depth
@@ -653,27 +678,27 @@ class PTV3(torch.nn.Module):
         self,
         num_classes: int,
         input_dim: int = 6,  # xyz + intensity/reflectance + additional features
-        enc_depths: Tuple[int, ...] = (
+        enc_depths: tuple[int, ...] = (
             2,
             2,
             2,
             2,
         ),  # default hyper-parameters to align with sonata ptv3's default hyper-parameters.
-        enc_channels: Tuple[int, ...] = (32, 64, 128, 256, 512),
-        enc_num_heads: Tuple[int, ...] = (2, 4, 8, 16, 32),
-        # enc_patch_size: Tuple[int, ...] = (4096),
-        dec_depths: Tuple[int, ...] = (),  # by default, no decoder.
-        dec_channels: Tuple[int, ...] = (),
-        dec_num_heads: Tuple[int, ...] = (),
+        enc_channels: tuple[int, ...] = (32, 64, 128, 256, 512),
+        enc_num_heads: tuple[int, ...] = (2, 4, 8, 16, 32),
+        # enc_patch_size: tuple[int, ...] = (4096),
+        dec_depths: tuple[int, ...] = (),  # by default, no decoder.
+        dec_channels: tuple[int, ...] = (),
+        dec_num_heads: tuple[int, ...] = (),
         patch_size: int = 0,
         drop_path: float = 0.3,
         proj_drop: float = 0.0,
-        qk_scale: float = None,
+        qk_scale: float | None = None,
         enable_batch_norm: bool = False,
         embedding_mode: str = "linear",
         no_conv_in_cpe: bool = False,
         sliding_window_attention: bool = False,
-        order_type: Union[str, tuple] = ("z", "z-trans"),
+        order_type: str | tuple = ("z", "z-trans"),
         shuffle_orders: bool = True,
     ) -> None:
         """
@@ -682,22 +707,22 @@ class PTV3(torch.nn.Module):
         Args:
             num_classes (int): Number of classes for segmentation.
             input_dim (int): Input feature dimension (default: 4 for xyz + intensity).
-            hidden_dims (Tuple[int, ...]): Hidden layer dimensions (not used in simplified version).
-            enc_depths (Tuple[int, ...]): Number of encoder blocks for each stage.
-            enc_channels (Tuple[int, ...]): Number of channels for each stage.
-            enc_num_heads (Tuple[int, ...]): Number of attention heads for each stage.
-            dec_depths (Tuple[int, ...]): Number of decoder blocks for each stage.
-            dec_channels (Tuple[int, ...]): Number of channels for each stage.
-            dec_num_heads (Tuple[int, ...]): Number of attention heads for each stage.
+            hidden_dims (tuple[int, ...]): Hidden layer dimensions (not used in simplified version).
+            enc_depths (tuple[int, ...]): Number of encoder blocks for each stage.
+            enc_channels (tuple[int, ...]): Number of channels for each stage.
+            enc_num_heads (tuple[int, ...]): Number of attention heads for each stage.
+            dec_depths (tuple[int, ...]): Number of decoder blocks for each stage.
+            dec_channels (tuple[int, ...]): Number of channels for each stage.
+            dec_num_heads (tuple[int, ...]): Number of attention heads for each stage.
             patch_size (int): Patch size for patch attention.
             drop_path (float): Drop path rate for regularization.
             proj_drop (float): Dropout rate for MLP layers.
-            qk_scale (float): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
+            qk_scale (float | None): Scale factor for query-key dot product. If None, uses 1/sqrt(head_dim).
             enable_batch_norm (bool): Whether to use batch normalization for the embedding, down pooling, and up pooling.
             embedding_mode (bool): the mode for the embedding layer, "linear" or "conv3x3", "conv5x5".
             no_conv_in_cpe (bool): Whether to disable convolution in CPE.
             sliding_window_attention (bool): Whether to use sliding window attention (uses patch_size as window size).
-            order (Union[str, tuple]): The type(s) of point ordering. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans")
+            order (str | tuple): The type(s) of point ordering. Can be a single string ("vdb", "z", "z-trans", "hilbert", "hilbert-trans")
                 or a tuple of strings (e.g., ("z", "z-trans")). Each block within a stage cycles through the order types.
             shuffle_orders (bool): Whether to shuffle the order of order types at the beginning of each forward pass and after each pooling.
         """

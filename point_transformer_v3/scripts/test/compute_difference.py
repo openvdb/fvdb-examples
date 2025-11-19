@@ -6,17 +6,19 @@ Script to compute average deviation between two minimal_inference_stats.json fil
 Usage: python compute_difference.py file1.json file2.json
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 
 
-def load_stats_file(filepath: str, logger: logging.Logger) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def load_stats_file(filepath: str, logger: logging.Logger) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load and parse a minimal_inference_stats.json file.
 
     Args:
@@ -58,8 +60,8 @@ def load_stats_file(filepath: str, logger: logging.Logger) -> tuple[List[Dict[st
 
 
 def compute_deviations(
-    stats1: List[Dict[str, Any]], stats2: List[Dict[str, Any]], logger: logging.Logger
-) -> Dict[str, Dict[str, float]]:
+    stats1: list[dict[str, Any]], stats2: list[dict[str, Any]], logger: logging.Logger
+) -> dict[str, dict[str, float]]:
     """Compute deviations between corresponding entries in two stats files.
 
     Args:
@@ -120,8 +122,8 @@ def compute_deviations(
 
 
 def compute_global_deviations(
-    global_stats1: Dict[str, Any], global_stats2: Dict[str, Any], logger: logging.Logger
-) -> Dict[str, Dict[str, float]]:
+    global_stats1: dict[str, Any], global_stats2: dict[str, Any], logger: logging.Logger
+) -> dict[str, dict[str, float]]:
     """Compute deviations between global statistics from two files.
 
     Args:
@@ -251,8 +253,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-# scannet_samples_large.json
-# python compute_difference.py --stats_path_1 data/scannet_samples_large_output.json --stats_path_2 data/scannet_samples_large_output_gt.json
-
-# scannet_samples_small.json
-# python compute_difference.py --stats_path_1 data/scannet_samples_small_output.json --stats_path_2 data/scannet_samples_small_output_gt.json
+# Run from point_transformer_v3/ directory:
+# python scripts/test/compute_difference.py --stats_path_1 data/scannet_samples_large_output.json --stats_path_2 data/scannet_samples_large_output_gt.json
+# python scripts/test/compute_difference.py --stats_path_1 data/scannet_samples_small_output.json --stats_path_2 data/scannet_samples_small_output_gt.json

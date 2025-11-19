@@ -1,0 +1,3 @@
+# Ignore all submodules in external directories
+**/external/**
+
