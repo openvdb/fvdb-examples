@@ -8,6 +8,8 @@ This script demonstrates how to:
 2. Load and run the PT-v3 model
 """
 
+from __future__ import annotations
+
 import argparse
 import gc
 import json
@@ -15,6 +17,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # Setup paths for imports
 # Script is in scripts/test/, so go up two levels to get project root
@@ -45,7 +48,9 @@ except ImportError:
     nvtx = DummyNVTX()
 
 
-def create_ptv3_model(args, device, num_classes):
+def create_ptv3_model(
+    args: argparse.Namespace, device: torch.device | str, num_classes: int
+) -> torch.nn.Module:
     """Create a PT-v3 model.
 
     Args:
@@ -137,7 +142,9 @@ def create_ptv3_model(args, device, num_classes):
     return model
 
 
-def prepare_batched_inputs_from_scannet_points(batch_samples, voxel_size=0.1, device="cuda"):
+def prepare_batched_inputs_from_scannet_points(
+    batch_samples: list[dict[str, Any]], voxel_size: float = 0.1, device: torch.device | str = "cuda"
+) -> tuple[fvdb.GridBatch, fvdb.JaggedTensor]:
     """Prepare batched inputs from a list of ScanNet-like samples.
 
     Args:

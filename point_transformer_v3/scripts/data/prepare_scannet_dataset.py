@@ -9,13 +9,15 @@ and development purposes. It performs grid sampling to reduce point density and
 ensures consistent point counts per sample.
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -192,7 +194,8 @@ def export_scannet_samples(
     # Randomly sample scenes
     np.random.seed(42)
     # create a permutation of the scene paths
-    selected_paths = np.random.permutation(scene_paths)
+    selected_paths = np.array(scene_paths)
+    selected_paths = selected_paths[np.random.permutation(len(selected_paths))]
 
     # Initialize dataset
     dataset = ScanNetDataset(data_root=data_root, split=split)

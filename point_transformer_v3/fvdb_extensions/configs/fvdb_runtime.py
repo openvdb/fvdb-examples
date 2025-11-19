@@ -1,3 +1,12 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Runtime configuration for FVDB-based Point Transformer V3 models.
+"""
+
+from __future__ import annotations
+
 weight = None  # path to model weight
 resume = False  # whether to resume training process
 evaluate = True  # evaluate after each epoch training process
@@ -44,4 +53,3 @@ train = dict(type="DefaultTrainer")
 
 # Tester
 test = dict(type="SemSegTester", verbose=True)
-
