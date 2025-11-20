@@ -125,5 +125,161 @@ class TestPointCreation(unittest.TestCase):
         self.assertTrue(torch.all(point.offset == torch.tensor([30, 50])))
 
 
+class TestPointBatchesAndGridCoords(unittest.TestCase):
+    """Additional tests to validate Point batches and grid coordinates."""
+
+    def test_multi_batch_batch_auto_generated_from_offset(self):
+        """Given multi-batch offsets, verify that batch indices are correctly generated."""
+        # 3 batches with sizes 2, 3, 4 -> cumulative offsets [2, 5, 9]
+        num_points = 9
+        coord = torch.rand(num_points, 3)
+        feat = torch.rand(num_points, 3)
+        offset = torch.tensor([2, 5, 9], dtype=torch.int64)
+
+        point = Point({"coord": coord, "feat": feat, "offset": offset, "grid_size": 0.1})
+
+        # Expected batch vector: [0, 0, 1, 1, 1, 2, 2, 2, 2]
+        expected_batch = torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=torch.long)
+        self.assertIn("batch", point)
+        self.assertTrue(torch.equal(point.batch, expected_batch))
+        self.assertTrue(torch.equal(point.offset, offset))
+
+    def test_multi_batch_offset_auto_generated_from_batch(self):
+        """Given multi-batch batch indices, verify that offsets are correctly generated."""
+        # 3 batches with sizes 2, 3, 4 -> cumulative offsets [2, 5, 9]
+        coord = torch.rand(9, 3)
+        feat = torch.rand(9, 3)
+        batch = torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=torch.long)
+
+        point = Point({"coord": coord, "feat": feat, "batch": batch, "grid_size": 0.1})
+
+        expected_offset = torch.tensor([2, 5, 9], dtype=torch.int64)
+        self.assertIn("offset", point)
+        self.assertTrue(torch.equal(point.batch, batch))
+        self.assertTrue(torch.equal(point.offset, expected_offset))
+
+    def test_grid_coord_generation_single_batch(self):
+        """Verify that grid_coord is generated as expected for a single batch."""
+        # Construct a small, deterministic point cloud
+        coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [0.0, 0.0, 3.0],
+            ],
+            dtype=torch.float32,
+        )
+        feat = torch.rand(4, 3)
+        offset = torch.tensor([4], dtype=torch.int64)
+        grid_size = 1.0
+
+        point = Point({"coord": coord, "feat": feat, "offset": offset, "grid_size": grid_size})
+
+        # Trigger grid_coord creation via serialization
+        point.serialization(order="z")
+
+        # Expected grid coordinates:
+        # coord_min = [0.0, 0.0, 0.0]
+        # (coord - coord_min) / grid_size, truncated to int
+        expected_grid_coord = torch.tensor(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 2, 0],
+                [0, 0, 3],
+            ],
+            dtype=torch.int32,
+        )
+
+        self.assertIn("grid_coord", point)
+        self.assertTrue(torch.equal(point.grid_coord, expected_grid_coord))
+
+    def test_grid_coord_generation_multi_batch_uses_global_min(self):
+        """Verify that grid_coord computation uses the global minimum across batches."""
+        # Two batches of 2 points each; second batch is shifted in space
+        coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],  # batch 0
+                [1.0, 0.0, 0.0],  # batch 0
+                [9.0, 0.0, 0.0],  # batch 1
+                [11.0, 2.0, 3.0],  # batch 1
+            ],
+            dtype=torch.float32,
+        )
+        feat = torch.rand(4, 3)
+        batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+        grid_size = 1.0
+
+        point = Point({"coord": coord, "feat": feat, "batch": batch, "grid_size": grid_size})
+
+        # Trigger grid_coord creation via serialization
+        point.serialization(order="z")
+
+        # Global coord_min = [0.0, 0.0, 0.0]
+        # (coord - coord_min) / grid_size, truncated to int
+        expected_grid_coord = torch.tensor(
+            [
+                [0, 0, 0],  # (0.0, 0.0, 0.0)
+                [1, 0, 0],  # (1.0, 0.0, 0.0)
+                [9, 0, 0],  # (9.0, 0.0, 0.0)
+                [11, 2, 3],  # (11.0, 2.0, 3.0)
+            ],
+            dtype=torch.int32,
+        )
+
+        self.assertIn("grid_coord", point)
+        self.assertTrue(torch.equal(point.grid_coord, expected_grid_coord))
+
+    def test_grid_coord_non_unit_grid_size_single_batch(self):
+        """grid_coord generation should respect a non-unit, uniform grid size (single batch)."""
+        coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.15, 0.0, 0.0],
+                [0.0, 0.30, 0.0],
+                [0.0, 0.0, 0.45],
+            ],
+            dtype=torch.float32,
+        )
+        feat = torch.rand(4, 3)
+        offset = torch.tensor([4], dtype=torch.int64)
+        grid_size = 0.15
+
+        point = Point({"coord": coord, "feat": feat, "offset": offset, "grid_size": grid_size})
+        point.serialization(order="z")
+
+        # Expected: same formula as Point.serialization uses
+        coord_min = coord.min(0)[0]
+        expected_grid_coord = torch.div(coord - coord_min, grid_size, rounding_mode="trunc").int()
+
+        self.assertIn("grid_coord", point)
+        self.assertTrue(torch.equal(point.grid_coord, expected_grid_coord))
+
+    def test_grid_coord_non_unit_grid_size_multi_batch_global_min(self):
+        """With non-unit grid size, grid_coord still uses the global min across batches."""
+        coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],  # batch 0
+                [0.15, 0.0, 0.0],  # batch 0
+                [0.75, 0.0, 0.0],  # batch 1
+                [1.05, 0.30, 0.45],  # batch 1
+            ],
+            dtype=torch.float32,
+        )
+        feat = torch.rand(4, 3)
+        batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+        grid_size = 0.15
+
+        point = Point({"coord": coord, "feat": feat, "batch": batch, "grid_size": grid_size})
+        point.serialization(order="z")
+
+        coord_min = coord.min(0)[0]
+        expected_grid_coord = torch.div(coord - coord_min, grid_size, rounding_mode="trunc").int()
+
+        self.assertIn("grid_coord", point)
+        self.assertTrue(torch.equal(point.grid_coord, expected_grid_coord))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
