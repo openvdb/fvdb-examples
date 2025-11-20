@@ -1,3 +1,6 @@
 [submodule "point_transformer_v3/pointcept_minimal"]
 	path = point_transformer_v3/external/pointcept
 	url = https://github.com/Pointcept/Pointcept.git
+[submodule "point_transformer_v3/external/fvdb-core"]
+	path = point_transformer_v3/external/fvdb-core-REFERENCE-ONLY
+	url = https://github.com/openvdb/fvdb-core.git

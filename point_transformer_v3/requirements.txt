@@ -1,6 +1,11 @@
 # Core dependencies for PT-v3 FVDB implementation
 timm
 requests
+addict
+peft
+wandb
+tensorboard
+tensorboardx
 
 # flash-attn is only needed when patch_size > 0 (default config uses patch_size=1024)
 # While PyTorch 2.8+ has built-in flash attention, flash-attn provides optimized varlen functions

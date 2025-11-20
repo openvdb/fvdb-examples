@@ -8,9 +8,14 @@ This repository contains a minimal implementation of Point Transformer V3 using 
 # Activate fvdb conda environment
 conda activate fvdb
 
-# Install dependencies
+# Install the package in editable mode (this sets up all imports properly)
 cd fvdb-examples/point_transformer_v3
-pip install -r requirements.txt
+pip install -e .
+
+# This installs the package and makes:
+# - fvdb_extensions importable
+# - pointcept importable (from external/pointcept/pointcept)
+# No need for manual sys.path manipulation!
 ```
 
 
