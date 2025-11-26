@@ -19,29 +19,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Normal imports - no path manipulation needed when package is installed with pip install -e .
-
+import fvdb
 import numpy as np
 import torch
+from fvdb_extensions.models.fvdb_utils import NVTXRange
 from fvdb_extensions.models.ptv3_fvdb import PTV3
 
-import fvdb
-
-try:
-    import torch.cuda.nvtx as nvtx
-
-    NVTX_AVAILABLE = True
-except ImportError:
-    NVTX_AVAILABLE = False
-
-    class DummyNVTX:
-        def range_push(self, msg):
-            pass
-
-        def range_pop(self):
-            pass
-
-    nvtx = DummyNVTX()
+# Normal imports - no path manipulation needed when package is installed with pip install -e .
 
 
 def create_ptv3_model(args: argparse.Namespace, device: torch.device | str, num_classes: int) -> torch.nn.Module:
@@ -138,7 +122,7 @@ def create_ptv3_model(args: argparse.Namespace, device: torch.device | str, num_
 
 def prepare_batched_inputs_from_scannet_points(
     batch_samples: list[dict[str, Any]], voxel_size: float = 0.1, device: torch.device | str = "cuda"
-) -> tuple[fvdb.GridBatch, fvdb.JaggedTensor]:
+) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
     """Prepare batched inputs from a list of ScanNet-like samples.
 
     Args:
@@ -164,7 +148,9 @@ def prepare_batched_inputs_from_scannet_points(
     jfeats = color_vdb_order.jdata
     # jfeats = fvdb.jcat([grid.ijk.float(), jfeats], dim=1)
     jfeats = fvdb.jcat([grid.ijk.float(), color_vdb_order], dim=1)
-    return grid, jfeats
+    assert isinstance(jfeats, fvdb.JaggedTensor), "Output jfeats must be a JaggedTensor"
+    assert isinstance(grid, fvdb.GridBatch), "Output grid must be a GridBatch"
+    return jfeats, grid
     # import pdb; pdb.set_trace()
     # jfeats = torch.cat([grid.ijk.float(), jfeats], dim=1)
     # return grid, fvdb.JaggedTensor(jfeats)
@@ -242,14 +228,12 @@ def main():
 
         # Run inference
         logger.info("Running batched inference...")
-        nvtx.range_push("inference")
-        nvtx.range_push("create_batched_grid_from_points")
-        init_grid, init_feat = prepare_batched_inputs_from_scannet_points(
-            batch, voxel_size=args.voxel_size, device=device
-        )
-        nvtx.range_pop()
-        grid, feats = model(init_grid, init_feat)
-        nvtx.range_pop()
+        with NVTXRange("inference"):
+            with NVTXRange("create_batched_grid_from_points"):
+                init_feat, init_grid = prepare_batched_inputs_from_scannet_points(
+                    batch, voxel_size=args.voxel_size, device=device
+                )
+            feats = model(init_feat, init_grid)
 
         # Compute per-sample forward stats by splitting with offsets
         offsets = feats.joffsets.to(device=feats.jdata.device, dtype=torch.int64)
@@ -279,10 +263,9 @@ def main():
 
         # Test backward path - compute accumulated gradients for the entire batch
         logger.info("Testing backward path...")
-        nvtx.range_push("backward")
-        batch_loss = feats.jdata.sum()  # Total loss for the entire batch
-        batch_loss.backward()
-        nvtx.range_pop()
+        with NVTXRange("backward"):
+            batch_loss = feats.jdata.sum()  # Total loss for the entire batch
+            batch_loss.backward()
 
         # Collect gradient from the first module and accumulate across batches
         batch_first_module_grad_last16 = None

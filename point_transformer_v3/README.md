@@ -27,7 +27,11 @@ pip install -e .
 python scripts/data/download_example_data.py
 
 # Run inference
-python scripts/test/minimal_inference.py --data-path data/scannet_samples_small.json --voxel-size 0.1 --patch-size 1024 --batch-size 1
+python scripts/test/minimal_inference.py \
+  --data-path data/scannet_samples_small.json \
+  --voxel-size 0.1 \
+  --patch-size 1024 \
+  --batch-size 1
 
 # Compare results
 python scripts/test/compute_difference.py --stats_path_1 data/scannet_samples_small_output.json --stats_path_2 data/scannet_samples_small_output_gt.json
