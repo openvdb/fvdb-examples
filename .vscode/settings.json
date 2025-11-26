@@ -37,7 +37,15 @@
     },
     "python.defaultInterpreterPath": "${env:CONDA_PREFIX}/envs/fvdb/bin/python",
     "python.analysis.extraPaths": [
-        "../fvdb-core"
+        "../fvdb-core",
+        "${workspaceFolder}/point_transformer_v3/external/pointcept"
+    ],
+    "python.autoComplete.extraPaths": [
+        "../fvdb-core",
+        "${workspaceFolder}/point_transformer_v3/external/pointcept"
+    ],
+    "python.analysis.exclude": [
+        "**/external/**"
     ],
     "python.analysis.typeCheckingMode": "basic",
     "python.testing.unittestArgs": [
@@ -47,11 +55,13 @@
     "python.testing.unittestEnabled": false,
     "python.testing.pytestArgs": [
         "-v",
-        "tests"
+        "point_transformer_v3/tests"
     ],
     "black-formatter.args": [
         "--target-version=py311",
-        "--line-length=120"
+        "--line-length=120",
+        "--extend-exclude",
+        ".*/external/.*"
     ],
     "python.analysis.diagnosticSeverityOverrides": {
         "reportPrivateImportUsage": "none",
@@ -66,6 +76,14 @@
     "cursorpyright.analysis.diagnosticSeverityOverrides": {
         "reportPrivateImportUsage": "none"
     },
+    "cursorpyright.analysis.extraPaths": [
+        "../fvdb-core",
+        "${workspaceFolder}/point_transformer_v3/external/pointcept"
+    ],
     "cursorpyright.analysis.typeCheckingMode": "basic",
+    "cursorpyright.analysis.exclude": [
+        "**/external/**"
+    ],
+    "basedpyright.configFile": "${workspaceFolder}/point_transformer_v3/pyproject.toml",
     "python.REPL.enableREPLSmartSend": false,
 }

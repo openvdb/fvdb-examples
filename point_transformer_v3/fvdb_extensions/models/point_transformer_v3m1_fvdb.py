@@ -128,7 +128,11 @@ class PointTransformerV3(PointModule):
             shuffle_orders=shuffle_orders,
         )
 
-    def forward(self, data_dict):
+    def __call__(self, data_dict: dict) -> torch.Tensor:
+        """Override __call__ to preserve type hints from forward."""
+        return super().__call__(data_dict)
+
+    def forward(self, data_dict: dict) -> torch.Tensor:
 
         grid_coord = data_dict["grid_coord"]
         feat = data_dict["feat"]
@@ -169,7 +173,7 @@ class PointTransformerV3(PointModule):
                 # catted_input_feat.append(jfeats.jdata)
                 # catted_original_coord_to_voxel_idx.append(original_coord_to_voxel_idx.jdata)
                 # grid shape and feats values match here.
-                grid, jfeats = self.fvdb_ptv3_model(grid, jfeats)
+                jfeats = self.fvdb_ptv3_model(jfeats, grid)
                 # feats values does not match here.
 
                 # Get output for this point cloud.
@@ -203,9 +207,9 @@ class PointTransformerV3(PointModule):
             # import pdb; pdb.set_trace()
             if torch.is_autocast_enabled():
                 with torch.autocast(device_type="cuda", enabled=False):
-                    grid, jfeats = self.fvdb_ptv3_model(grid, jfeats)
+                    jfeats = self.fvdb_ptv3_model(jfeats, grid)
             else:
-                grid, jfeats = self.fvdb_ptv3_model(grid, jfeats)
+                jfeats = self.fvdb_ptv3_model(jfeats, grid)
 
             output = jfeats.jdata[original_coord_to_voxel_idx.jdata]
             # import pdb; pdb.set_trace()

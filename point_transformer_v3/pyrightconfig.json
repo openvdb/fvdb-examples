@@ -1,0 +1,11 @@
+{
+    "extraPaths": [
+        "external/pointcept"
+    ],
+    "executionEnvironments": [
+        {
+            "root": "."
+        }
+    ]
+}
+

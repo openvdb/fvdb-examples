@@ -10,14 +10,8 @@ It works directly with FVDB GridBatch and JaggedTensor types.
 For pointcept framework integration, see point_transformer_v3m1_fvdb.py
 """
 
-from typing import Any, Callable, cast
-
-try:
-    import flash_attn
-except ImportError:
-    flash_attn = None
-
 from functools import partial
+from typing import Callable
 
 import fvdb
 import torch
@@ -25,25 +19,17 @@ import torch.nn
 import torch.nn.functional as F
 from timm.layers import DropPath
 
-# Add NVTX import for profiling
-try:
-    import torch.cuda.nvtx as nvtx
-
-    NVTX_AVAILABLE = True
-except ImportError:
-    NVTX_AVAILABLE = False
-
-    class DummyNVTX:
-        def range_push(self, msg):
-            pass
-
-        def range_pop(self):
-            pass
-
-    nvtx = DummyNVTX()
+from .fvdb_utils import (
+    FJTM,
+    FVDBGridModule,
+    NVTXRange,
+    inverse_order_features_from_perm,
+    jagged_attention,
+    order_features_from_jagged_ijk,
+)
 
 
-class PTV3_Embedding(torch.nn.Module):
+class PTV3_Embedding(FVDBGridModule):
     """
     PTV3_Embedding for 3D point cloud embedding.
     """
@@ -62,76 +48,60 @@ class PTV3_Embedding(torch.nn.Module):
             embed_channels (int): Number of channels in the output features.
             norm_layer_module (type[torch.nn.Module] | Callable): Normalization layer module.
             embedding_mode (str): The type of embedding layer, "linear" or "conv3x3", "conv5x5".
-            shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
+            #shared_plan_cache (dict | None): Shared cache for ConvolutionPlans across all layers.
         """
         super().__init__()
         self.embedding_mode = embedding_mode
         self.shared_plan_cache = shared_plan_cache if shared_plan_cache is not None else {}
 
         if embedding_mode == "linear":
-            self.embed = torch.nn.Linear(in_channels, embed_channels)
+            self.embed = FJTM(torch.nn.Linear(in_channels, embed_channels))
         elif embedding_mode == "conv3x3":
             # Initialize embedding using FVDB's sparse 3D convolution
             self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(
                 in_channels, embed_channels, kernel_size=3, stride=1, bias=False
             )
         elif embedding_mode == "conv5x5":
-            ## Implementation Option 1: Cascaded 3x3 convolutions
-            # This approach uses two 3x3 convs to achieve a 5x5 receptive field with fewer parameters
-            # Parameters: (27 x in_channels x embed_channels) + (27 x embed_channels^2)
-            self.embed_conv3x3_1 = fvdb.nn.SparseConv3d(
-                in_channels, embed_channels, kernel_size=3, stride=1, bias=False
-            )
-            self.embed_conv3x3_2 = fvdb.nn.SparseConv3d(
-                embed_channels, embed_channels, kernel_size=3, stride=1, bias=False
-            )
-
-            ## Implementation Option 2: Direct 5x5 convolution
-            # TODO: Implementation pending - requires additional sparse convolution support from fVDB-core.
-            # Expected parameters: 125 x in_channels x embed_channels
-            # self.embed_conv5x5_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=5, stride=1)
+            # Initialize embedding using FVDB's sparse 3D convolution
+            self.embed_conv5x5_1 = fvdb.nn.SparseConv3d(in_channels, embed_channels, kernel_size=5, stride=1)
         else:
             raise ValueError(f"Unsupported embedding mode: {embedding_mode}")
 
-        self.norm_layer = norm_layer_module(embed_channels)
-        self.act_layer = torch.nn.GELU()
+        self.norm_layer = FJTM(norm_layer_module(embed_channels))
+        self.act_layer = FJTM(torch.nn.GELU())
 
-    def _get_plan(self, grid, kernel_size, stride):
+    def _get_plan(self, grid: fvdb.GridBatch, kernel_size, stride):
         """Get or create a ConvolutionPlan from shared cache."""
-        cache_key = (grid.address, kernel_size, stride)
-        if cache_key not in self.shared_plan_cache:
-            self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
-                kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
-            )
-        return self.shared_plan_cache[cache_key]
+        # target_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_Embedding")
+        # We definitely want the target grid to be the same as the source grid,
+        # because we need the topology to remain the same.
+        return fvdb.ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
+        )
+        # cache_key = (grid.address, kernel_size, stride)
+        # if cache_key not in self.shared_plan_cache:
+        #     self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
+        #         kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
+        #     )
+        # return self.shared_plan_cache[cache_key]
 
-        if self.embedding_mode == "linear":
-            jfeats = feats.jdata
-            jfeats = self.embed(jfeats)
-        elif self.embedding_mode == "conv3x3":
-            # Apply 3x3 sparse convolution using shared ConvolutionPlan cache
-            plan = self._get_plan(grid, kernel_size=3, stride=1)
-            feats = self.embed_conv3x3_1(feats, plan)
-            jfeats = feats.jdata
-        elif self.embedding_mode == "conv5x5":
-            # First 3x3 convolution
-            plan1 = self._get_plan(grid, kernel_size=3, stride=1)
-            feats = self.embed_conv3x3_1(feats, plan1)
+    # We use the same output grid as the input grid to maintain topology, so only the
+    # features are updated.
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
+        with NVTXRange("PTV3_Embedding"):
+            if self.embedding_mode == "linear":
+                feats = self.embed(feats)
+            elif self.embedding_mode == "conv3x3":
+                plan = self._get_plan(grid, kernel_size=3, stride=1)
+                feats = self.embed_conv3x3_1(feats, plan)
+            elif self.embedding_mode == "conv5x5":
+                plan = self._get_plan(grid, kernel_size=5, stride=1)
+                feats = self.embed_conv5x5_1(feats, plan)
 
-            # Second 3x3 convolution (same grid since stride=1, in-place)
-            plan2 = self._get_plan(grid, kernel_size=3, stride=1)
-            feats = self.embed_conv3x3_2(feats, plan2)
-            jfeats = feats.jdata
-
-        jfeats = self.norm_layer(jfeats)
-        jfeats = self.act_layer(jfeats)
-
-        feats = grid.jagged_like(jfeats)
-        nvtx.range_pop()
-        return grid, feats
+            feats = self.norm_layer(feats)
+            feats = self.act_layer(feats)
+        return feats
 
 
 class PTV3_Pooling(torch.nn.Module):
@@ -150,22 +120,22 @@ class PTV3_Pooling(torch.nn.Module):
         """
         super().__init__()
         self.kernel_size = kernel_size
-        self.proj = torch.nn.Linear(in_channels, out_channels)
-        self.norm_layer = norm_layer_module(out_channels)
-        self.act_layer = torch.nn.GELU()
+        self.proj = FJTM(torch.nn.Linear(in_channels, out_channels))
+        self.norm_layer = FJTM(norm_layer_module(out_channels))
+        self.act_layer = FJTM(torch.nn.GELU())
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_Pooling")
-        feats_j = self.proj(feats.jdata)
-        feats = grid.jagged_like(feats_j)
+    def __call__(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
+        """Override __call__ to preserve type hints from forward."""
+        return super().__call__(feats, grid)
 
-        ds_feature, ds_grid = grid.max_pool(self.kernel_size, feats, stride=self.kernel_size, coarse_grid=None)
-        ds_feature_j = ds_feature.jdata
-        ds_feature_j = self.norm_layer(ds_feature_j)
-        ds_feature_j = self.act_layer(ds_feature_j)
-        ds_feature = ds_grid.jagged_like(ds_feature_j)
-        nvtx.range_pop()
-        return ds_grid, ds_feature
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
+        with NVTXRange("PTV3_Pooling"):
+            feats = self.proj(feats)
+
+            ds_feature, ds_grid = grid.max_pool(self.kernel_size, feats, stride=self.kernel_size, coarse_grid=None)
+            ds_feature = self.norm_layer(ds_feature)
+            ds_feature = self.act_layer(ds_feature)
+        return ds_feature, ds_grid
 
 
 class PTV3_Unpooling(torch.nn.Module):
@@ -190,30 +160,39 @@ class PTV3_Unpooling(torch.nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.proj = torch.nn.Linear(in_channels, out_channels)
-        self.norm = norm_layer_module(out_channels)
-        self.act_layer = torch.nn.GELU()
-        self.proj_skip = torch.nn.Linear(skip_channels, out_channels)
-        self.norm_skip = norm_layer_module(out_channels)
-        self.act_layer_skip = torch.nn.GELU()
+        self.proj = FJTM(torch.nn.Linear(in_channels, out_channels))
+        self.norm = FJTM(norm_layer_module(out_channels))
+        self.act_layer = FJTM(torch.nn.GELU())
+        self.proj_skip = FJTM(torch.nn.Linear(skip_channels, out_channels))
+        self.norm_skip = FJTM(norm_layer_module(out_channels))
+        self.act_layer_skip = FJTM(torch.nn.GELU())
 
-    def forward(self, grid, feats, last_grid, last_feats):
+    def __call__(
+        self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch, last_feats: fvdb.JaggedTensor, last_grid: fvdb.GridBatch
+    ) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
+        """Override __call__ to preserve type hints from forward."""
+        return super().__call__(feats, grid, last_feats, last_grid)
 
-        feats_j = self.proj(
-            feats.jdata
-        )  # BUG: When enabled AMP, despite both feats.jdata and linear.weights are float32, the output becomes float16 which causes the subsequent convolution operation to fail.
-        feats_j = self.norm(feats_j)
-        feats_j = self.act_layer(feats_j)
+    def forward(
+        self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch, last_feats: fvdb.JaggedTensor, last_grid: fvdb.GridBatch
+    ) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
+        with NVTXRange("PTV3_Unpooling"):
+            # The conversion is to avoid the bug when enabled AMP,
+            # despite both feats.jdata and linear.weights are float32,
+            # the output becomes float16 which causes the subsequent convolution operation to fail.
+            feats = self.proj(feats).to(torch.float32)
+            feats = self.norm(feats)
+            feats = self.act_layer(feats)
 
-        last_feats_j = self.proj_skip(last_feats.jdata)
-        last_feats_j = self.norm_skip(last_feats_j)
-        last_feats_j = self.act_layer_skip(last_feats_j)
+            last_feats = self.proj_skip(last_feats)
+            last_feats = self.norm_skip(last_feats)
+            last_feats = self.act_layer_skip(last_feats)
 
-        feats, _ = grid.refine(self.kernel_size, grid.jagged_like(feats_j), fine_grid=last_grid)
-        feats_j = feats.jdata
+            feats, _match_last_grid = grid.refine(self.kernel_size, feats, fine_grid=last_grid)
+            assert last_grid.is_same(_match_last_grid), "The last grid and the matched grid are not the same."
 
-        new_feats_j = last_feats_j + feats_j
-        return last_grid, last_grid.jagged_like(new_feats_j)
+            feats = fvdb.add(feats, last_feats)
+        return feats, last_grid
 
 
 class PTV3_MLP(torch.nn.Module):
@@ -225,26 +204,26 @@ class PTV3_MLP(torch.nn.Module):
         """
         super().__init__()
         self.hidden_size = hidden_size
-        self.fc1 = torch.nn.Linear(hidden_size, hidden_size * 4)
-        self.act = torch.nn.GELU()
-        self.fc2 = torch.nn.Linear(hidden_size * 4, hidden_size)
-        self.drop = torch.nn.Dropout(proj_drop)
+        self.fc1 = FJTM(torch.nn.Linear(hidden_size, hidden_size * 4))
+        self.act = FJTM(torch.nn.GELU())
+        self.fc2 = FJTM(torch.nn.Linear(hidden_size * 4, hidden_size))
+        self.drop = FJTM(torch.nn.Dropout(proj_drop))
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_MLP")
-        feats_j = feats.jdata  # TODO: deprecate the .jdata usage.
+    def __call__(self, feats: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
+        """Override __call__ to preserve type hints from forward."""
+        return super().__call__(feats)
 
-        feats_j = self.fc1(feats_j)
-        feats_j = self.act(feats_j)
-        feats_j = self.drop(feats_j)
-        feats_j = self.fc2(feats_j)
-        feats_j = self.drop(feats_j)
-        feats = grid.jagged_like(feats_j)
-        nvtx.range_pop()
-        return grid, feats
+    def forward(self, feats: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
+        with NVTXRange("PTV3_MLP"):
+            feats = self.fc1(feats)
+            feats = self.act(feats)
+            feats = self.drop(feats)
+            feats = self.fc2(feats)
+            feats = self.drop(feats)
+        return feats
 
 
-class PTV3_Attention(torch.nn.Module):
+class PTV3_Attention(FVDBGridModule):
     def __init__(
         self,
         hidden_size: int,
@@ -274,9 +253,9 @@ class PTV3_Attention(torch.nn.Module):
         assert self.head_dim * num_heads == hidden_size, "hidden_size must be divisible by num_heads"
 
         self.scale = qk_scale or (self.head_dim) ** -0.5
-        self.qkv = torch.nn.Linear(hidden_size, hidden_size * 3)  # Combined QKV projection
-        self.proj = torch.nn.Linear(hidden_size, hidden_size)
-        self.drop = torch.nn.Dropout(proj_drop)
+        self.qkv = FJTM(torch.nn.Linear(hidden_size, hidden_size * 3))  # Combined QKV projection
+        self.proj = FJTM(torch.nn.Linear(hidden_size, hidden_size))
+        self.drop = FJTM(torch.nn.Dropout(proj_drop))
         self.patch_size = patch_size
         self.order_index = order_index
         self.order_types = order_types
@@ -286,206 +265,37 @@ class PTV3_Attention(torch.nn.Module):
         # Sliding window attention parameter
         self.sliding_window_attention = sliding_window_attention
 
-    def _compute_permutation(self, grid, curve_codes):
-        """
-        Get permutation indices to sort voxels by space-filling curve order.
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
+        with NVTXRange("PTV3_Attention"):
+            # Get the shuffled order from grid metadata if available, otherwise use default order_types
+            # This allows for order shuffling per forward pass (matching reference implementation)
+            active_order_types = grid._shuffled_order  # type: ignore
 
-        Takes pre-computed space-filling curve codes (e.g., from morton(), hilbert(), etc.)
-        and returns the permutation indices that would sort voxels according to those codes.
-        This is useful for spatially coherent data access patterns and cache optimization.
+            # Get the order type for this block using the order index
+            order_type = active_order_types[self.order_index % len(active_order_types)]
 
-        Args:
-            grid: The grid batch containing voxel information.
-            curve_codes (JaggedTensor): Space-filling curve codes for each voxel.
-                Shape: `[num_grids, -1, 1]`. Typically obtained from morton(), morton_zyx(),
-                hilbert(), or hilbert_zyx() methods.
+            feats_ordered, perm = order_features_from_jagged_ijk(feats, grid.ijk, order_type)
 
-        Returns:
-            JaggedTensor: A JaggedTensor of shape `[num_grids, -1, 1]` containing
-                the permutation indices. Use these indices to reorder voxel data for spatial coherence.
-        """
-        # Get the curve codes as a flat tensor
-        curve_data = curve_codes.jdata.squeeze(-1)  # Shape: [total_voxels]
+            qkv = self.qkv(feats_ordered)
 
-        # Create output tensor for permutation indices
-        permutation_indices = torch.empty_like(curve_data, dtype=torch.long)
+            feats_ordered_out = jagged_attention(
+                feats_ordered,
+                qkv,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                patch_size=self.patch_size,
+                sliding_window_attention=self.sliding_window_attention,
+                scale=self.scale,
+            )
 
-        # Sort curve codes and get permutation indices for each grid
-        offset = 0
-        for grid_idx in range(grid.grid_count):
-            num_voxels = grid.num_voxels_at(grid_idx)
-            if num_voxels == 0:
-                continue
-
-            # Extract curve codes for this grid
-            grid_curve_codes = curve_data[offset : offset + num_voxels]
-
-            # Sort and get indices
-            _, indices = torch.sort(grid_curve_codes, dim=0)
-
-            # Store indices with offset
-            permutation_indices[offset : offset + num_voxels] = indices + offset
-
-            offset += num_voxels
-
-        # Return as JaggedTensor with the same structure as the input
-        return grid.jagged_like(permutation_indices.unsqueeze(-1))
-
-    def _permutation_morton(self, grid):
-        """
-        Return permutation indices to sort voxels by Morton curve order.
-        """
-        return self._compute_permutation(grid, grid.morton())
-
-    def _permutation_morton_zyx(self, grid):
-        """
-        Return permutation indices to sort voxels by transposed Morton curve order.
-        """
-        return self._compute_permutation(grid, grid.morton_zyx())
-
-    def _permutation_hilbert(self, grid):
-        """
-        Return permutation indices to sort voxels by Hilbert curve order.
-        """
-        return self._compute_permutation(grid, grid.hilbert())
-
-    def _permutation_hilbert_zyx(self, grid):
-        """
-        Return permutation indices to sort voxels by transposed Hilbert curve order.
-        """
-        return self._compute_permutation(grid, grid.hilbert_zyx())
-
-    def _permute(self, grid, order_type):
-        if order_type == "z":
-            return self._permutation_morton(grid)
-        elif order_type == "z-trans":
-            return self._permutation_morton_zyx(grid)
-        elif order_type == "hilbert":
-            return self._permutation_hilbert(grid)
-        elif order_type == "hilbert-trans":
-            return self._permutation_hilbert_zyx(grid)
-        else:
-            raise ValueError(f"Unsupported order type: {order_type}")
-
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_Attention")
-        feats_j = feats.jdata
-
-        # Get the shuffled order from grid metadata if available, otherwise use default order_types
-        # This allows for order shuffling per forward pass (matching reference implementation)
-        active_order_types = grid._shuffled_order
-
-        # Get the order type for this block using the order index
-        order_type = active_order_types[self.order_index % len(active_order_types)]
-
-        if order_type != "vdb":
-            perm = self._permute(grid, order_type).jdata.squeeze(-1)  # [num_voxels]
-            # Use torch.gather for permutation: expand perm to match feats_j dimensions
-            perm_expanded = perm.unsqueeze(-1).expand(-1, feats_j.shape[-1])  # [num_voxels, hidden_size]
-            feats_j = torch.gather(feats_j, 0, perm_expanded)
-
-        # import pdb; pdb.set_trace()
-
-        qkv = self.qkv(feats_j)  # (num_voxels, 3 * hidden_size)
-
-        if self.sliding_window_attention and self.patch_size > 0:
-            # Perform sliding window attention per-grid using flash attention
-            assert (
-                flash_attn is not None
-            ), "flash_attn is required for sliding_window_attention. Install with: pip install flash-attn"
-            num_voxels = feats_j.shape[0]
-            H = self.num_heads
-            D = self.head_dim
-            offsets = feats.joffsets.to(device=qkv.device, dtype=torch.int64)
-            outputs = []
-            for b in range(offsets.numel() - 1):
-                start = int(offsets[b].item())
-                end = int(offsets[b + 1].item())
-                Li = end - start
-                if Li <= 0:
-                    continue
-                qkv_b = qkv[start:end].view(1, Li, 3, H, D)
-                window_size = (self.patch_size // 2, self.patch_size // 2)
-                out_b = cast(
-                    Any,
-                    flash_attn.flash_attn_qkvpacked_func(
-                        qkv_b.half(), dropout_p=0.0, softmax_scale=self.scale, window_size=window_size
-                    ),
-                ).reshape(
-                    Li, self.hidden_size
-                )  # dtype: float16
-                outputs.append(out_b)
-            if len(outputs) == 0:
-                feats_out_j = torch.empty_like(qkv[:, : self.hidden_size])
-            else:
-                feats_out_j = torch.cat(outputs, dim=0)
-
-            feats_out_j = feats_out_j.to(feats_j.dtype)
-
-        elif self.patch_size > 0:
-            # Perform attention within each patch_size window per-grid using varlen API
-            assert (
-                flash_attn is not None
-            ), "flash_attn is required when patch_size > 0. Install with: pip install flash-attn"
-            num_voxels = feats_j.shape[0]
-            H = self.num_heads
-            D = self.head_dim
-            qkv = qkv.view(-1, 3, H, D)  # (num_voxels, 3, num_heads, head_dim)
-
-            # Build cu_seqlens as concatenation of per-grid patches so we never cross grid boundaries
-            offsets = feats.joffsets.to(device=qkv.device, dtype=torch.int64)
-            lengths = []
-            for b in range(offsets.numel() - 1):
-                start = int(offsets[b].item())
-                end = int(offsets[b + 1].item())
-                Li = end - start
-                if Li <= 0:
-                    continue
-                full = Li // self.patch_size
-                rem = Li % self.patch_size
-                if full > 0:
-                    lengths.extend([self.patch_size] * full)
-                if rem > 0:
-                    lengths.append(rem)
-            if len(lengths) == 0:
-                feats_out_j = torch.empty((0, self.hidden_size), device=qkv.device, dtype=feats_j.dtype)
-            else:
-                cu_seqlens = torch.zeros(len(lengths) + 1, device=qkv.device, dtype=torch.int32)
-                cu_seqlens[1:] = torch.as_tensor(lengths, device=qkv.device, dtype=torch.int32).cumsum(dim=0)
-
-                feats_out_j = cast(
-                    Any,
-                    flash_attn.flash_attn_varlen_qkvpacked_func(
-                        qkv.half(),
-                        cu_seqlens,
-                        max_seqlen=self.patch_size,
-                        dropout_p=0.0,  # TODO: implement attention dropout in the future. By default, it is 0.
-                        softmax_scale=self.scale,
-                    ),
-                ).reshape(
-                    num_voxels, self.hidden_size
-                )  # dtype: float16
-
-                feats_out_j = feats_out_j.to(feats_j.dtype)
-        else:
-            feats_out_j = qkv[:, : self.hidden_size].contiguous()
-
-        if order_type != "vdb":
-            perm_reverse = torch.empty_like(perm)
-            perm_reverse[perm] = torch.arange(perm.shape[0], device=perm.device)  # [num_voxels]
-            perm_reverse_expanded = perm_reverse.unsqueeze(-1).expand(
-                -1, feats_out_j.shape[-1]
-            )  # [num_voxels, hidden_size]
-            feats_out_j = torch.gather(feats_out_j, 0, perm_reverse_expanded)
-
-        feats_out_j = self.proj(feats_out_j)
-        feats_out_j = self.drop(feats_out_j)
-        feats_out = grid.jagged_like(feats_out_j)
-        nvtx.range_pop()
-        return grid, feats_out
+            feats_out = inverse_order_features_from_perm(feats_ordered_out, perm)
+            feats_out = self.proj(feats_out)
+            feats_out = self.drop(feats_out)
+        return feats_out
 
 
-class PTV3_CPE(torch.nn.Module):
+class PTV3_CPE(FVDBGridModule):
     def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False, shared_plan_cache: dict | None = None):
         """
         Args:
@@ -497,48 +307,45 @@ class PTV3_CPE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.no_conv_in_cpe = no_conv_in_cpe
         self.shared_plan_cache = shared_plan_cache if shared_plan_cache is not None else {}
-        self.cpe = torch.nn.ModuleList(
-            [
-                (
-                    fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1)  # by default, bias is True.
-                    if not no_conv_in_cpe
-                    else torch.nn.Identity()
-                ),
-                torch.nn.Linear(hidden_size, hidden_size),
-                torch.nn.LayerNorm(hidden_size),
-            ]
+
+        self.maybe_conv: fvdb.nn.SparseConv3d | None = (
+            None
+            if no_conv_in_cpe
+            else fvdb.nn.SparseConv3d(hidden_size, hidden_size, kernel_size=3, stride=1, bias=True)
         )
+        self.linear = FJTM(torch.nn.Linear(hidden_size, hidden_size))
+        self.norm = FJTM(torch.nn.LayerNorm(hidden_size))
 
     def _get_plan(self, grid, kernel_size, stride):
         """Get or create a ConvolutionPlan from shared cache."""
-        cache_key = (grid.address, kernel_size, stride)
-        if cache_key not in self.shared_plan_cache:
-            self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
-                kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
-            )
-        return self.shared_plan_cache[cache_key]
+        # target_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
+        # We need target grid to be the same as the source grid to maintain topology.
+        return fvdb.ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
+        )
+        # cache_key = (grid.address, kernel_size, stride)
+        # if cache_key not in self.shared_plan_cache:
+        #     self.shared_plan_cache[cache_key] = fvdb.ConvolutionPlan.from_grid_batch(
+        #         kernel_size=kernel_size, stride=stride, source_grid=grid, target_grid=grid
+        #     )
+        # return self.shared_plan_cache[cache_key]
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_CPE")
+    # Target grid is same as source grid to maintain topology.
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
+        with NVTXRange("PTV3_CPE"):
+            if not self.no_conv_in_cpe:
+                # Apply 3x3 sparse convolution using shared ConvolutionPlan cache
+                plan = self._get_plan(grid, kernel_size=3, stride=1)
+                assert self.maybe_conv is not None, "maybe_conv is not initialized"
+                feats = self.maybe_conv(feats, plan)
 
-        if not self.no_conv_in_cpe:
-            # Apply 3x3 sparse convolution using shared ConvolutionPlan cache
-            plan = self._get_plan(grid, kernel_size=3, stride=1)
-            out_feature = self.cpe[0](feats, plan)
-            # Note: bias is already handled inside SparseConv3d.forward()
-        else:
-            out_feature = feats
+            feats = self.linear(feats)
+            feats = self.norm(feats)
 
-        out_feature_j = out_feature.jdata
-        out_feature_j = self.cpe[1](out_feature_j)
-        out_feature_j = self.cpe[2](out_feature_j)
-        out_feature = grid.jagged_like(out_feature_j)
-
-        nvtx.range_pop()
-        return grid, out_feature
+        return feats
 
 
-class PTV3_Block(torch.nn.Module):
+class PTV3_Block(FVDBGridModule):
     def __init__(
         self,
         hidden_size: int,
@@ -570,7 +377,7 @@ class PTV3_Block(torch.nn.Module):
         super().__init__()
 
         self.cpe = PTV3_CPE(hidden_size, no_conv_in_cpe, shared_plan_cache)
-        self.norm1 = torch.nn.LayerNorm(hidden_size)
+        self.norm1 = FJTM(torch.nn.LayerNorm(hidden_size))
         self.attn = PTV3_Attention(
             hidden_size,
             num_heads,
@@ -581,41 +388,34 @@ class PTV3_Block(torch.nn.Module):
             order_index,
             order_types,
         )
-        self.norm2 = torch.nn.LayerNorm(hidden_size)
+        self.norm2 = FJTM(torch.nn.LayerNorm(hidden_size))
         self.order_index = order_index
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else torch.nn.Identity()
+        self.drop_path = FJTM(DropPath(drop_path)) if drop_path > 0.0 else FJTM(torch.nn.Identity())
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_Block")
-        grid, feats_out = self.cpe(grid, feats)
-        feats = grid.jagged_like(feats.jdata + feats_out.jdata)  # Is this a potential issue?
-        short_cut = feats.jdata
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
+        assert isinstance(feats, fvdb.JaggedTensor), "Input feats must be a JaggedTensor"
+        assert isinstance(grid, fvdb.GridBatch), "Input grid must be a GridBatch"
+        with NVTXRange("PTV3_Block"):
+            feats = self.cpe(feats, grid)
+            short_cut = feats
 
-        feats = grid.jagged_like(self.norm1(feats.jdata))
+            feats = self.norm1(feats)
+            feats = self.attn(feats, grid)
+            # The drop_path is applied to each point independently.
+            feats = self.drop_path(feats)
+            feats = fvdb.add(short_cut, feats)
+            short_cut = feats
 
-        grid, feats_out = self.attn(grid, feats)
-        feats_out = grid.jagged_like(
-            self.drop_path(feats_out.jdata)
-        )  # This drop_path is applied to each point independently.
+            feats = self.norm2(feats)
+            feats = self.mlp(feats)
+            feats = self.drop_path(feats)
+            feats = fvdb.add(short_cut, feats)
 
-        feats = grid.jagged_like(short_cut + feats_out.jdata)
-        short_cut = feats.jdata
-
-        feats = grid.jagged_like(self.norm2(feats.jdata))
-
-        grid, feats_out = self.mlp(grid, feats)
-        feats_out = grid.jagged_like(
-            self.drop_path(feats_out.jdata)
-        )  # This drop_path is applied to each point independently.
-
-        feats = grid.jagged_like(short_cut + feats_out.jdata)
-
-        nvtx.range_pop()
-        return grid, feats
+        return feats
 
 
-class PTV3_Encoder(torch.nn.Module):
+class PTV3_Encoder(FVDBGridModule):
     def __init__(
         self,
         hidden_size: int,
@@ -666,13 +466,14 @@ class PTV3_Encoder(torch.nn.Module):
         )
         self.order_types = order_types
 
-    def forward(self, grid, feats):
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
         for block in self.blocks:
-            grid, feats = block(grid, feats)
-        return grid, feats
+            assert isinstance(block, PTV3_Block), "All blocks must be of type PTV3_Block"
+            feats = block(feats, grid)
+        return feats
 
 
-class PTV3(torch.nn.Module):
+class PTV3(FVDBGridModule):
 
     def __init__(
         self,
@@ -755,6 +556,10 @@ class PTV3(torch.nn.Module):
             shared_plan_cache=self.shared_plan_cache,
         )
 
+        assert (
+            len(enc_depths) == len(enc_channels) == len(enc_num_heads)
+        ), "The number of encoder depths, channels, and heads must be the same."
+
         self.num_stages = len(enc_depths)
         if self.num_stages > 0:
             self.enc = torch.nn.ModuleList()
@@ -811,7 +616,8 @@ class PTV3(torch.nn.Module):
                         norm_layer_module=self.norm_layer,
                     )
                 )
-                # All decoder stages share the same order types; blocks within each stage cycle through them
+                # All decoder stages share the same order types;
+                # blocks within each stage cycle through them
                 self.dec.append(
                     PTV3_Encoder(
                         dec_channels[i],
@@ -839,63 +645,69 @@ class PTV3(torch.nn.Module):
         else:
             return self.order_type
 
-    def forward(self, grid, feats):
-        nvtx.range_push("PTV3_Forward")
+    def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
+        original_grid = grid
+        with NVTXRange("PTV3_Forward"):
 
-        # Shuffle order at the beginning of forward pass (matching reference implementation)
-        shuffled_order = self._shuffle_order()
+            # Shuffle order at the beginning of forward pass (matching reference implementation)
+            shuffled_order = self._shuffle_order()
 
-        # Store shuffled order in grid metadata so all blocks can access it
-        grid._shuffled_order = shuffled_order
+            # Store shuffled order in grid metadata so all blocks can access it
+            grid._shuffled_order = shuffled_order  # type: ignore
 
-        grid, feats = self.embedding(grid, feats)
+            feats = self.embedding(feats, grid)
 
-        layer_id = 0
-        stack = []  # Stack stores (grid, feats, shuffled_order) tuples
-        for i in range(self.num_stages):
-            if i > 0:
-                nvtx.range_push(f"PTV3_Pooling_{layer_id}")
-                # Push grid, feats, AND the current shuffled_order to stack
-                # The decoder will reuse this exact shuffled order for the corresponding stage
-                stack.append((grid, feats, shuffled_order))
-                grid, feats = self.enc[layer_id](grid, feats)
-
-                # Shuffle order after pooling for the next (downsampled) stage
-                shuffled_order = self._shuffle_order()
-                grid._shuffled_order = shuffled_order
-
-                nvtx.range_pop()
-                layer_id += 1
-            nvtx.range_push(f"PTV3_Encoder_{layer_id}")
-            grid, feats = self.enc[layer_id](grid, feats)
-            nvtx.range_pop()
-            layer_id += 1
-
-        if self.num_dec_stages > 0:
             layer_id = 0
-            for i in range(self.num_dec_stages):
-                nvtx.range_push(f"PTV3_Unpooling_{layer_id}")
-                # Pop grid, feats, AND the shuffled_order from the corresponding encoder stage
-                last_grid, last_feats, last_shuffled_order = stack.pop()
+            stack = []  # Stack stores (grid, feats, shuffled_order) tuples
+            for i in range(self.num_stages):
+                if i > 0:
+                    with NVTXRange(f"PTV3_Pooling_{layer_id}"):
+                        # Push grid, feats, AND the current shuffled_order to stack
+                        # The decoder will reuse this exact shuffled order for the corresponding stage
+                        stack.append((grid, feats, shuffled_order))
+                        pooler = self.enc[layer_id]
+                        assert isinstance(pooler, PTV3_Pooling), "All encoder poolers must be of type PTV3_Pooling"
+                        feats, grid = pooler(feats, grid)
 
-                # Restore the shuffled order from the encoder stage to the grids
-                # This ensures decoder blocks use the SAME order as the corresponding encoder blocks
-                last_grid._shuffled_order = last_shuffled_order
+                        # Shuffle order after pooling for the next (downsampled) stage
+                        shuffled_order = self._shuffle_order()
+                        grid._shuffled_order = shuffled_order  # type: ignore
+                        layer_id += 1
+                with NVTXRange(f"PTV3_Encoder_{layer_id}"):
+                    encoder = self.enc[layer_id]
+                    assert isinstance(encoder, PTV3_Encoder), "All encoder stages must be of type PTV3_Encoder"
+                    feats = encoder(feats, grid)
+                    layer_id += 1
 
-                grid, feats = self.dec[layer_id](grid, feats, last_grid, last_feats)
-                # After unpooling, grid becomes last_grid with the restored shuffled order
-                nvtx.range_pop()
-                layer_id += 1
+            if self.num_dec_stages > 0:
+                layer_id = 0
+                for i in range(self.num_dec_stages):
+                    with NVTXRange(f"PTV3_Unpooling_{layer_id}"):
+                        # Pop grid, feats, AND the shuffled_order from the corresponding encoder stage
+                        last_grid, last_feats, last_shuffled_order = stack.pop()
 
-                nvtx.range_push(f"PTV3_Decoder_{layer_id}")
-                # Decoder blocks use grid with the restored shuffled order from encoder
-                grid, feats = self.dec[layer_id](grid, feats)
-                nvtx.range_pop()
-                layer_id += 1
+                        # Restore the shuffled order from the encoder stage to the grids
+                        # This ensures decoder blocks use the SAME order as the corresponding encoder blocks
+                        last_grid._shuffled_order = last_shuffled_order
 
-        # Clear cache after forward pass to prevent OOM between batches
-        # Plans are shared across layers during this forward pass, but won't be needed for next batch
-        self.shared_plan_cache.clear()
+                        unpooler = self.dec[layer_id]
+                        assert isinstance(
+                            unpooler, PTV3_Unpooling
+                        ), "All decoder unpoolers must be of type PTV3_Unpooling"
+                        feats, grid = unpooler(feats, grid, last_feats, last_grid)
+                        # After unpooling, grid becomes last_grid with the restored shuffled order
+                        layer_id += 1
 
-        nvtx.range_pop()
-        return grid, feats
+                    with NVTXRange(f"PTV3_Decoder_{layer_id}"):
+                        # Decoder blocks use grid with the restored shuffled order from encoder
+                        decoder = self.dec[layer_id]
+                        assert isinstance(decoder, PTV3_Encoder), "All decoder stages must be of type PTV3_Encoder"
+                        feats = decoder(feats, grid)
+                        layer_id += 1
+
+            # Clear cache after forward pass to prevent OOM between batches
+            # Plans are shared across layers during this forward pass, but won't be needed for next batch
+            self.shared_plan_cache.clear()
+            assert original_grid.is_same(grid), "The original grid and the final grid are not the same."
+
+        return feats

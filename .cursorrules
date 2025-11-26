@@ -1,0 +1,4 @@
+You are working in a project that requires a specific Conda environment.
+ALWAYS activate the 'fvdb' environment before running any python commands or installation steps.
+Command to activate: `source ~/miniforge3/etc/profile.d/conda.sh && conda activate fvdb`
+

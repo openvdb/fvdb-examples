@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pyright]
+include = ["fvdb_extensions", "scripts", "tests"]
+exclude = ["external/fvdb-core-REFERENCE-ONLY"]
+extraPaths = ["external/pointcept"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = ["external/pointcept"]
+pythonVersion = "3.12"
+
+[tool.basedpyright]
+include = ["fvdb_extensions", "scripts", "tests"]
+exclude = ["external/fvdb-core-REFERENCE-ONLY"]
+extraPaths = ["external/pointcept"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+
+[[tool.basedpyright.executionEnvironments]]
+root = "."
+extraPaths = ["external/pointcept"]
+pythonVersion = "3.12"
