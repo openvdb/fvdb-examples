@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=40.8.0", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nksr-fvdb"
+description = "Neural Kernel Surface Reconstruction (fVDB version)"
+authors = [
+    {name = "The NKSR Authors", email = "jiahuih@nvidia.com"},
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "torch",
+    "omegaconf",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "nksr_fvdb.__version__"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint.isort]
+known-first-party = ["nksr_fvdb"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+lines-between-types = 1
+lines-after-imports = 2
