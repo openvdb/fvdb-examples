@@ -610,7 +610,8 @@ class TestVoxelStatusEvaluation(unittest.TestCase):
 
         # Evaluate at coarsest level
         target_grid = hierarchy.levels[-1].grid
-        status = hierarchy.evaluate_voxel_status(target_grid, coarse_depth=DEFAULT_DEPTH - 1)
+        jagged_status = hierarchy.evaluate_voxel_status(target_grid, coarse_depth=DEFAULT_DEPTH - 1)
+        status = jagged_status.jdata
 
         # Should return tensor of correct shape
         self.assertEqual(status.shape[0], target_grid.total_voxels)
@@ -647,7 +648,8 @@ class TestVoxelStatusEvaluation(unittest.TestCase):
 
         # Evaluate at finest level (depth=0)
         target_grid = hierarchy.levels[0].grid
-        status = hierarchy.evaluate_voxel_status(target_grid, coarse_depth=0)
+        jagged_status = hierarchy.evaluate_voxel_status(target_grid, coarse_depth=0)
+        status = jagged_status.jdata
 
         # At finest level, all existing voxels should be EXIST_STOP (no finer level)
         # Non-existing voxels would be NON_EXIST
@@ -710,7 +712,8 @@ class TestModuleLevelEvaluateVoxelStatus(unittest.TestCase):
 
         # Target grid equals coarse grid, fine grid is None
         coarse_grid = hierarchy.levels[0].grid
-        status = evaluate_voxel_status(coarse_grid, coarse_grid, fine_grid=None)
+        jagged_status = evaluate_voxel_status(coarse_grid, coarse_grid, fine_grid=None)
+        status = jagged_status.jdata
 
         # All voxels should be EXIST_STOP when target == coarse and no fine grid
         self.assertTrue(torch.all(status == VoxelStatus.VS_EXIST_STOP.value))

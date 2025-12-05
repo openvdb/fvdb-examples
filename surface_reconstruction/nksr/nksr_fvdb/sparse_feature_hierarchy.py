@@ -25,7 +25,7 @@ class VoxelStatus(Enum):
     VS_EXIST_CONTINUE = 2
 
 
-def evaluate_voxel_status(target_grid: GridBatch, coarse_grid: GridBatch, fine_grid: GridBatch | None) -> torch.Tensor:
+def evaluate_voxel_status(target_grid: GridBatch, coarse_grid: GridBatch, fine_grid: GridBatch | None) -> JaggedTensor:
     """Compute per-voxel status labels for structure prediction training.
 
     Classifies each voxel in target_grid by comparing against coarse/fine hierarchy levels:
@@ -49,26 +49,32 @@ def evaluate_voxel_status(target_grid: GridBatch, coarse_grid: GridBatch, fine_g
     if coarse_grid.device != device:
         raise ValueError(f"Device not match {device} vs {coarse_grid.device}.")
 
-    if fine_grid is not None and fine_grid.device != device:
-        raise ValueError(f"Device not match {device} vs {fine_grid.device}.")
+    # create a coarse feature jagged tensor, by broadcasting. The coarse grid is filled with
+    # VoxelStatus.VS_EXIST_STOP.
+    coarse_feature = coarse_grid.jagged_like(
+        torch.tensor(VoxelStatus.VS_EXIST_STOP.value, dtype=torch.uint8, device=device).expand(coarse_grid.total_voxels)
+    )
 
-    # Start with a flat tensor of all voxels in the target grid, initialized to NON_EXIST.
-    status = torch.full((target_grid.total_voxels,), VoxelStatus.VS_NON_EXIST.value, dtype=torch.uint8, device=device)
-
-    # Set the intersection of the coarse grid and the target grid to EXIST_STOP.
-    coarse_exist_idx = target_grid.ijk_to_index(coarse_grid.ijk, cumulative=True)
-    coarse_exist_mask = coarse_exist_idx.jdata != -1
-    status[coarse_exist_mask] = VoxelStatus.VS_EXIST_STOP.value
+    # Inject the coarse feature into the target
+    target_feature = coarse_grid.inject_to(
+        dst_grid=target_grid, src=coarse_feature, dst=None, default_value=VoxelStatus.VS_NON_EXIST.value
+    )
 
     # If there is a fine grid, set the intersection of the fine grid and the target grid to EXIST_CONTINUE.
-    # This can overwrite the coarse grid's EXIST_STOP status.
+    # This can overwrite the coarse grid's EXIST_STOP status. It modifies the target_feature in place,
+    # and doesn't overwrite except where the fine coarsened grid exists.
     if fine_grid is not None:
+        if fine_grid.device != device:
+            raise ValueError(f"Device not match {device} vs {fine_grid.device}.")
         fine_coarsened = fine_grid.coarsened_grid(coarsening_factor=2)
-        fine_exist_idx = target_grid.ijk_to_index(fine_coarsened.ijk, cumulative=True)
-        fine_exist_mask = fine_exist_idx.jdata != -1
-        status[fine_exist_mask] = VoxelStatus.VS_EXIST_CONTINUE.value
+        fine_coarsened_feature = fine_coarsened.jagged_like(
+            torch.tensor(VoxelStatus.VS_EXIST_CONTINUE.value, dtype=torch.uint8, device=device).expand(
+                fine_coarsened.total_voxels
+            )
+        )
+        fine_coarsened.inject_to(dst_grid=target_grid, src=fine_coarsened_feature, dst=target_feature)
 
-    return status
+    return target_feature
 
 
 @dataclass(frozen=True)
@@ -270,7 +276,7 @@ class SparseFeatureHierarchy:
 
         return cls(levels=levels)
 
-    def evaluate_voxel_status(self, target_grid: GridBatch, coarse_depth: int | None = None) -> torch.Tensor:
+    def evaluate_voxel_status(self, target_grid: GridBatch, coarse_depth: int | None = None) -> JaggedTensor:
         """Evaluate voxel status at a given hierarchy depth.
 
         Convenience wrapper around the module-level evaluate_voxel_status function.

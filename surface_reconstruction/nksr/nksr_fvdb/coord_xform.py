@@ -80,7 +80,7 @@ class CoordXform(ABC):
         """Transform coordinates from source frame to target frame.
 
         Args:
-            coords: JaggedTensor of shape [N, 3] containing 3D coordinates.
+            coords: JaggedTensor of shape [B, Njagged, 3] containing 3D coordinates.
 
         Returns:
             Transformed coordinates as a JaggedTensor with the same structure.
@@ -101,13 +101,13 @@ class CoordXform(ABC):
         Args:
             coords: 3D coordinates to transform.
                 - torch.Tensor: shape [N, 3] where N is the number of points.
-                - fvdb.JaggedTensor: shape [B][N, 3] where B is batch size and N
+                - fvdb.JaggedTensor: shape [B, Njagged, 3] where B is batch size and Njagged
                   varies per batch element.
 
         Returns:
             Transformed coordinates with the same type and shape as input.
                 - torch.Tensor input -> torch.Tensor output, shape [N, 3]
-                - fvdb.JaggedTensor input -> fvdb.JaggedTensor output, shape [B][N, 3]
+                - fvdb.JaggedTensor input -> fvdb.JaggedTensor output, shape [B, Njagged, 3]
         """
         if isinstance(coords, torch.Tensor):
             return self.apply_tensor(coords)
@@ -288,7 +288,7 @@ class CoordXform(ABC):
         Returns:
             A new CoordXform representing the composition.
         """
-        return ComposedXform(first=other, second=self)
+        return ComposedXform([other, self])
 
     @overload
     def __matmul__(self, other: "CoordXform") -> "CoordXform": ...
@@ -346,40 +346,54 @@ class CoordXform(ABC):
 
 @dataclass(frozen=True)
 class ComposedXform(CoordXform):
-    """Composition of two transformations applied in sequence.
+    """Composition of multiple transformations applied in sequence.
+    The 0th transformation is applied first, followed by the 1st, etc.
 
-    Represents the transformation: coords_out = second(first(coords_in))
     """
 
-    first: CoordXform
-    second: CoordXform
+    xforms: list[CoordXform]
 
     def apply_tensor(self, coords: torch.Tensor) -> torch.Tensor:
-        """Apply first, then second transformation."""
-        return self.second.apply_tensor(self.first.apply_tensor(coords))
+        """Apply all transformations in to tensor coords insequence."""
+        for xform in self.xforms:
+            coords = xform.apply_tensor(coords)
+        return coords
 
     def apply_jagged(self, coords: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
-        """Apply first, then second transformation."""
-        return self.second.apply_jagged(self.first.apply_jagged(coords))
+        """Apply all transformations to jagged tensor coords in sequence."""
+        for xform in self.xforms:
+            coords = xform.apply_jagged(coords)
+        return coords
 
     def apply_bounds_tensor(self, bounds: torch.Tensor) -> torch.Tensor:
-        """Apply first, then second bounds transformation."""
-        return self.second.apply_bounds_tensor(self.first.apply_bounds_tensor(bounds))
+        """Apply all transformations to bounds tensor in sequence."""
+        for xform in self.xforms:
+            bounds = xform.apply_bounds_tensor(bounds)
+        return bounds
 
     def apply_bounds_jagged(self, bounds: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
-        """Apply first, then second bounds transformation."""
-        return self.second.apply_bounds_jagged(self.first.apply_bounds_jagged(bounds))
+        """Apply all transformations to bounds jagged tensor in sequence."""
+        for xform in self.xforms:
+            bounds = xform.apply_bounds_jagged(bounds)
+        return bounds
 
     def inverse(self) -> CoordXform:
-        """Return inverse: (second o first)^-1 = first^-1 o second^-1."""
+        """Return inverse: (all xforms)^-1 = inverse(all xforms) in reverse order."""
         if not self.invertible:
             raise NotImplementedError("Cannot invert: one or both transforms not invertible.")
-        return ComposedXform(self.second.inverse(), self.first.inverse())
+        return ComposedXform([xform.inverse() for xform in reversed(self.xforms)])
+
+    def compose(self, other: "CoordXform") -> "CoordXform":
+        """Compose this transformation with another. Other is applied first, then self."""
+        if isinstance(other, ComposedXform):
+            return ComposedXform(other.xforms + self.xforms)
+        else:
+            return ComposedXform([other] + self.xforms)
 
     @property
     def invertible(self) -> bool:
         """True if both first and second are invertible."""
-        return self.first.invertible and self.second.invertible
+        return all(xform.invertible for xform in self.xforms)
 
 
 @dataclass(frozen=True)
@@ -476,7 +490,8 @@ class UniformScaleThenTranslate(CoordXform):
                 scale=other.scale * self.scale,
                 translation=other.translation * self.scale + self.translation,
             )
-        return ComposedXform(first=other, second=self)
+        else:
+            return super().compose(other)
 
     @property
     def invertible(self) -> bool:

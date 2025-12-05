@@ -10,7 +10,12 @@ Tests the basic transformation classes: IdentityXform and UniformScaleThenTransl
 import unittest
 
 import torch
-from nksr.nksr_fvdb.coord_xform import IdentityXform, UniformScaleThenTranslate
+from nksr.nksr_fvdb.coord_xform import (
+    ComposedXform,
+    CoordXform,
+    IdentityXform,
+    UniformScaleThenTranslate,
+)
 from parameterized import parameterized
 
 all_devices = [
@@ -336,6 +341,262 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         sequential = first.apply_tensor(second.apply_tensor(coords))
         fused = composed.apply_tensor(coords)
         self.assertTrue(torch.allclose(sequential, fused))
+
+
+class TestComposedXform(unittest.TestCase):
+    """Test cases for ComposedXform with sequence-based composition."""
+
+    def test_composed_xform_stores_sequence(self):
+        """Test that ComposedXform stores transforms in xforms list."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        # Create a ComposedXform directly
+        composed = ComposedXform([xform_a, xform_b])
+
+        self.assertEqual(len(composed.xforms), 2)
+        self.assertIs(composed.xforms[0], xform_a)
+        self.assertIs(composed.xforms[1], xform_b)
+
+    def test_composed_xform_applies_in_sequence_order(self):
+        """Test that transforms are applied in sequence order (0th first, then 1st, etc.)."""
+        # xform_a: y = x * 2 + 0 (applied first)
+        # xform_b: z = y * 1 + 10 (applied second)
+        # Result: z = x * 2 + 10
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=10.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+        result = composed @ coords
+
+        # First apply xform_a: [2, 4, 6]
+        # Then apply xform_b: [12, 14, 16]
+        expected = torch.tensor([[12.0, 14.0, 16.0]])
+        self.assertTrue(torch.allclose(result, expected))
+
+    def test_composing_composed_xforms_flattens_sequence(self):
+        """Test that composing ComposedXforms avoids nesting by flattening sequences."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=5.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=1.0)
+        xform_d = UniformScaleThenTranslate(scale=3.0, translation=-2.0)
+
+        # Create two ComposedXforms
+        composed_ab = ComposedXform([xform_a, xform_b])
+        composed_cd = ComposedXform([xform_c, xform_d])
+
+        # Compose them: composed_ab @ composed_cd
+        # This means: composed_cd is applied first, then composed_ab
+        # Expected sequence: [xform_c, xform_d, xform_a, xform_b]
+        final = composed_ab @ composed_cd
+
+        self.assertIsInstance(final, ComposedXform)
+        assert isinstance(final, ComposedXform)  # for type narrowing
+        self.assertEqual(len(final.xforms), 4)
+        self.assertIs(final.xforms[0], xform_c)
+        self.assertIs(final.xforms[1], xform_d)
+        self.assertIs(final.xforms[2], xform_a)
+        self.assertIs(final.xforms[3], xform_b)
+
+    def test_composing_single_xform_with_composed_flattens(self):
+        """Test that composing a single xform with a ComposedXform flattens correctly."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=5.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=1.0)
+
+        composed_ab = ComposedXform([xform_a, xform_b])
+
+        # composed_ab @ xform_c: xform_c applied first, then composed_ab
+        result = composed_ab @ xform_c
+
+        self.assertIsInstance(result, ComposedXform)
+        assert isinstance(result, ComposedXform)
+        self.assertEqual(len(result.xforms), 3)
+        self.assertIs(result.xforms[0], xform_c)
+        self.assertIs(result.xforms[1], xform_a)
+        self.assertIs(result.xforms[2], xform_b)
+
+    def test_triple_composition_flattens_correctly(self):
+        """Test that chaining three ComposedXforms results in a flat sequence."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=5.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=1.0)
+
+        # Create individual ComposedXforms (each with 1 element)
+        composed_a = ComposedXform([xform_a])
+        composed_b = ComposedXform([xform_b])
+        composed_c = ComposedXform([xform_c])
+
+        # Chain: composed_a @ composed_b @ composed_c
+        # Order: c applied first, then b, then a
+        result = composed_a @ composed_b @ composed_c
+
+        self.assertIsInstance(result, ComposedXform)
+        assert isinstance(result, ComposedXform)
+        self.assertEqual(len(result.xforms), 3)
+        # Verify order: c is applied first (index 0), then b, then a
+        self.assertIs(result.xforms[0], xform_c)
+        self.assertIs(result.xforms[1], xform_b)
+        self.assertIs(result.xforms[2], xform_a)
+
+    @parameterized.expand(all_devices)
+    def test_composed_xform_apply_tensor(self, device: str):
+        """Test that ComposedXform.apply_tensor works correctly."""
+        if device == "cuda" and not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=0.5, translation=-3.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+        coords = torch.tensor([[2.0, 4.0, 6.0]], device=device)
+
+        result = composed.apply_tensor(coords)
+
+        # Sequential: xform_a first: [5, 9, 13], then xform_b: [-0.5, 1.5, 3.5]
+        expected = torch.tensor([[-0.5, 1.5, 3.5]], device=device)
+        self.assertTrue(torch.allclose(result, expected))
+
+    @parameterized.expand(all_devices)
+    def test_composed_xform_matches_sequential_application(self, device: str):
+        """Test that ComposedXform gives same result as sequential application."""
+        if device == "cuda" and not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=-2.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=5.0)
+
+        composed = ComposedXform([xform_a, xform_b, xform_c])
+        coords = torch.tensor([[1.0, 2.0, 3.0]], device=device)
+
+        composed_result = composed @ coords
+
+        # Sequential: xform_a(coords), then xform_b, then xform_c
+        sequential_result = xform_c @ (xform_b @ (xform_a @ coords))
+
+        self.assertTrue(torch.allclose(composed_result, sequential_result))
+
+    def test_composed_xform_inverse(self):
+        """Test that ComposedXform.inverse() reverses the sequence and inverts each."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+        inverse = composed.inverse()
+
+        self.assertIsInstance(inverse, ComposedXform)
+        assert isinstance(inverse, ComposedXform)
+
+        # Inverse should have reversed order with each element inverted
+        self.assertEqual(len(inverse.xforms), 2)
+
+        # The inverse of composed is [inverse(xform_b), inverse(xform_a)]
+        # Check by verifying the composed result with its inverse gives identity
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+        transformed = composed @ coords
+        recovered = inverse @ transformed
+
+        self.assertTrue(torch.allclose(recovered, coords))
+
+    @parameterized.expand(all_devices)
+    def test_composed_xform_inverse_roundtrip(self, device: str):
+        """Test that xform @ inverse(xform) recovers original coordinates."""
+        if device == "cuda" and not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=-2.0)
+
+        composed = ComposedXform([xform_a, xform_b, xform_c])
+        coords = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device=device)
+
+        transformed = composed @ coords
+        recovered = composed.inverse() @ transformed
+
+        self.assertTrue(torch.allclose(recovered, coords))
+
+    def test_composed_xform_invertible_all_invertible(self):
+        """Test that ComposedXform is invertible when all transforms are invertible."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+
+        self.assertTrue(composed.invertible)
+
+    def test_composed_xform_not_invertible_if_any_not_invertible(self):
+        """Test that ComposedXform is not invertible if any transform is not invertible."""
+
+        class NonInvertibleXform(CoordXform):
+            def apply_tensor(self, coords: torch.Tensor) -> torch.Tensor:
+                return coords * 0  # Maps everything to zero
+
+            @property
+            def invertible(self) -> bool:
+                return False
+
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = NonInvertibleXform()
+
+        composed = ComposedXform([xform_a, xform_b])
+
+        self.assertFalse(composed.invertible)
+
+    @parameterized.expand(all_devices)
+    def test_composed_xform_apply_bounds_tensor(self, device: str):
+        """Test that ComposedXform.apply_bounds_tensor works correctly."""
+        if device == "cuda" and not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=1.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+
+        bounds = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]], device=device)
+        result = composed.apply_bounds_tensor(bounds)
+
+        # xform_a: [0,0,0]->[0,0,0], [1,1,1]->[2,2,2]
+        # xform_b: [0,0,0]->[1,1,1], [2,2,2]->[3,3,3]
+        expected = torch.tensor([[[1.0, 1.0, 1.0], [3.0, 3.0, 3.0]]], device=device)
+        self.assertTrue(torch.allclose(result, expected))
+
+    def test_pseudo_scaling_factor_of_composed(self):
+        """Test pseudo_scaling_factor for ComposedXform."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        composed = ComposedXform([xform_a, xform_b])
+
+        # Total scale should be 2 * 3 = 6
+        self.assertAlmostEqual(composed.pseudo_scaling_factor, 6.0, places=5)
+
+    def test_empty_sequence_raises_or_handles_gracefully(self):
+        """Test behavior with empty xforms sequence."""
+        # This tests edge case behavior - empty composition should act like identity
+        composed = ComposedXform([])
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        result = composed @ coords
+
+        # Empty composition should return coords unchanged (acts like identity)
+        self.assertTrue(torch.allclose(result, coords))
+
+    def test_single_element_sequence(self):
+        """Test ComposedXform with a single element behaves like that element."""
+        xform = UniformScaleThenTranslate(scale=2.0, translation=3.0)
+        composed = ComposedXform([xform])
+
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        composed_result = composed @ coords
+        direct_result = xform @ coords
+
+        self.assertTrue(torch.allclose(composed_result, direct_result))
 
 
 class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
