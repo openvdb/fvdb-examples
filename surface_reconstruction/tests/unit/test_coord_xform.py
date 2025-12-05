@@ -4,13 +4,13 @@
 """
 Unit tests for coordinate frame transformations in coord_xform.py.
 
-Tests the basic transformation classes: IdentityXform and ScalarGainBiasXform.
+Tests the basic transformation classes: IdentityXform and UniformScaleThenTranslate.
 """
 
 import unittest
 
 import torch
-from nksr.nksr_fvdb.coord_xform import IdentityXform, ScalarGainBiasXform
+from nksr.nksr_fvdb.coord_xform import IdentityXform, UniformScaleThenTranslate
 
 
 class TestIdentityXform(unittest.TestCase):
@@ -37,12 +37,12 @@ class TestIdentityXform(unittest.TestCase):
         self.assertIsInstance(inverse, IdentityXform)
 
 
-class TestScalarGainBiasXform(unittest.TestCase):
-    """Test cases for ScalarGainBiasXform."""
+class TestUniformScaleThenTranslate(unittest.TestCase):
+    """Test cases for UniformScaleThenTranslate."""
 
-    def test_gain_only(self):
-        """Test scaling with gain only."""
-        xform = ScalarGainBiasXform(gain=2.0)
+    def test_scale_only(self):
+        """Test scaling with scale only."""
+        xform = UniformScaleThenTranslate(scale=2.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
         result = xform.apply_tensor(coords)
@@ -50,9 +50,9 @@ class TestScalarGainBiasXform(unittest.TestCase):
 
         self.assertTrue(torch.allclose(result, expected))
 
-    def test_bias_only(self):
-        """Test translation with bias only."""
-        xform = ScalarGainBiasXform(bias=1.0)
+    def test_translation_only(self):
+        """Test translation with translation only."""
+        xform = UniformScaleThenTranslate(translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
         result = xform.apply_tensor(coords)
@@ -60,9 +60,9 @@ class TestScalarGainBiasXform(unittest.TestCase):
 
         self.assertTrue(torch.allclose(result, expected))
 
-    def test_gain_and_bias(self):
+    def test_scale_and_translation(self):
         """Test combined scaling and translation."""
-        xform = ScalarGainBiasXform(gain=2.0, bias=1.0)
+        xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
         result = xform.apply_tensor(coords)
@@ -72,7 +72,7 @@ class TestScalarGainBiasXform(unittest.TestCase):
 
     def test_inverse(self):
         """Test that inverse correctly reverses the transformation."""
-        xform = ScalarGainBiasXform(gain=2.0, bias=1.0)
+        xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
         transformed = xform.apply_tensor(coords)
@@ -80,15 +80,36 @@ class TestScalarGainBiasXform(unittest.TestCase):
 
         self.assertTrue(torch.allclose(recovered, coords))
 
-    def test_invertible_when_gain_nonzero(self):
-        """Test that ScalarGainBiasXform is invertible when gain != 0."""
-        xform = ScalarGainBiasXform(gain=2.0, bias=1.0)
+    def test_invertible_when_scale_nonzero(self):
+        """Test that UniformScaleThenTranslate is invertible when scale != 0."""
+        xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         self.assertTrue(xform.invertible)
 
-    def test_not_invertible_when_gain_zero(self):
-        """Test that ScalarGainBiasXform is not invertible when gain == 0."""
-        xform = ScalarGainBiasXform(gain=0.0, bias=1.0)
-        self.assertFalse(xform.invertible)
+    def test_construction_fails_when_scale_zero(self):
+        """Test that UniformScaleThenTranslate cannot be constructed with scale == 0."""
+        with self.assertRaises(ValueError):
+            UniformScaleThenTranslate(scale=0.0, translation=1.0)
+
+    def test_compose_fuses_two_uniform_scale_translates(self):
+        """Test that composing two UniformScaleThenTranslate fuses them."""
+        # First: y = x * 2 + 1
+        # Second: z = y * 3 + 5
+        # Composed: z = x * (2*3) + (1*3 + 5) = x * 6 + 8
+        first = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        second = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        composed = first.compose(second)
+
+        self.assertIsInstance(composed, UniformScaleThenTranslate)
+        assert isinstance(composed, UniformScaleThenTranslate)  # for type narrowing
+        self.assertEqual(composed.scale, 6.0)
+        self.assertEqual(composed.translation, 8.0)
+
+        # Verify the result matches applying them sequentially
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+        sequential = second.apply_tensor(first.apply_tensor(coords))
+        fused = composed.apply_tensor(coords)
+        self.assertTrue(torch.allclose(sequential, fused))
 
 
 if __name__ == "__main__":

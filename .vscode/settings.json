@@ -55,7 +55,8 @@
     "python.testing.unittestEnabled": false,
     "python.testing.pytestArgs": [
         "-v",
-        "point_transformer_v3/tests"
+        "point_transformer_v3/tests",
+        "surface_reconstruction/tests"
     ],
     "black-formatter.args": [
         "--target-version=py311",

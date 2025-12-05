@@ -272,7 +272,25 @@ class CoordXform(ABC):
             raise ValueError("Coarsening factor cannot be negative or zero.")
         if factor == 1 or factor == 1.0:
             return self
-        return self.compose(ScalarGainBiasXform(gain=1.0 / factor))
+        return self.compose(UniformScaleThenTranslate(scale=1.0 / factor))
+
+    def refined(self, factor: int | float) -> "CoordXform":
+        """Return a transform for a refined grid.
+
+        When a grid is refined by a factor, ijk coordinates are multiplied
+        by that factor. This composes the scaling into the transform.
+
+        Args:
+            factor: The refinement factor (typically 2).
+
+        Returns:
+            A new CoordXform that maps to the refined grid's ijk space.
+        """
+        if factor <= 0:
+            raise ValueError("Refinement factor cannot be negative or zero.")
+        if factor == 1 or factor == 1.0:
+            return self
+        return self.compose(UniformScaleThenTranslate(scale=float(factor)))
 
 
 @dataclass(frozen=True)
@@ -355,33 +373,51 @@ class IdentityXform(CoordXform):
 
 
 @dataclass(frozen=True)
-class ScalarGainBiasXform(CoordXform):
-    """Uniform scale and translate: coords_out = coords_in * gain + bias.
+class UniformScaleThenTranslate(CoordXform):
+    """Uniform scale and translate: coords_out = coords_in * scale + translation.
 
-    This applies the same scalar gain and bias to all three coordinate axes.
-    Invertible when gain != 0.
+    This applies the same scalar scale and translation to all three coordinate axes.
+    Invertible when scale != 0.
     """
 
-    gain: float = 1.0
-    bias: float = 0.0
+    scale: float = 1.0
+    translation: float = 0.0
+
+    def __post_init__(self):
+        if self.scale == 0:
+            raise ValueError("Scale cannot be zero.")
 
     def apply_tensor(self, coords: torch.Tensor) -> torch.Tensor:
-        """Apply coords * gain + bias."""
-        return coords * self.gain + self.bias
+        """Apply coords * scale + translation."""
+        return coords * self.scale + self.translation
 
     def apply_bounds_tensor(self, bounds: torch.Tensor) -> torch.Tensor:
-        """Apply bounds * gain + bias, swapping min/max if gain < 0."""
-        transformed = bounds * self.gain + self.bias
-        if self.gain < 0:
-            # Negative gain swaps min and max corners
+        """Apply bounds * scale + translation, swapping min/max if scale < 0."""
+        transformed = bounds * self.scale + self.translation
+        if self.scale < 0:
+            # Negative scale swaps min and max corners
             transformed = torch.stack([transformed[:, 1, :], transformed[:, 0, :]], dim=1)
         return transformed
 
-    def inverse(self) -> "ScalarGainBiasXform":
-        """Return inverse: gain'=1/gain, bias'=-bias/gain."""
-        return ScalarGainBiasXform(gain=1.0 / self.gain, bias=-self.bias / self.gain)
+    def inverse(self) -> "UniformScaleThenTranslate":
+        """Return inverse: scale'=1/scale, translation'=-translation/scale."""
+        return UniformScaleThenTranslate(scale=1.0 / self.scale, translation=-self.translation / self.scale)
+
+    def compose(self, other: "CoordXform") -> "CoordXform":
+        """Compose this transformation with another.
+
+        If other is also a UniformScaleThenTranslate, fuse into a single transform.
+        Given self: y = x * s1 + t1 and other: z = y * s2 + t2,
+        the fused transform is: z = x * (s1 * s2) + (t1 * s2 + t2).
+        """
+        if isinstance(other, UniformScaleThenTranslate):
+            return UniformScaleThenTranslate(
+                scale=self.scale * other.scale,
+                translation=self.translation * other.scale + other.translation,
+            )
+        return ComposedXform(self, other)
 
     @property
     def invertible(self) -> bool:
-        """True if gain != 0."""
-        return self.gain != 0.0
+        """True if scale != 0."""
+        return self.scale != 0.0
