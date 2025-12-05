@@ -12,6 +12,7 @@ import unittest
 
 import torch
 from fvdb import JaggedTensor
+from parameterized import parameterized
 
 from .utils import (
     PointCloudConfig,
@@ -20,10 +21,27 @@ from .utils import (
     generate_plane_patch,
     generate_scene,
     generate_sphere_patch,
+    generate_street_scene_batch,
     generate_test_jagged_tensor,
     generate_test_point_clouds,
     point_clouds_to_jagged_tensor,
 )
+
+# Parameter combinations for device and batch size
+all_device_batch_combos = [
+    ["cpu", 1],
+    ["cpu", 2],
+    ["cpu", 4],
+    ["cuda", 1],
+    ["cuda", 2],
+    ["cuda", 4],
+]
+
+# Device-only combinations for tests that don't need batch size variation
+all_devices = [
+    ["cpu"],
+    ["cuda"],
+]
 
 
 class TestPointCloudConfig(unittest.TestCase):
@@ -405,6 +423,120 @@ class TestGenerateTestJaggedTensor(unittest.TestCase):
         jt2 = generate_test_jagged_tensor(batch_size=2, seed=42)
 
         self.assertTrue(torch.equal(jt1.jdata, jt2.jdata))
+
+
+# =============================================================================
+# Street scene batch generation tests
+# =============================================================================
+
+
+class TestGenerateStreetSceneBatch(unittest.TestCase):
+    """Test cases for street scene batch JaggedTensor generation."""
+
+    @parameterized.expand(all_device_batch_combos)
+    def test_batch_generation(self, device: str, batch_size: int) -> None:
+        """Smoke test: verify batch generation succeeds and returns valid JaggedTensor."""
+        jt = generate_street_scene_batch(
+            batch_size=batch_size,
+            base_seed=42,
+            num_points=1000,  # Smaller for faster tests
+            device=device,
+        )
+
+        # Verify it's a JaggedTensor
+        self.assertIsInstance(jt, JaggedTensor)
+
+        # Verify shape: data should be (N, 3)
+        self.assertEqual(jt.jdata.ndim, 2)
+        self.assertEqual(jt.jdata.shape[1], 3)
+
+        # Verify batch structure: offsets should have batch_size + 1 elements
+        self.assertEqual(len(jt.joffsets), batch_size + 1)
+
+        # Verify offsets start at 0 and end at total points
+        self.assertEqual(jt.joffsets[0], 0)
+        self.assertEqual(jt.joffsets[-1], jt.jdata.shape[0])
+
+        # Verify device
+        self.assertEqual(jt.jdata.device.type, device)
+
+    @parameterized.expand(all_device_batch_combos)
+    def test_batch_has_points(self, device: str, batch_size: int) -> None:
+        """Verify each batch element has a reasonable number of points."""
+        jt = generate_street_scene_batch(
+            batch_size=batch_size,
+            base_seed=123,
+            num_points=1000,
+            device=device,
+        )
+
+        # Check each batch element has points
+        for i in range(batch_size):
+            start = jt.joffsets[i].item()
+            end = jt.joffsets[i + 1].item()
+            num_points = end - start
+
+            # Each scene should have a reasonable number of points
+            # (at least 100, since we requested 1000)
+            self.assertGreaterEqual(num_points, 100, f"Batch element {i} has too few points: {num_points}")
+
+    @parameterized.expand(all_devices)
+    def test_different_seeds_produce_different_scenes(self, device: str) -> None:
+        """Verify that different base seeds produce different point clouds."""
+        jt1 = generate_street_scene_batch(batch_size=1, base_seed=42, num_points=500, device=device)
+        jt2 = generate_street_scene_batch(batch_size=1, base_seed=43, num_points=500, device=device)
+
+        # The point clouds should be different
+        self.assertFalse(torch.equal(jt1.jdata, jt2.jdata))
+
+    @parameterized.expand(all_devices)
+    def test_same_seed_is_reproducible(self, device: str) -> None:
+        """Verify that same seed produces identical results."""
+        jt1 = generate_street_scene_batch(batch_size=2, base_seed=42, num_points=500, device=device)
+        jt2 = generate_street_scene_batch(batch_size=2, base_seed=42, num_points=500, device=device)
+
+        # The point clouds should be identical
+        self.assertTrue(torch.equal(jt1.jdata, jt2.jdata))
+        self.assertTrue(torch.equal(jt1.joffsets, jt2.joffsets))
+
+    @parameterized.expand(all_devices)
+    def test_batch_elements_are_distinct(self, device: str) -> None:
+        """Verify that different batch elements have different geometry."""
+        jt = generate_street_scene_batch(batch_size=4, base_seed=42, num_points=1000, device=device)
+
+        # Compute centroids for each batch element
+        centroids = []
+        for i in range(4):
+            start = jt.joffsets[i].item()
+            end = jt.joffsets[i + 1].item()
+            batch_points = jt.jdata[start:end]
+            centroid = batch_points.mean(dim=0)
+            centroids.append(centroid)
+
+        # Each pair of centroids should be different
+        for i in range(len(centroids)):
+            for j in range(i + 1, len(centroids)):
+                dist = torch.linalg.norm(centroids[i] - centroids[j])
+                # Different scenes should have different centroids
+                self.assertGreater(dist, 0.01, f"Batch elements {i} and {j} have nearly identical centroids")
+
+    @parameterized.expand(all_devices)
+    def test_points_in_reasonable_range(self, device: str) -> None:
+        """Verify that generated points are in a reasonable coordinate range."""
+        jt = generate_street_scene_batch(batch_size=2, base_seed=42, num_points=1000, device=device)
+
+        # Street scenes should be roughly 30-50m in length, 8-12m wide
+        # Points should generally be within a reasonable bounding box
+        min_coords = jt.jdata.min(dim=0).values
+        max_coords = jt.jdata.max(dim=0).values
+        extent = max_coords - min_coords
+
+        # The scene should have some spatial extent
+        self.assertGreater(extent[0], 1.0, "Scene X extent too small")
+        self.assertGreater(extent[1], 1.0, "Scene Y extent too small")
+
+        # But not be astronomically large (sanity check)
+        self.assertLess(extent.max(), 200.0, "Scene extent unexpectedly large")
 
 
 if __name__ == "__main__":

@@ -154,8 +154,9 @@ class SparseFeatureLevel:
         will interpret that as a batch size of 1. Instead, we create an offsets tensor
         that's just arange.
         """
-        offsets = torch.arange(0, self.grid.grid_count, dtype=torch.int32, device=self.grid.device)
-        return JaggedTensor.from_data_and_offsets(self.grid.bboxes, offsets)
+        bboxes = self.grid.bboxes
+        offsets = torch.arange(0, self.grid.grid_count + 1, dtype=torch.long, device=self.grid.device)
+        return JaggedTensor.from_data_and_offsets(bboxes, offsets)
 
     @property
     def bounds_world(self) -> JaggedTensor:

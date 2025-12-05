@@ -106,7 +106,7 @@ def generate_plane_patch(
     # Gram-Schmidt to get orthonormal basis
     tangent_u = arbitrary - torch.dot(arbitrary, normal_t) * normal_t
     tangent_u = tangent_u / torch.linalg.norm(tangent_u)
-    tangent_v = torch.cross(normal_t, tangent_u)
+    tangent_v = torch.linalg.cross(normal_t, tangent_u)
 
     # Generate points on plane
     center_t = torch.tensor(center, dtype=torch.float32, device=device)
@@ -506,19 +506,7 @@ def point_clouds_to_jagged_tensor(clouds: list[torch.Tensor]) -> JaggedTensor:
     if not clouds:
         raise ValueError("Cannot create JaggedTensor from empty list")
 
-    # Build offsets from cumulative point counts
-    offsets = [0]
-    for cloud in clouds:
-        offsets.append(offsets[-1] + cloud.shape[0])
-
-    # Concatenate all point data
-    data = torch.cat(clouds, dim=0)
-
-    # Build offsets tensor
-    device = clouds[0].device
-    offsets_tensor = torch.tensor(offsets, dtype=torch.int32, device=device)
-
-    return JaggedTensor.from_data_and_offsets(data, offsets_tensor)
+    return JaggedTensor.from_list_of_tensors(clouds)
 
 
 def generate_test_jagged_tensor(
@@ -861,6 +849,54 @@ def generate_street_scene(
         )
 
     return generate_scene(primitives)
+
+
+def generate_street_scene_batch(
+    batch_size: int,
+    base_seed: int = 42,
+    num_points: int = 10000,
+    noise_std: float = 0.02,
+    device: torch.device | str = "cpu",
+) -> JaggedTensor:
+    """Generate a batch of street scene point clouds as a JaggedTensor.
+
+    Creates multiple street scenes with different random seeds, suitable for
+    testing batch processing in SparseFeatureHierarchy and related components.
+
+    Each scene in the batch uses a different seed derived from base_seed to ensure
+    variety while maintaining reproducibility:
+        - Scene 0: seed = base_seed
+        - Scene 1: seed = base_seed + 1000
+        - Scene 2: seed = base_seed + 2000
+        - etc.
+
+    Args:
+        batch_size: Number of street scenes to generate (1, 2, 4, etc.).
+        base_seed: Base random seed. Each scene uses base_seed + i * 1000.
+        num_points: Approximate number of points per scene.
+        noise_std: Noise standard deviation for point perturbation.
+        device: Torch device for the output tensor.
+
+    Returns:
+        JaggedTensor containing all street scenes with proper batch structure.
+
+    Example:
+        >>> jt = generate_street_scene_batch(batch_size=2, base_seed=42, device="cuda")
+        >>> print(jt.jdata.shape)  # (total_points, 3)
+        >>> print(len(jt.joffsets))  # 3 (batch_size + 1)
+    """
+    clouds = []
+    for i in range(batch_size):
+        scene_seed = base_seed + i * 1000
+        cloud = generate_street_scene(
+            seed=scene_seed,
+            num_points=num_points,
+            noise_std=noise_std,
+            device=device,
+        )
+        clouds.append(cloud)
+
+    return point_clouds_to_jagged_tensor(clouds)
 
 
 def generate_default_scenes(seed: int = 42, device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
