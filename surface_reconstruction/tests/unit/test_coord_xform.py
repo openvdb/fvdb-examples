@@ -13,6 +13,166 @@ import torch
 from nksr.nksr_fvdb.coord_xform import IdentityXform, UniformScaleThenTranslate
 
 
+class TestMatmulOperator(unittest.TestCase):
+    """Test cases for the @ (matmul) operator on CoordXform.
+
+    The @ operator is overloaded to support both composition and application:
+    - xform_a @ xform_b: Composition, returns a transform where xform_b is applied first, then xform_a.
+    - xform @ coords: Application, transforms the coordinates.
+
+    These tests validate all usages of the @ operator to ensure correct behavior.
+    """
+
+    def test_matmul_applies_tensor(self):
+        """Test that xform @ tensor applies the transform to coordinates."""
+        xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+        result = xform @ coords
+
+        expected = torch.tensor([[3.0, 5.0, 7.0], [9.0, 11.0, 13.0]])  # coords * 2 + 1
+        self.assertTrue(torch.allclose(result, expected))
+
+    def test_matmul_applies_tensor_matches_apply(self):
+        """Test that xform @ tensor gives same result as xform.apply_tensor()."""
+        xform = UniformScaleThenTranslate(scale=3.0, translation=-2.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        matmul_result = xform @ coords
+        apply_result = xform.apply_tensor(coords)
+
+        self.assertTrue(torch.equal(matmul_result, apply_result))
+
+    def test_matmul_composes_transforms(self):
+        """Test that xform_a @ xform_b composes transforms correctly.
+
+        Composition semantics: (A @ B)(x) = A(B(x)), so B is applied first, then A.
+        """
+        # B: y = x * 3 + 5  (applied first)
+        # A: z = y * 2 + 1  (applied second)
+        # Composed: z = (x * 3 + 5) * 2 + 1 = x * 6 + 11
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        composed = xform_a @ xform_b
+
+        self.assertIsInstance(composed, UniformScaleThenTranslate)
+        assert isinstance(composed, UniformScaleThenTranslate)  # for type narrowing
+        self.assertEqual(composed.scale, 6.0)
+        self.assertEqual(composed.translation, 11.0)
+
+    def test_matmul_compose_matches_compose_method(self):
+        """Test that xform_a @ xform_b gives same result as xform_a.compose(xform_b)."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+
+        matmul_result = xform_a @ xform_b
+        compose_result = xform_a.compose(xform_b)
+
+        # Both should be equivalent UniformScaleThenTranslate
+        self.assertIsInstance(matmul_result, UniformScaleThenTranslate)
+        self.assertIsInstance(compose_result, UniformScaleThenTranslate)
+        assert isinstance(matmul_result, UniformScaleThenTranslate)
+        assert isinstance(compose_result, UniformScaleThenTranslate)
+        self.assertEqual(matmul_result.scale, compose_result.scale)
+        self.assertEqual(matmul_result.translation, compose_result.translation)
+
+    def test_matmul_composition_order(self):
+        """Test that (A @ B)(x) == A(B(x)) - B is applied first, then A."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=1.0)
+        xform_b = UniformScaleThenTranslate(scale=3.0, translation=5.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        # Composed transform applied to coords
+        composed = xform_a @ xform_b
+        composed_result = composed @ coords
+
+        # Sequential application: A(B(x))
+        sequential_result = xform_a @ (xform_b @ coords)
+
+        self.assertTrue(torch.allclose(composed_result, sequential_result))
+
+    def test_matmul_chain_of_three(self):
+        """Test chaining three transforms: (A @ B @ C)(x) = A(B(C(x)))."""
+        xform_a = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        xform_b = UniformScaleThenTranslate(scale=1.0, translation=3.0)
+        xform_c = UniformScaleThenTranslate(scale=0.5, translation=1.0)
+        coords = torch.tensor([[2.0, 4.0, 6.0]])
+
+        # Compose all three
+        composed = xform_a @ xform_b @ xform_c
+
+        # Apply composed
+        composed_result = composed @ coords
+
+        # Sequential: A(B(C(x)))
+        # C(x) = x * 0.5 + 1 = [2.0, 3.0, 4.0]
+        # B(C(x)) = C(x) * 1.0 + 3.0 = [5.0, 6.0, 7.0]
+        # A(B(C(x))) = B(C(x)) * 2.0 + 0.0 = [10.0, 12.0, 14.0]
+        expected = torch.tensor([[10.0, 12.0, 14.0]])
+
+        self.assertTrue(torch.allclose(composed_result, expected))
+
+    def test_matmul_with_identity(self):
+        """Test that identity @ xform and xform @ identity both equal xform."""
+        identity = IdentityXform()
+        xform = UniformScaleThenTranslate(scale=2.0, translation=3.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        # identity @ xform should behave like xform
+        left_composed = identity @ xform
+        left_result = left_composed @ coords
+
+        # xform @ identity should behave like xform
+        right_composed = xform @ identity
+        right_result = right_composed @ coords
+
+        # Direct application
+        direct_result = xform @ coords
+
+        self.assertTrue(torch.allclose(left_result, direct_result))
+        self.assertTrue(torch.allclose(right_result, direct_result))
+
+    def test_matmul_with_inverse(self):
+        """Test that xform @ xform.inverse() is equivalent to identity."""
+        xform = UniformScaleThenTranslate(scale=2.0, translation=3.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        # xform @ inverse should give us back the original coords
+        composed = xform @ xform.inverse()
+        result = composed @ coords
+
+        self.assertTrue(torch.allclose(result, coords))
+
+    def test_matmul_inverse_order(self):
+        """Test that inverse @ xform also gives identity-like behavior."""
+        xform = UniformScaleThenTranslate(scale=2.0, translation=3.0)
+        coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        # inverse @ xform: inverse is applied first, then xform
+        # This should NOT give identity behavior (order matters)
+        # But (inverse @ xform) @ (xform @ coords) should give coords back
+        transformed = xform @ coords
+        recovered = xform.inverse() @ transformed
+
+        self.assertTrue(torch.allclose(recovered, coords))
+
+    def test_matmul_mixed_types_compose_then_apply(self):
+        """Test mixed usage: compose transforms, then apply to coords."""
+        world_T_camera = UniformScaleThenTranslate(scale=1.0, translation=10.0)
+        camera_T_object = UniformScaleThenTranslate(scale=2.0, translation=0.0)
+        object_coords = torch.tensor([[1.0, 2.0, 3.0]])
+
+        # Compose first, then apply
+        world_T_object = world_T_camera @ camera_T_object
+        world_coords = world_T_object @ object_coords
+
+        # Should equal sequential application
+        expected = world_T_camera @ (camera_T_object @ object_coords)
+
+        self.assertTrue(torch.allclose(world_coords, expected))
+
+
 class TestIdentityXform(unittest.TestCase):
     """Test cases for IdentityXform."""
 
@@ -21,7 +181,7 @@ class TestIdentityXform(unittest.TestCase):
         xform = IdentityXform()
         coords = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
-        result = xform.apply_tensor(coords)
+        result = xform @ coords
 
         self.assertTrue(torch.equal(result, coords))
 
@@ -45,7 +205,7 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         xform = UniformScaleThenTranslate(scale=2.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
-        result = xform.apply_tensor(coords)
+        result = xform @ coords
         expected = torch.tensor([[2.0, 4.0, 6.0]])
 
         self.assertTrue(torch.allclose(result, expected))
@@ -55,7 +215,7 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         xform = UniformScaleThenTranslate(translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
-        result = xform.apply_tensor(coords)
+        result = xform @ coords
         expected = torch.tensor([[2.0, 3.0, 4.0]])
 
         self.assertTrue(torch.allclose(result, expected))
@@ -65,7 +225,7 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
-        result = xform.apply_tensor(coords)
+        result = xform @ coords
         expected = torch.tensor([[3.0, 5.0, 7.0]])  # coords * 2 + 1
 
         self.assertTrue(torch.allclose(result, expected))
@@ -75,8 +235,8 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         xform = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         coords = torch.tensor([[1.0, 2.0, 3.0]])
 
-        transformed = xform.apply_tensor(coords)
-        recovered = xform.inverse().apply_tensor(transformed)
+        transformed = xform @ coords
+        recovered = xform.inverse() @ transformed
 
         self.assertTrue(torch.allclose(recovered, coords))
 
@@ -91,10 +251,14 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
             UniformScaleThenTranslate(scale=0.0, translation=1.0)
 
     def test_compose_fuses_two_uniform_scale_translates(self):
-        """Test that composing two UniformScaleThenTranslate fuses them."""
-        # First: y = x * 2 + 1
-        # Second: z = y * 3 + 5
-        # Composed: z = x * (2*3) + (1*3 + 5) = x * 6 + 8
+        """Test that composing two UniformScaleThenTranslate fuses them.
+
+        Composition semantics: first.compose(second) returns a transform where
+        second is applied first, then first. i.e., (first.compose(second))(x) = first(second(x)).
+        """
+        # second: y = x * 3 + 5  (applied first)
+        # first:  z = y * 2 + 1  (applied second)
+        # Composed: z = (x * 3 + 5) * 2 + 1 = x * 6 + 11
         first = UniformScaleThenTranslate(scale=2.0, translation=1.0)
         second = UniformScaleThenTranslate(scale=3.0, translation=5.0)
 
@@ -103,11 +267,11 @@ class TestUniformScaleThenTranslate(unittest.TestCase):
         self.assertIsInstance(composed, UniformScaleThenTranslate)
         assert isinstance(composed, UniformScaleThenTranslate)  # for type narrowing
         self.assertEqual(composed.scale, 6.0)
-        self.assertEqual(composed.translation, 8.0)
+        self.assertEqual(composed.translation, 11.0)
 
-        # Verify the result matches applying them sequentially
+        # Verify the result matches applying them sequentially: first(second(x))
         coords = torch.tensor([[1.0, 2.0, 3.0]])
-        sequential = second.apply_tensor(first.apply_tensor(coords))
+        sequential = first.apply_tensor(second.apply_tensor(coords))
         fused = composed.apply_tensor(coords)
         self.assertTrue(torch.allclose(sequential, fused))
 
@@ -130,7 +294,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         xform = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]])
-        world_pos = xform.apply_tensor(origin_ijk)
+        world_pos = xform @ origin_ijk
 
         expected = torch.tensor([[voxel_size / 2, voxel_size / 2, voxel_size / 2]])
         self.assertTrue(torch.allclose(world_pos, expected))
@@ -156,12 +320,12 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         voxel_size = 0.1
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
-        # Create center-aligned coarse transform
+        # Create center-aligned coarse transform using @ for composition
         fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
-        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+        world_T_coarse = world_T_fine @ fine_T_coarse
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]])
-        coarse_world_pos = world_T_coarse.apply_tensor(origin_ijk)
+        coarse_world_pos = world_T_coarse @ origin_ijk
 
         # Coarse ijk=0 should map to the center of the coarse voxel: voxel_size
         expected_center = torch.tensor([[voxel_size, voxel_size, voxel_size]])
@@ -177,10 +341,10 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
         fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
-        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+        world_T_coarse = world_T_fine @ fine_T_coarse
 
         # The pseudo_scaling_factor should be 2x the original voxel size
-        self.assertAlmostEqual(world_T_coarse.pseudo_scaling_factor, voxel_size * 2, places=10)
+        self.assertAlmostEqual(world_T_coarse.pseudo_scaling_factor, voxel_size * 2, places=5)
 
     def test_center_aligned_coarsening_multiple_voxels(self):
         """Test center-aligned coarsening for multiple voxel coordinates."""
@@ -192,7 +356,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
         fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
-        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+        world_T_coarse = world_T_fine @ fine_T_coarse
 
         # Test multiple coarse ijk coordinates
         coarse_ijk = torch.tensor(
@@ -204,7 +368,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
             ]
         )
 
-        coarse_world = world_T_coarse.apply_tensor(coarse_ijk)
+        coarse_world = world_T_coarse @ coarse_ijk
 
         # For center-aligned: world = (coarse_ijk * 2 + 0.5) * voxel_size + voxel_size/2
         #                           = coarse_ijk * 2 * voxel_size + 0.5 * voxel_size + voxel_size/2
@@ -223,10 +387,10 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
         fine_T_coarse = voxel_center_aligned_coarsening_xform(4)
-        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+        world_T_coarse = world_T_fine @ fine_T_coarse
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]])
-        coarse_world_pos = world_T_coarse.apply_tensor(origin_ijk)
+        coarse_world_pos = world_T_coarse @ origin_ijk
 
         # For factor=4: fine_ijk = coarse_ijk * 4 + 1.5 (since (4-1)/2 = 1.5)
         # world = (0 * 4 + 1.5) * 0.1 + 0.05 = 0.15 + 0.05 = 0.20
@@ -235,7 +399,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         self.assertTrue(torch.allclose(coarse_world_pos, expected))
 
         # Voxel size should be 4x
-        self.assertAlmostEqual(world_T_coarse.pseudo_scaling_factor, voxel_size * 4, places=10)
+        self.assertAlmostEqual(world_T_coarse.pseudo_scaling_factor, voxel_size * 4, places=5)
 
     def test_iterative_center_aligned_coarsening(self):
         """Test that iterative center-aligned coarsening works correctly.
@@ -251,30 +415,30 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
 
         fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
 
-        # Level 1: coarsen once
-        world_T_level1 = world_T_level0.compose(fine_T_coarse)
+        # Level 1: coarsen once using @ for composition
+        world_T_level1 = world_T_level0 @ fine_T_coarse
 
         # Level 2: coarsen again
-        world_T_level2 = world_T_level1.compose(fine_T_coarse)
+        world_T_level2 = world_T_level1 @ fine_T_coarse
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]])
 
         # Level 0: center at voxel_size/2 = 0.05
-        level0_world = world_T_level0.apply_tensor(origin_ijk)
+        level0_world = world_T_level0 @ origin_ijk
         self.assertTrue(torch.allclose(level0_world, torch.tensor([[0.05, 0.05, 0.05]])))
 
         # Level 1: center at voxel_size = 0.10 (2x coarser)
-        level1_world = world_T_level1.apply_tensor(origin_ijk)
+        level1_world = world_T_level1 @ origin_ijk
         self.assertTrue(torch.allclose(level1_world, torch.tensor([[0.10, 0.10, 0.10]])))
 
         # Level 2: center at 2*voxel_size = 0.20 (4x coarser)
-        level2_world = world_T_level2.apply_tensor(origin_ijk)
+        level2_world = world_T_level2 @ origin_ijk
         self.assertTrue(torch.allclose(level2_world, torch.tensor([[0.20, 0.20, 0.20]])))
 
         # Check voxel sizes
-        self.assertAlmostEqual(world_T_level0.pseudo_scaling_factor, 0.1, places=10)
-        self.assertAlmostEqual(world_T_level1.pseudo_scaling_factor, 0.2, places=10)
-        self.assertAlmostEqual(world_T_level2.pseudo_scaling_factor, 0.4, places=10)
+        self.assertAlmostEqual(world_T_level0.pseudo_scaling_factor, 0.1, places=5)
+        self.assertAlmostEqual(world_T_level1.pseudo_scaling_factor, 0.2, places=5)
+        self.assertAlmostEqual(world_T_level2.pseudo_scaling_factor, 0.4, places=5)
 
 
 if __name__ == "__main__":

@@ -7,34 +7,7 @@ from enum import Enum
 import torch
 from fvdb import GridBatch, JaggedTensor
 
-from .coord_xform import CoordXform, UniformScaleThenTranslate
-
-
-def voxel_center_aligned_coarsening_xform(factor: int) -> CoordXform:
-    """Create a transform from coarse ijk to fine ijk for center-aligned grids.
-
-    When grids use voxel-center tracking (ijk=0 maps to the center of voxel 0),
-    coarsening requires a half-voxel offset to ensure coarse ijk=0 maps to the
-    center of the coarse voxel (which is the midpoint of the fine voxels it contains).
-
-    For factor=2:
-    - Fine voxels 0 and 1 combine into coarse voxel 0
-    - Coarse voxel 0's center is at fine ijk=0.5 (midpoint of 0 and 1)
-    - So: fine_ijk = coarse_ijk * 2 + 0.5
-
-    General formula: fine_ijk = coarse_ijk * factor + (factor - 1) / 2
-
-    Usage:
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(factor)
-        world_T_coarse = world_T_fine.compose(fine_T_coarse)
-
-    Args:
-        factor: The coarsening factor (typically 2).
-
-    Returns:
-        A CoordXform that maps coarse ijk to fine ijk with center alignment.
-    """
-    return UniformScaleThenTranslate(scale=float(factor), translation=(factor - 1) / 2)
+from .coord_xform import CoordXform, voxel_center_aligned_coarsening_xform
 
 
 class VoxelStatus(Enum):
@@ -110,11 +83,10 @@ class SparseFeatureLevel:
         assert queries_per_primal == resolution**3
 
         # Get the query positions in voxel space
-        query_voxel_flat = (
-            primal_coords.jdata.unsqueeze(1) + box_coords.unsqueeze(0)  # [N, 1, 3]  # [1, R^3, 3]
-        ).view(
-            -1, 3
-        )  # [N * R^3, 3]
+        # primal_coords jdata unsqueeze(1): [N, 1,   3]
+        # box coords unsqueeze(0):          [1, R^3, 3]
+        # addition and .view(-1, 3):       [N * R^3, 3]
+        query_voxel_flat = (primal_coords.jdata.unsqueeze(1) + box_coords.unsqueeze(0)).view(-1, 3)
 
         # make them jagged.
         query_voxel = JaggedTensor.from_data_and_offsets(
@@ -122,7 +94,7 @@ class SparseFeatureLevel:
         )
 
         # Transform the points to world space
-        query_world = self.world_T_voxel(query_voxel)
+        query_world: JaggedTensor = self.world_T_voxel @ query_voxel
 
         return query_world, primal_coords
 
@@ -167,12 +139,12 @@ class SparseFeatureHierarchy:
     ) -> "SparseFeatureHierarchy":
 
         voxel_T_world = world_T_voxel.inverse()
-        voxel_points = voxel_T_world(world_points)
+        voxel_points = voxel_T_world @ world_points
         levels: list[SparseFeatureLevel] = [SparseFeatureLevel(GridBatch.from_points(voxel_points), world_T_voxel)]
         fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
             coarsened_grid = levels[-1].grid.coarsened_grid(coarsening_factor)
-            coarsened_xform = levels[-1].world_T_voxel.compose(fine_T_coarse)
+            coarsened_xform = levels[-1].world_T_voxel @ fine_T_coarse
             levels.append(SparseFeatureLevel(coarsened_grid, coarsened_xform))
 
         return cls(levels=levels)
@@ -183,16 +155,16 @@ class SparseFeatureHierarchy:
     ) -> "SparseFeatureHierarchy":
 
         voxel_T_world = world_T_voxel.inverse()
-        voxel_points = voxel_T_world(world_points)
+        voxel_points = voxel_T_world @ world_points
         levels: list[SparseFeatureLevel] = [
             SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points), world_T_voxel)
         ]
 
         fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
-            world_T_voxel_d = levels[-1].world_T_voxel.compose(fine_T_coarse)
+            world_T_voxel_d = levels[-1].world_T_voxel @ fine_T_coarse
             voxel_T_world_d = world_T_voxel_d.inverse()
-            voxel_points_d = voxel_T_world_d(world_points)
+            voxel_points_d = voxel_T_world_d @ world_points
             levels.append(SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points_d), world_T_voxel_d))
 
         return cls(levels=levels)

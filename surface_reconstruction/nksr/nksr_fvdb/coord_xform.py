@@ -279,24 +279,69 @@ class CoordXform(ABC):
     def compose(self, other: "CoordXform") -> "CoordXform":
         """Compose this transformation with another.
 
-        The resulting transformation applies self first, then other.
-        i.e., (self.compose(other))(x) == other(self(x))
+        The resulting transformation applies other first, then self.
+        i.e., (self.compose(other))(x) == self(other(x))
 
         Args:
-            other: The transformation to apply after this one.
+            other: The transformation to apply before this one.
 
         Returns:
             A new CoordXform representing the composition.
         """
-        return ComposedXform(self, other)
+        return ComposedXform(first=other, second=self)
 
-    def __matmul__(self, other: "CoordXform") -> "CoordXform":
-        """Compose transformations using @ operator.
+    @overload
+    def __matmul__(self, other: "CoordXform") -> "CoordXform": ...
 
-        Note: Uses mathematical convention where (A @ B)(x) = A(B(x)),
-        so other is applied first, then self.
+    @overload
+    def __matmul__(self, other: torch.Tensor) -> torch.Tensor: ...
+    @overload
+    def __matmul__(self, other: fvdb.JaggedTensor) -> fvdb.JaggedTensor: ...
+
+    def __matmul__(
+        self, other: "CoordXform | torch.Tensor | fvdb.JaggedTensor"
+    ) -> "CoordXform | torch.Tensor | fvdb.JaggedTensor":
+        """Matrix-multiply style operator supporting both composition and application.
+
+        This operator is overloaded to support two distinct use cases:
+
+        1. **Composition** (when other is a CoordXform):
+           Returns a new transform representing self(other(x)).
+           Uses mathematical convention where (A @ B)(x) = A(B(x)),
+           so B (other) is applied first, then A (self).
+
+           Example:
+               world_T_object = world_T_camera @ camera_T_object
+               # Equivalent to: world_T_camera.compose(camera_T_object)
+
+        2. **Application** (when other is a Tensor or JaggedTensor):
+           Applies this transform to the coordinates, returning transformed coords.
+           This provides a convenient notation: xform @ coords instead of xform(coords).
+
+           Example:
+               world_coords = world_T_object @ object_coords
+               # Equivalent to: world_T_object.apply(object_coords)
+
+        Args:
+            other: Either a CoordXform (for composition) or coordinates to transform
+                   (torch.Tensor of shape [N, 3] or fvdb.JaggedTensor).
+
+        Returns:
+            - If other is CoordXform: A new CoordXform representing the composition.
+            - If other is torch.Tensor: Transformed coordinates as torch.Tensor.
+            - If other is fvdb.JaggedTensor: Transformed coordinates as fvdb.JaggedTensor.
+
+        Raises:
+            ValueError: If other is not a supported type.
         """
-        return ComposedXform(other, self)
+        if isinstance(other, torch.Tensor):
+            return self.apply_tensor(other)
+        elif isinstance(other, fvdb.JaggedTensor):
+            return self.apply_jagged(other)
+        elif isinstance(other, CoordXform):
+            return self.compose(other)
+        else:
+            raise ValueError(f"Unsupported type: {type(other)}")
 
 
 @dataclass(frozen=True)
@@ -417,16 +462,21 @@ class UniformScaleThenTranslate(CoordXform):
     def compose(self, other: "CoordXform") -> "CoordXform":
         """Compose this transformation with another.
 
+        The resulting transformation applies other first, then self.
+        i.e., (self.compose(other))(x) == self(other(x))
+
         If other is also a UniformScaleThenTranslate, fuse into a single transform.
-        Given self: y = x * s1 + t1 and other: z = y * s2 + t2,
-        the fused transform is: z = x * (s1 * s2) + (t1 * s2 + t2).
+        Given:
+            other: y = x * s_other + t_other  (applied first)
+            self:  z = y * s_self + t_self    (applied second)
+        The fused transform is: z = x * (s_other * s_self) + (t_other * s_self + t_self)
         """
         if isinstance(other, UniformScaleThenTranslate):
             return UniformScaleThenTranslate(
-                scale=self.scale * other.scale,
-                translation=self.translation * other.scale + other.translation,
+                scale=other.scale * self.scale,
+                translation=other.translation * self.scale + self.translation,
             )
-        return ComposedXform(self, other)
+        return ComposedXform(first=other, second=self)
 
     @property
     def invertible(self) -> bool:
@@ -437,3 +487,30 @@ class UniformScaleThenTranslate(CoordXform):
     def pseudo_scaling_factor(self) -> float:
         """Return the absolute scale factor."""
         return abs(self.scale)
+
+
+def voxel_center_aligned_coarsening_xform(factor: int) -> CoordXform:
+    """Create a transform from coarse ijk to fine ijk for center-aligned grids.
+
+    When grids use voxel-center tracking (ijk=0 maps to the center of voxel 0),
+    coarsening requires a half-voxel offset to ensure coarse ijk=0 maps to the
+    center of the coarse voxel (which is the midpoint of the fine voxels it contains).
+
+    For factor=2:
+    - Fine voxels 0 and 1 combine into coarse voxel 0
+    - Coarse voxel 0's center is at fine ijk=0.5 (midpoint of 0 and 1)
+    - So: fine_ijk = coarse_ijk * 2 + 0.5
+
+    General formula: fine_ijk = coarse_ijk * factor + (factor - 1) / 2
+
+    Usage:
+        fine_T_coarse = voxel_center_aligned_coarsening_xform(factor)
+        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+
+    Args:
+        factor: The coarsening factor (typically 2).
+
+    Returns:
+        A CoordXform that maps coarse ijk to fine ijk with center alignment.
+    """
+    return UniformScaleThenTranslate(scale=float(factor), translation=(factor - 1) / 2)
