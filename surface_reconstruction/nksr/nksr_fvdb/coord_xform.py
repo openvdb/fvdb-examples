@@ -504,7 +504,26 @@ class UniformScaleThenTranslate(CoordXform):
         return abs(self.scale)
 
 
-def voxel_center_aligned_coarsening_xform(factor: int) -> CoordXform:
+def world_T_voxcen_from_voxel_size(voxel_size: float) -> CoordXform:
+    """Create a world_T_voxcen transform for a given finest voxel size.
+
+    Uses center-aligned voxels where ijk coordinates reference voxel centers.
+    The half-voxel offset ensures proper alignment.
+
+    For a voxel_size of 0.05m:
+    - Voxcen ijk (0,0,0) maps to world (0.025, 0.025, 0.025)
+    - Voxcen ijk (1,0,0) maps to world (0.075, 0.025, 0.025)
+
+    Args:
+        voxel_size: The size of the voxels in world units.
+
+    Returns:
+        A CoordXform that maps voxcen coordinates to world coordinates.
+    """
+    return UniformScaleThenTranslate(scale=voxel_size, translation=0.5 * voxel_size)
+
+
+def voxcen_coarsening_xform(factor: int) -> CoordXform:
     """Create a transform from coarse ijk to fine ijk for center-aligned grids.
 
     When grids use voxel-center tracking (ijk=0 maps to the center of voxel 0),
@@ -519,7 +538,7 @@ def voxel_center_aligned_coarsening_xform(factor: int) -> CoordXform:
     General formula: fine_ijk = coarse_ijk * factor + (factor - 1) / 2
 
     Usage:
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(factor)
+        fine_T_coarse = voxcen_coarsening_xform(factor)
         world_T_coarse = world_T_fine.compose(fine_T_coarse)
 
     Args:

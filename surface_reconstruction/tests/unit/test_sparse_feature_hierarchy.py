@@ -16,7 +16,7 @@ import unittest
 
 import torch
 from fvdb import GridBatch, JaggedTensor
-from nksr.nksr_fvdb.coord_xform import UniformScaleThenTranslate
+from nksr.nksr_fvdb.coord_xform import world_T_voxcen_from_voxel_size
 from nksr.nksr_fvdb.sparse_feature_hierarchy import (
     SparseFeatureHierarchy,
     SparseFeatureLevel,
@@ -49,19 +49,6 @@ DEFAULT_DEPTH = 4  # Gives levels at 5cm, 10cm, 20cm, 40cm
 DEFAULT_COARSENING_FACTOR = 2
 
 
-def create_world_T_voxel(voxel_size: float) -> UniformScaleThenTranslate:
-    """Create a world_T_voxel transform for a given finest voxel size.
-
-    Uses center-aligned voxels where ijk coordinates reference voxel centers.
-    The half-voxel offset ensures proper alignment.
-
-    For a voxel_size of 0.05m:
-    - Voxel ijk (0,0,0) maps to world center (0.025, 0.025, 0.025)
-    - Voxel ijk (1,0,0) maps to world center (0.075, 0.025, 0.025)
-    """
-    return UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
-
-
 class TestSparseFeatureHierarchyConstruction(unittest.TestCase):
     """Tests for SparseFeatureHierarchy construction methods."""
 
@@ -78,12 +65,12 @@ class TestSparseFeatureHierarchyConstruction(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         # Create hierarchy
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -104,11 +91,11 @@ class TestSparseFeatureHierarchyConstruction(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_point_splatting(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -128,22 +115,22 @@ class TestSparseFeatureHierarchyConstruction(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         # Create a base hierarchy with depth 3
         base = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=3,
         )
 
         # Create a new finest level (half the voxel size of the base finest)
         finer_voxel_size = DEFAULT_VOXEL_SIZE / 2
-        finer_world_T_voxel = create_world_T_voxel(finer_voxel_size)
-        voxel_T_world = finer_world_T_voxel.inverse()
-        voxel_points = voxel_T_world @ world_points
-        finer_grid = GridBatch.from_points(voxel_points)
-        finest_level = SparseFeatureLevel(finer_grid, finer_world_T_voxel)
+        finer_world_T_voxcen = world_T_voxcen_from_voxel_size(finer_voxel_size)
+        voxcen_T_world = finer_world_T_voxcen.inverse()
+        voxcen_points = voxcen_T_world @ world_points
+        finer_grid = GridBatch.from_points(voxcen_points)
+        finest_level = SparseFeatureLevel(finer_grid, finer_world_T_voxcen)
 
         # Extend the hierarchy
         extended = SparseFeatureHierarchy.from_refinement(finest_level, base)
@@ -171,11 +158,11 @@ class TestSparseFeatureHierarchyStructure(unittest.TestCase):
             num_points=10000,  # More points for clearer hierarchy
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -201,11 +188,11 @@ class TestSparseFeatureHierarchyStructure(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
             coarsening_factor=2,
         )
@@ -241,11 +228,11 @@ class TestSparseFeatureHierarchyStructure(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -268,11 +255,11 @@ class TestSparseFeatureHierarchyStructure(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -296,11 +283,11 @@ class TestSparseFeatureHierarchyBounds(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -344,8 +331,8 @@ class TestSparseFeatureHierarchyBounds(unittest.TestCase):
                 )
 
     @parameterized.expand(all_device_batch_combos)
-    def test_bounds_voxel_are_integers_at_finest_level(self, device: str, batch_size: int) -> None:
-        """Test that voxel bounds at finest level are integer-ish (from grid ijk)."""
+    def test_bounds_voxcen_are_integers_at_finest_level(self, device: str, batch_size: int) -> None:
+        """Test that voxcen bounds at finest level are integer-ish (from grid ijk)."""
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
@@ -355,22 +342,22 @@ class TestSparseFeatureHierarchyBounds(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
-        bounds_voxel = hierarchy.bounds_voxel
+        bounds_voxcen = hierarchy.bounds_voxcen
 
-        # Voxel bounds should be close to integers
-        bound_offsets = bounds_voxel.joffsets
+        # Voxcen bounds should be close to integers
+        bound_offsets = bounds_voxcen.joffsets
         for b in range(batch_size):
             bd_start = bound_offsets[b].item()
             bd_end = bound_offsets[b + 1].item()
-            batch_bounds = bounds_voxel.jdata[bd_start:bd_end].squeeze(0)  # [2, 3]
+            batch_bounds = bounds_voxcen.jdata[bd_start:bd_end].squeeze(0)  # [2, 3]
             for corner_idx in range(2):
                 for dim in range(3):
                     val = batch_bounds[corner_idx, dim].item()
@@ -378,7 +365,7 @@ class TestSparseFeatureHierarchyBounds(unittest.TestCase):
                         val,
                         round(val),
                         places=5,
-                        msg=f"Batch {b}, corner {corner_idx}, dim {dim}: voxel bound should be integer",
+                        msg=f"Batch {b}, corner {corner_idx}, dim {dim}: voxcen bound should be integer",
                     )
 
 
@@ -401,17 +388,17 @@ class TestSparseFeatureHierarchyComparisons(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy_iter = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
         hierarchy_splat = SparseFeatureHierarchy.from_point_splatting(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -441,11 +428,11 @@ class TestSparseFeatureHierarchyEdgeCases(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=1,
         )
 
@@ -465,12 +452,12 @@ class TestSparseFeatureHierarchyEdgeCases(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         for factor in [2, 3, 4]:
             hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
                 world_points=world_points,
-                world_T_voxel=world_T_voxel,
+                world_T_voxcen=world_T_voxcen,
                 depth=3,
                 coarsening_factor=factor,
             )
@@ -503,11 +490,11 @@ class TestSparseFeatureHierarchyEdgeCases(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -533,11 +520,11 @@ class TestSparseFeatureLevelTestGrid(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -564,11 +551,11 @@ class TestSparseFeatureLevelTestGrid(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=2,
         )
 
@@ -600,11 +587,11 @@ class TestVoxelStatusEvaluation(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -638,11 +625,11 @@ class TestVoxelStatusEvaluation(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -669,11 +656,11 @@ class TestVoxelStatusEvaluation(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -702,11 +689,11 @@ class TestModuleLevelEvaluateVoxelStatus(unittest.TestCase):
             num_points=5000,
             device=device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=2,
         )
 
@@ -745,16 +732,16 @@ class TestModuleLevelEvaluateVoxelStatus(unittest.TestCase):
             num_points=5000,
             device=other_device,
         )
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         hierarchy_1 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_1,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=2,
         )
         hierarchy_2 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_2,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=2,
         )
 
@@ -776,7 +763,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         # Create two hierarchies with same seed
         world_points_1 = generate_street_scene_batch(
@@ -787,7 +774,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         )
         hierarchy_1 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_1,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -799,7 +786,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         )
         hierarchy_2 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_2,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -817,7 +804,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        world_T_voxel = create_world_T_voxel(DEFAULT_VOXEL_SIZE)
+        world_T_voxcen = world_T_voxcen_from_voxel_size(DEFAULT_VOXEL_SIZE)
 
         world_points_1 = generate_street_scene_batch(
             batch_size=1,
@@ -827,7 +814,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         )
         hierarchy_1 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_1,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 
@@ -839,7 +826,7 @@ class TestSparseFeatureHierarchyDeterminism(unittest.TestCase):
         )
         hierarchy_2 = SparseFeatureHierarchy.from_iterative_coarsening(
             world_points=world_points_2,
-            world_T_voxel=world_T_voxel,
+            world_T_voxcen=world_T_voxcen,
             depth=DEFAULT_DEPTH,
         )
 

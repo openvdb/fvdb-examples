@@ -7,7 +7,11 @@ from enum import Enum
 import torch
 from fvdb import GridBatch, JaggedTensor
 
-from .coord_xform import CoordXform, voxel_center_aligned_coarsening_xform
+from .coord_xform import (
+    CoordXform,
+    voxcen_coarsening_xform,
+    world_T_voxcen_from_voxel_size,
+)
 
 
 class VoxelStatus(Enum):
@@ -86,12 +90,12 @@ class SparseFeatureLevel:
 
     Attributes:
         grid: Sparse voxel grid at this level.
-        world_T_voxel: Transform from voxel coordinates to world coordinates.
-        pseudo_voxel_size: Cached world-space voxel size (derived from world_T_voxel).
+        world_T_voxcen: Transform from voxcen coordinates to world coordinates.
+        pseudo_voxel_size: Cached world-space voxel size (derived from world_T_voxcen).
     """
 
     grid: GridBatch
-    world_T_voxel: CoordXform
+    world_T_voxcen: CoordXform
     pseudo_voxel_size: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -102,7 +106,7 @@ class SparseFeatureLevel:
         choosing algorithm parameters).
         """
         # Use object.__setattr__ because this is a frozen dataclass
-        object.__setattr__(self, "pseudo_voxel_size", self.world_T_voxel.pseudo_scaling_factor)
+        object.__setattr__(self, "pseudo_voxel_size", self.world_T_voxcen.pseudo_scaling_factor)
 
     def get_test_grid(self, resolution: int = 2) -> tuple[JaggedTensor, JaggedTensor]:
         """Generate a regular grid of query points within each voxel for evaluation.
@@ -131,19 +135,19 @@ class SparseFeatureLevel:
         queries_per_primal = box_coords.shape[0]
         assert queries_per_primal == resolution**3
 
-        # Get the query positions in voxel space
+        # Get the query positions in voxcen space
         # primal_coords jdata unsqueeze(1): [N, 1,   3]
         # box coords unsqueeze(0):          [1, R^3, 3]
         # addition and .view(-1, 3):       [N * R^3, 3]
-        query_voxel_flat = (primal_coords.jdata.unsqueeze(1) + box_coords.unsqueeze(0)).view(-1, 3)
+        query_voxcen_flat = (primal_coords.jdata.unsqueeze(1) + box_coords.unsqueeze(0)).view(-1, 3)
 
         # make them jagged.
-        query_voxel = JaggedTensor.from_data_and_offsets(
-            query_voxel_flat, offsets=primal_coords.joffsets * queries_per_primal
+        query_voxcen = JaggedTensor.from_data_and_offsets(
+            query_voxcen_flat, offsets=primal_coords.joffsets * queries_per_primal
         )
 
         # Transform the points to world space
-        query_world: JaggedTensor = self.world_T_voxel @ query_voxel
+        query_world: JaggedTensor = self.world_T_voxcen @ query_voxcen
 
         return query_world, primal_coords
 
@@ -151,7 +155,7 @@ class SparseFeatureLevel:
         return f"SparseFeatureLevel: {self.grid.total_voxels} voxels, pseudo_voxel_size={self.pseudo_voxel_size:.4g}"
 
     @property
-    def bounds_voxel(self) -> JaggedTensor:
+    def bounds_voxcen(self) -> JaggedTensor:
         """
         The bboxes returned by gridbatch normally are a regular tensor, but because
         of how the coord xform works, it might want to have a different transform per
@@ -166,7 +170,7 @@ class SparseFeatureLevel:
 
     @property
     def bounds_world(self) -> JaggedTensor:
-        return self.world_T_voxel.apply_bounds(self.bounds_voxel)
+        return self.world_T_voxcen.apply_bounds(self.bounds_voxcen)
 
     @property
     def device(self) -> torch.device:
@@ -210,38 +214,68 @@ class SparseFeatureHierarchy:
         """
         return cls(levels=[finest_level] + base.levels)
 
+    @staticmethod
+    def _init_world_T_voxcen(world_T_voxcen: CoordXform | None = None, voxel_size: float | None = None) -> CoordXform:
+        if world_T_voxcen is None and voxel_size is None:
+            raise ValueError("Either world_T_voxcen or voxel_size must be provided.")
+        if world_T_voxcen is not None and voxel_size is not None:
+            raise ValueError("Only one of world_T_voxcen or voxel_size may(must!) be provided")
+        if world_T_voxcen is None:
+            assert voxel_size is not None
+            return world_T_voxcen_from_voxel_size(voxel_size)
+        assert world_T_voxcen is not None
+        return world_T_voxcen
+
     @classmethod
     def from_iterative_coarsening(
-        cls, world_points: JaggedTensor, world_T_voxel: CoordXform, depth: int, coarsening_factor: int = 2
+        cls,
+        world_points: JaggedTensor,
+        *,
+        world_T_voxcen: CoordXform | None = None,
+        voxel_size: float | None = None,
+        depth: int = 4,
+        coarsening_factor: int = 2,
     ) -> "SparseFeatureHierarchy":
         """Construct a new hierarchy by iteratively coarsening a base level.
 
         This version will use the from_points method to construct the GridBatch at the finest level,
         and then coarsen it iteratively using the coarsened_grid method.
 
+        Either world_T_voxcen or voxel_size must be provided, but not both.
+
         Args:
             world_points: Points in world coordinates.
-            world_T_voxel: Transform from (finest) voxel coordinates to world coordinates.
+            world_T_voxcen: Transform from (finest) voxcen coordinates to world coordinates.
+            voxel_size: Size of the finest voxels in world units.
             depth: Number of levels to coarsen.
             coarsening_factor: Factor by which to coarsen each level.
 
         Returns:
             New SparseFeatureHierarchy with the coarsened levels.
+
+
         """
-        voxel_T_world = world_T_voxel.inverse()
-        voxel_points = voxel_T_world @ world_points
-        levels: list[SparseFeatureLevel] = [SparseFeatureLevel(GridBatch.from_points(voxel_points), world_T_voxel)]
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
+        world_T_voxcen = cls._init_world_T_voxcen(world_T_voxcen, voxel_size)
+        voxcen_T_world = world_T_voxcen.inverse()
+        voxcen_points = voxcen_T_world @ world_points
+        levels: list[SparseFeatureLevel] = [SparseFeatureLevel(GridBatch.from_points(voxcen_points), world_T_voxcen)]
+        fine_T_coarse = voxcen_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
             coarsened_grid = levels[-1].grid.coarsened_grid(coarsening_factor)
-            coarsened_xform = levels[-1].world_T_voxel @ fine_T_coarse
+            coarsened_xform = levels[-1].world_T_voxcen @ fine_T_coarse
             levels.append(SparseFeatureLevel(coarsened_grid, coarsened_xform))
 
         return cls(levels=levels)
 
     @classmethod
     def from_point_splatting(
-        cls, world_points: JaggedTensor, world_T_voxel: CoordXform, depth: int, coarsening_factor: int = 2
+        cls,
+        world_points: JaggedTensor,
+        *,
+        world_T_voxcen: CoordXform | None = None,
+        voxel_size: float | None = None,
+        depth: int = 4,
+        coarsening_factor: int = 2,
     ) -> "SparseFeatureHierarchy":
         """Construct a new hierarchy by splatting points to voxels at each different detail
         level. The underlying grid batch keeps its voxel size as 1 and origin as 0, we don't use those
@@ -252,27 +286,33 @@ class SparseFeatureHierarchy:
         center point. Each level is splatted from all points, not using the grid from the
         other refinement levels.
 
+        Either world_T_voxcen or voxel_size must be provided, but not both.
+
         Args:
             world_points: Points in world coordinates.
-            world_T_voxel: Transform from (finest) voxel coordinates to world coordinates.
+            world_T_voxcen: Transform from (finest) voxcen coordinates to world coordinates.
+            voxel_size: Size of the finest voxels in world units.
             depth: Number of levels to coarsen.
             coarsening_factor: Factor by which to coarsen each level.
 
         Returns:
             New SparseFeatureHierarchy with the coarsened levels.
         """
-        voxel_T_world = world_T_voxel.inverse()
-        voxel_points = voxel_T_world @ world_points
+        world_T_voxcen = cls._init_world_T_voxcen(world_T_voxcen, voxel_size)
+        voxcen_T_world = world_T_voxcen.inverse()
+        voxcen_points = voxcen_T_world @ world_points
         levels: list[SparseFeatureLevel] = [
-            SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points), world_T_voxel)
+            SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxcen_points), world_T_voxcen)
         ]
 
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
+        fine_T_coarse = voxcen_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
-            world_T_voxel_d = levels[-1].world_T_voxel @ fine_T_coarse
-            voxel_T_world_d = world_T_voxel_d.inverse()
-            voxel_points_d = voxel_T_world_d @ world_points
-            levels.append(SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points_d), world_T_voxel_d))
+            world_T_voxcen_d = levels[-1].world_T_voxcen @ fine_T_coarse
+            voxcen_T_world_d = world_T_voxcen_d.inverse()
+            voxcen_points_d = voxcen_T_world_d @ world_points
+            levels.append(
+                SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxcen_points_d), world_T_voxcen_d)
+            )
 
         return cls(levels=levels)
 
@@ -320,8 +360,8 @@ class SparseFeatureHierarchy:
         return len(self.levels)
 
     @property
-    def bounds_voxel(self) -> JaggedTensor:
-        return self.levels[0].bounds_voxel
+    def bounds_voxcen(self) -> JaggedTensor:
+        return self.levels[0].bounds_voxcen
 
     @property
     def bounds_world(self) -> JaggedTensor:

@@ -611,7 +611,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
     """
 
     @parameterized.expand(all_devices)
-    def test_voxel_center_transform_origin_maps_to_half_voxel(self, device: str):
+    def test_voxcen_transform_origin_maps_to_half_voxel(self, device: str):
         """Verify that a voxel-center transform maps ijk=(0,0,0) to (voxel_size/2, ...)."""
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
@@ -627,7 +627,7 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         self.assertTrue(torch.allclose(world_pos, expected))
 
     @parameterized.expand(all_devices)
-    def test_center_aligned_coarsening_maps_to_coarse_voxel_center(self, device: str):
+    def test_coarsening_correctly_centers_voxels(self, device: str):
         """Test that center-aligned coarsening maps coarse ijk=0 to the coarse voxel center.
 
         For a fine grid with voxel_size=0.1 and voxel-center tracking:
@@ -644,15 +644,13 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        from nksr.nksr_fvdb.sparse_feature_hierarchy import (
-            voxel_center_aligned_coarsening_xform,
-        )
+        from nksr.nksr_fvdb.sparse_feature_hierarchy import voxcen_coarsening_xform
 
         voxel_size = 0.1
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
         # Create center-aligned coarse transform using @ for composition
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
+        fine_T_coarse = voxcen_coarsening_xform(2)
         world_T_coarse = world_T_fine @ fine_T_coarse
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]], device=device)
@@ -664,14 +662,12 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
 
     def test_center_aligned_coarsening_doubles_voxel_size(self):
         """Test that center-aligned coarsening by 2 doubles the effective voxel size."""
-        from nksr.nksr_fvdb.sparse_feature_hierarchy import (
-            voxel_center_aligned_coarsening_xform,
-        )
+        from nksr.nksr_fvdb.sparse_feature_hierarchy import voxcen_coarsening_xform
 
         voxel_size = 0.1
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
+        fine_T_coarse = voxcen_coarsening_xform(2)
         world_T_coarse = world_T_fine @ fine_T_coarse
 
         # The pseudo_scaling_factor should be 2x the original voxel size
@@ -683,14 +679,12 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        from nksr.nksr_fvdb.sparse_feature_hierarchy import (
-            voxel_center_aligned_coarsening_xform,
-        )
+        from nksr.nksr_fvdb.sparse_feature_hierarchy import voxcen_coarsening_xform
 
         voxel_size = 0.1
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
+        fine_T_coarse = voxcen_coarsening_xform(2)
         world_T_coarse = world_T_fine @ fine_T_coarse
 
         # Test multiple coarse ijk coordinates
@@ -719,14 +713,12 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        from nksr.nksr_fvdb.sparse_feature_hierarchy import (
-            voxel_center_aligned_coarsening_xform,
-        )
+        from nksr.nksr_fvdb.sparse_feature_hierarchy import voxcen_coarsening_xform
 
         voxel_size = 0.1
         world_T_fine = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(4)
+        fine_T_coarse = voxcen_coarsening_xform(4)
         world_T_coarse = world_T_fine @ fine_T_coarse
 
         origin_ijk = torch.tensor([[0.0, 0.0, 0.0]], device=device)
@@ -750,14 +742,12 @@ class TestVoxelCenterAlignedCoarsening(unittest.TestCase):
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        from nksr.nksr_fvdb.sparse_feature_hierarchy import (
-            voxel_center_aligned_coarsening_xform,
-        )
+        from nksr.nksr_fvdb.sparse_feature_hierarchy import voxcen_coarsening_xform
 
         voxel_size = 0.1
         world_T_level0 = UniformScaleThenTranslate(scale=voxel_size, translation=voxel_size / 2)
 
-        fine_T_coarse = voxel_center_aligned_coarsening_xform(2)
+        fine_T_coarse = voxcen_coarsening_xform(2)
 
         # Level 1: coarsen once using @ for composition
         world_T_level1 = world_T_level0 @ fine_T_coarse
