@@ -1,14 +1,40 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
 from fvdb import GridBatch, JaggedTensor
 
-from .coord_xform import CoordXform
+from .coord_xform import CoordXform, UniformScaleThenTranslate
+
+
+def voxel_center_aligned_coarsening_xform(factor: int) -> CoordXform:
+    """Create a transform from coarse ijk to fine ijk for center-aligned grids.
+
+    When grids use voxel-center tracking (ijk=0 maps to the center of voxel 0),
+    coarsening requires a half-voxel offset to ensure coarse ijk=0 maps to the
+    center of the coarse voxel (which is the midpoint of the fine voxels it contains).
+
+    For factor=2:
+    - Fine voxels 0 and 1 combine into coarse voxel 0
+    - Coarse voxel 0's center is at fine ijk=0.5 (midpoint of 0 and 1)
+    - So: fine_ijk = coarse_ijk * 2 + 0.5
+
+    General formula: fine_ijk = coarse_ijk * factor + (factor - 1) / 2
+
+    Usage:
+        fine_T_coarse = voxel_center_aligned_coarsening_xform(factor)
+        world_T_coarse = world_T_fine.compose(fine_T_coarse)
+
+    Args:
+        factor: The coarsening factor (typically 2).
+
+    Returns:
+        A CoordXform that maps coarse ijk to fine ijk with center alignment.
+    """
+    return UniformScaleThenTranslate(scale=float(factor), translation=(factor - 1) / 2)
 
 
 class VoxelStatus(Enum):
@@ -60,52 +86,14 @@ class SparseFeatureLevel:
     pseudo_voxel_size: float = field(init=False)
 
     def __post_init__(self) -> None:
-        """Compute and cache the pseudo voxel size.
-
-        The concept of "voxel size" is well-defined for uniform-scale transforms
-        (e.g., ScalarGainBiasXform), but becomes ambiguous when:
-          - The transform has different scales per batch element
-          - The transform is non-linear (e.g., frustum/perspective transforms)
-          - The transform has non-uniform scaling along different axes
-
-        However, in typical usage, there is a single meaningful voxel size that's
-        approximately consistent across all batch elements and all points in space.
-
-        To estimate this, we compute the "pseudo voxel size" as follows:
-          1. Take two reference points in voxel space: the origin (0,0,0) and the
-             unit diagonal corner (1,1,1).
-          2. Transform both points to world space using world_T_voxel.
-          3. Compute the Euclidean distance between the transformed points.
-          4. Divide by the reference distance (sqrt(3), the distance from origin
-             to (1,1,1) in voxel space).
-
-        This gives us the approximate scale factor, which equals the voxel size
-        for uniform-scale transforms. For non-uniform or spatially-varying transforms,
-        this is a representative "average" scale measured along the body diagonal.
+        """Cache the pseudo voxel size from the transform's pseudo_scaling_factor.
 
         This value is cached because the computation requires tensor operations
         and we expect it to be accessed frequently (e.g., for display, for
         choosing algorithm parameters).
         """
-        # Create the two reference points in voxel space
-        device = self.grid.device
-        ref_points = torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], device=device)
-
-        # Transform to world space
-        world_points = self.world_T_voxel.apply_tensor(ref_points)
-
-        # Compute the distance in world space
-        diff = world_points[1] - world_points[0]
-        world_distance = torch.linalg.norm(diff).item()
-
-        # Reference distance is sqrt(3) (distance from origin to (1,1,1))
-        ref_distance = math.sqrt(3.0)
-
-        # Pseudo voxel size is the ratio
-        pseudo_voxel_size = world_distance / ref_distance
-
         # Use object.__setattr__ because this is a frozen dataclass
-        object.__setattr__(self, "pseudo_voxel_size", pseudo_voxel_size)
+        object.__setattr__(self, "pseudo_voxel_size", self.world_T_voxel.pseudo_scaling_factor)
 
     def get_test_grid(self, resolution: int = 2) -> tuple[JaggedTensor, JaggedTensor]:
         # The primal coords are the voxel centers of the grid batch.
@@ -181,9 +169,10 @@ class SparseFeatureHierarchy:
         voxel_T_world = world_T_voxel.inverse()
         voxel_points = voxel_T_world(world_points)
         levels: list[SparseFeatureLevel] = [SparseFeatureLevel(GridBatch.from_points(voxel_points), world_T_voxel)]
+        fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
             coarsened_grid = levels[-1].grid.coarsened_grid(coarsening_factor)
-            coarsened_xform = levels[-1].world_T_voxel.coarsened(coarsening_factor)
+            coarsened_xform = levels[-1].world_T_voxel.compose(fine_T_coarse)
             levels.append(SparseFeatureLevel(coarsened_grid, coarsened_xform))
 
         return cls(levels=levels)
@@ -199,8 +188,9 @@ class SparseFeatureHierarchy:
             SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points), world_T_voxel)
         ]
 
+        fine_T_coarse = voxel_center_aligned_coarsening_xform(coarsening_factor)
         for d in range(1, depth):
-            world_T_voxel_d = levels[-1].world_T_voxel.coarsened(coarsening_factor)
+            world_T_voxel_d = levels[-1].world_T_voxel.compose(fine_T_coarse)
             voxel_T_world_d = world_T_voxel_d.inverse()
             voxel_points_d = voxel_T_world_d(world_points)
             levels.append(SparseFeatureLevel(GridBatch.from_nearest_voxels_to_points(voxel_points_d), world_T_voxel_d))

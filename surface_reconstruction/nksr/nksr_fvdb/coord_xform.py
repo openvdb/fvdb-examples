@@ -47,6 +47,7 @@ explicit axis-angle or other form might be used, particularly as it may relate t
 
 """
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import overload
@@ -234,6 +235,47 @@ class CoordXform(ABC):
         """Whether this transformation has an inverse."""
         return False
 
+    @property
+    def pseudo_scaling_factor(self) -> float:
+        """Compute the approximate uniform scaling factor of this transform.
+
+        The concept of "scaling factor" is well-defined for uniform-scale transforms
+        (e.g., UniformScaleThenTranslate), but becomes ambiguous when:
+          - The transform has different scales per batch element
+          - The transform is non-linear (e.g., frustum/perspective transforms)
+          - The transform has non-uniform scaling along different axes
+
+        However, in typical usage, there is a single meaningful scale that's
+        approximately consistent across all batch elements and all points in space.
+
+        To estimate this, we compute the "pseudo scaling factor" as follows:
+          1. Take two reference points in source space: the origin (0,0,0) and the
+             unit diagonal corner (1,1,1).
+          2. Transform both points to target space.
+          3. Compute the Euclidean distance between the transformed points.
+          4. Divide by the reference distance (sqrt(3), the distance from origin
+             to (1,1,1) in source space).
+
+        This gives us the approximate scale factor, which equals the exact scale
+        for uniform-scale transforms. For non-uniform or spatially-varying transforms,
+        this is a representative "average" scale measured along the body diagonal.
+        """
+        # Create the two reference points in source space
+        ref_points = torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+
+        # Transform to target space
+        target_points = self.apply_tensor(ref_points)
+
+        # Compute the distance in target space
+        diff = target_points[1] - target_points[0]
+        target_distance = torch.linalg.norm(diff).item()
+
+        # Reference distance is sqrt(3) (distance from origin to (1,1,1))
+        ref_distance = math.sqrt(3.0)
+
+        # Pseudo scaling factor is the ratio
+        return target_distance / ref_distance
+
     def compose(self, other: "CoordXform") -> "CoordXform":
         """Compose this transformation with another.
 
@@ -255,42 +297,6 @@ class CoordXform(ABC):
         so other is applied first, then self.
         """
         return ComposedXform(other, self)
-
-    def coarsened(self, factor: int | float) -> "CoordXform":
-        """Return a transform for a coarsened grid.
-
-        When a grid is coarsened by a factor, ijk coordinates are divided
-        by that factor. This composes the scaling into the transform.
-
-        Args:
-            factor: The coarsening factor (typically 2).
-
-        Returns:
-            A new CoordXform that maps to the coarsened grid's ijk space.
-        """
-        if factor <= 0:
-            raise ValueError("Coarsening factor cannot be negative or zero.")
-        if factor == 1 or factor == 1.0:
-            return self
-        return self.compose(UniformScaleThenTranslate(scale=1.0 / factor))
-
-    def refined(self, factor: int | float) -> "CoordXform":
-        """Return a transform for a refined grid.
-
-        When a grid is refined by a factor, ijk coordinates are multiplied
-        by that factor. This composes the scaling into the transform.
-
-        Args:
-            factor: The refinement factor (typically 2).
-
-        Returns:
-            A new CoordXform that maps to the refined grid's ijk space.
-        """
-        if factor <= 0:
-            raise ValueError("Refinement factor cannot be negative or zero.")
-        if factor == 1 or factor == 1.0:
-            return self
-        return self.compose(UniformScaleThenTranslate(scale=float(factor)))
 
 
 @dataclass(frozen=True)
@@ -371,6 +377,11 @@ class IdentityXform(CoordXform):
         """Always True."""
         return True
 
+    @property
+    def pseudo_scaling_factor(self) -> float:
+        """Always 1.0 for identity."""
+        return 1.0
+
 
 @dataclass(frozen=True)
 class UniformScaleThenTranslate(CoordXform):
@@ -421,3 +432,8 @@ class UniformScaleThenTranslate(CoordXform):
     def invertible(self) -> bool:
         """True if scale != 0."""
         return self.scale != 0.0
+
+    @property
+    def pseudo_scaling_factor(self) -> float:
+        """Return the absolute scale factor."""
+        return abs(self.scale)
