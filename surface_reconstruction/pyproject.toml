@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pyright]
+include = ["nksr", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+
+[[tool.pyright.executionEnvironments]]
+root = "."
+pythonVersion = "3.12"
+
+[tool.basedpyright]
+include = ["nksr", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+
+[[tool.basedpyright.executionEnvironments]]
+root = "."
+pythonVersion = "3.12"

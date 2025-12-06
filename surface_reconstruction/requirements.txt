@@ -1,0 +1,7 @@
+# fvdb requirements
+--extra-index-url https://download.pytorch.org/whl/cu129
+--extra-index-url https://d36m13axqqhiit.cloudfront.net/simple
+fvdb-core==0.3.0+pt28.cu129
+
+# Development
+black~=24.0
