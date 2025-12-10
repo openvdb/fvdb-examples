@@ -262,3 +262,11 @@ class PointEncoder(tnn.Module):
         # Use the grid to re-jagged the output features. This means that while the input
         # data is an arbitrary point cloud, the output data is aligned to the batched voxel grid.
         return grid.jagged_like(x)
+
+    def __call__(
+        self,
+        jagged_positions_voxel: fvdb.JaggedTensor,
+        jagged_extra_features: fvdb.JaggedTensor | None,
+        grid: fvdb.GridBatch,
+    ) -> fvdb.JaggedTensor:
+        return super().__call__(jagged_positions_voxel, jagged_extra_features, grid)

@@ -523,6 +523,21 @@ def world_T_voxcen_from_voxel_size(voxel_size: float) -> CoordXform:
     return UniformScaleThenTranslate(scale=voxel_size, translation=0.5 * voxel_size)
 
 
+def voxel_T_world_from_voxel_size(voxel_size: float) -> UniformScaleThenTranslate:
+    """Create a voxel_T_world transform for the given voxel size.
+
+    Uses lower-left corner aligned voxels (NOT center-aligned voxcen).
+    voxel_coords = world_coords / voxel_size
+
+    Args:
+        voxel_size: The size of voxels in world units.
+
+    Returns:
+        Transform that converts world coordinates to voxel coordinates.
+    """
+    return UniformScaleThenTranslate(scale=1.0 / voxel_size, translation=0.0)
+
+
 def voxcen_coarsening_xform(factor: int) -> CoordXform:
     """Create a transform from coarse ijk to fine ijk for center-aligned grids.
 

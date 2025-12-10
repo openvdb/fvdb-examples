@@ -95,3 +95,6 @@ class ResnetBlockFC(torch.nn.Module):
 
     def extra_repr(self) -> str:
         return f"size_in={self.size_in}, size_hidden={self.size_hidden}, size_out={self.size_out}"
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return super().__call__(x)
