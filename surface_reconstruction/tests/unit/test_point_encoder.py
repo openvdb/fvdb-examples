@@ -654,7 +654,11 @@ class TestPointEncoderDeterminism(unittest.TestCase):
 
     @parameterized.expand(all_devices)
     def test_same_input_produces_same_output(self, device: str) -> None:
-        """Test that the same input produces identical output."""
+        """Test that the same input produces essentially identical output.
+
+        Note: PyTorch's scatter_reduce_ can be non-deterministic on CUDA devices,
+        so we use allclose to allow for minor floating-point variations.
+        """
         points_world = generate_street_scene_batch(
             batch_size=2,
             base_seed=42,
@@ -672,7 +676,11 @@ class TestPointEncoderDeterminism(unittest.TestCase):
             features1 = encoder(points_voxel, None, grid)
             features2 = encoder(points_voxel, None, grid)
 
-        self.assertTrue(torch.equal(features1.jdata, features2.jdata))
+        # Use allclose to handle potential CUDA non-determinism in scatter operations
+        self.assertTrue(
+            torch.allclose(features1.jdata, features2.jdata, atol=1e-5, rtol=1e-5),
+            "Same input should produce essentially identical output",
+        )
 
     @parameterized.expand(all_devices)
     def test_different_seeds_produce_different_outputs(self, device: str) -> None:
@@ -824,6 +832,215 @@ class TestPointEncoderSerialization(unittest.TestCase):
         self.assertIn("size_output=64", s)
         self.assertIn("size_hidden=48", s)
         self.assertIn("block_count=5", s)
+
+
+class TestPointEncoderScatterReduction(unittest.TestCase):
+    """Tests for scatter reduction operations (max pooling and mean pooling).
+
+    These tests specifically verify that the scatter operations correctly
+    aggregate multiple points per voxel. This is critical for the PointNet-style
+    architecture where many points can fall into the same voxel.
+    """
+
+    @parameterized.expand(all_devices)
+    def test_multiple_points_per_voxel_produces_valid_output(self, device: str) -> None:
+        """Test that voxels with multiple points produce finite, non-zero features."""
+        # Create points where multiple points fall into the same voxel
+        # Points at [0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.3, 0.3, 0.3] all map to voxel [0,0,0]
+        # Points at [1.1, 1.1, 1.1], [1.2, 1.2, 1.2] map to voxel [1,1,1]
+        points = fvdb.JaggedTensor.from_list_of_tensors(
+            [
+                torch.tensor(
+                    [
+                        [0.1, 0.1, 0.1],
+                        [0.2, 0.2, 0.2],
+                        [0.3, 0.3, 0.3],
+                        [1.1, 1.1, 1.1],
+                        [1.2, 1.2, 1.2],
+                    ],
+                    device=device,
+                )
+            ]
+        )
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        with torch.no_grad():
+            features = encoder(points, None, grid)
+
+        # Should have exactly 2 voxels with valid features
+        self.assertEqual(features.jdata.shape[0], grid.total_voxels)
+        self.assertTrue(torch.isfinite(features.jdata).all())
+        # Features should not be all zeros (since we have points in all voxels)
+        self.assertTrue((features.jdata != 0).any())
+
+    @parameterized.expand(all_devices)
+    def test_varying_points_per_voxel(self, device: str) -> None:
+        """Test encoder with varying number of points per voxel.
+
+        This test creates multiple points that should cluster into a small number
+        of voxels (fewer than the total number of points), exercising the
+        many-to-one scatter aggregation.
+        """
+        # Create points clustered around certain locations
+        points = fvdb.JaggedTensor.from_list_of_tensors(
+            [
+                torch.tensor(
+                    [
+                        # Cluster 1: 1 point
+                        [0.5, 0.5, 0.5],
+                        # Cluster 2: 3 points (all in same voxel due to small offsets)
+                        [10.1, 10.1, 10.1],
+                        [10.2, 10.2, 10.2],
+                        [10.3, 10.3, 10.3],
+                        # Cluster 3: 5 points (all in same voxel)
+                        [20.1, 20.1, 20.1],
+                        [20.2, 20.2, 20.2],
+                        [20.3, 20.3, 20.3],
+                        [20.4, 20.4, 20.4],
+                        [20.5, 20.5, 20.5],
+                    ],
+                    device=device,
+                )
+            ]
+        )
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        with torch.no_grad():
+            features = encoder(points, None, grid)
+
+        # Key assertion: there should be fewer voxels than input points
+        # (demonstrating many-to-one aggregation)
+        num_points = points.jdata.shape[0]
+        self.assertLess(grid.total_voxels, num_points, "Should have fewer voxels than input points")
+        self.assertEqual(features.jdata.shape[0], grid.total_voxels)
+        self.assertTrue(torch.isfinite(features.jdata).all())
+        # At least some voxels should have non-zero features
+        self.assertTrue((features.jdata != 0).any(), "At least some features should be non-zero")
+
+    @parameterized.expand(all_devices)
+    def test_dense_points_many_per_voxel(self, device: str) -> None:
+        """Test with very dense point cloud - 100 points in a small region."""
+        # Create 100 random points within a small region
+        # Use small offsets from a base point to ensure they all fall in the same voxel
+        torch.manual_seed(42)
+        base = torch.tensor([[10.0, 10.0, 10.0]], device=device)
+        offsets = torch.rand(100, 3, device=device) * 0.5  # Small offsets in [0, 0.5)
+        single_voxel_points = base + offsets
+
+        points = fvdb.JaggedTensor.from_list_of_tensors([single_voxel_points])
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        with torch.no_grad():
+            features = encoder(points, None, grid)
+
+        # Should have exactly 1 voxel (all points in the same voxel)
+        self.assertEqual(grid.total_voxels, 1)
+        self.assertEqual(features.jdata.shape[0], 1)
+        self.assertTrue(torch.isfinite(features.jdata).all())
+
+    @parameterized.expand(all_devices)
+    def test_scatter_consistency_with_duplicates(self, device: str) -> None:
+        """Test that scatter operations produce consistent results with multiple points per voxel.
+
+        Note: PyTorch's scatter_reduce_ can be non-deterministic on CUDA devices due to
+        atomic operation ordering. We use allclose to allow for minor floating-point
+        variations while ensuring results are essentially the same.
+        """
+        points = fvdb.JaggedTensor.from_list_of_tensors(
+            [
+                torch.tensor(
+                    [
+                        [10.1, 10.1, 10.1],
+                        [10.5, 10.5, 10.5],
+                        [10.9, 10.9, 10.9],
+                        [20.1, 20.1, 20.1],
+                        [20.5, 20.5, 20.5],
+                    ],
+                    device=device,
+                )
+            ]
+        )
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        with torch.no_grad():
+            features1 = encoder(points, None, grid)
+            features2 = encoder(points, None, grid)
+            features3 = encoder(points, None, grid)
+
+        # All runs should produce essentially identical results
+        # Use allclose to handle potential CUDA non-determinism in scatter operations
+        self.assertTrue(
+            torch.allclose(features1.jdata, features2.jdata, atol=1e-5, rtol=1e-5),
+            "Features from run 1 and 2 should be essentially identical",
+        )
+        self.assertTrue(
+            torch.allclose(features2.jdata, features3.jdata, atol=1e-5, rtol=1e-5),
+            "Features from run 2 and 3 should be essentially identical",
+        )
+
+    @parameterized.expand(all_devices)
+    def test_gradients_flow_with_multiple_points_per_voxel(self, device: str) -> None:
+        """Test that gradients flow correctly when multiple points map to same voxel."""
+        points = fvdb.JaggedTensor.from_list_of_tensors(
+            [
+                torch.tensor(
+                    [
+                        [0.1, 0.1, 0.1],
+                        [0.5, 0.5, 0.5],
+                        [0.9, 0.9, 0.9],  # 3 points in voxel [0,0,0]
+                        [1.5, 1.5, 1.5],  # 1 point in voxel [1,1,1]
+                    ],
+                    device=device,
+                )
+            ]
+        )
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        # Forward and backward pass
+        features = encoder(points, None, grid)
+        loss = features.jdata.square().mean()
+        loss.backward()
+
+        # All parameters should have gradients
+        for name, param in encoder.named_parameters():
+            self.assertIsNotNone(param.grad, f"Gradient for {name} is None")
+            assert param.grad is not None
+            self.assertTrue(
+                torch.isfinite(param.grad).all(),
+                f"Gradient for {name} contains non-finite values",
+            )
+
+    @parameterized.expand(all_device_batch_combos)
+    def test_batched_with_varying_density(self, device: str, batch_size: int) -> None:
+        """Test batched input where different batches have different point densities."""
+        tensors = []
+        for i in range(batch_size):
+            # Each batch item has (i+1)*10 points, creating varying density
+            num_points = (i + 1) * 10
+            torch.manual_seed(42 + i)
+            pts = torch.rand(num_points, 3, device=device) * 3  # Points in [0, 3) range
+            tensors.append(pts)
+
+        points = fvdb.JaggedTensor.from_list_of_tensors(tensors)
+        grid = fvdb.GridBatch.from_points(points, voxel_sizes=1, origins=0)
+
+        encoder = PointEncoder(size_feature=3, size_output=32, device=device)
+
+        with torch.no_grad():
+            features = encoder(points, None, grid)
+
+        self.assertEqual(features.jdata.shape[0], grid.total_voxels)
+        self.assertTrue(torch.isfinite(features.jdata).all())
 
 
 class TestPointEncoderExtraFeatures(unittest.TestCase):

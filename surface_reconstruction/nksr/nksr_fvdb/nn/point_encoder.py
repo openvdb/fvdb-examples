@@ -5,7 +5,6 @@ import fvdb
 import torch
 import torch.nn as tnn
 from fvdb.types import DeviceIdentifier, resolve_device
-from torch_scatter import scatter_max, scatter_mean
 
 from .resnet_block import ResnetBlockFC
 
@@ -220,7 +219,10 @@ class PointEncoder(tnn.Module):
             # Take the values x, which are the network-transformed features only at the valid
             # feature indices, and scatter them via max (which removes order dependence) into an
             # output vector that's the same size as the original voxel grid.
-            pooled, _ = scatter_max(x, valid_gvoxel_indices, dim=0, dim_size=grid.total_voxels)
+            # Using PyTorch's native scatter_reduce_ with "amax" reduction.
+            pooled = torch.zeros(grid.total_voxels, self.size_hidden, dtype=x.dtype, device=x.device)
+            expanded_indices = valid_gvoxel_indices.unsqueeze(1).expand(-1, self.size_hidden)
+            pooled.scatter_reduce_(0, expanded_indices, x, reduce="amax", include_self=False)
             assert pooled.ndim == 2
             assert pooled.shape[0] == grid.total_voxels
             assert pooled.shape[1] == self.size_hidden
@@ -258,7 +260,11 @@ class PointEncoder(tnn.Module):
         # Finally, we need to scatter the features back into their corresponding voxel indices.
         # Because this is a mean pooling, the ordering doesn't matter.
         # Note: Voxels with no overlapping input points will have zero features.
-        x = scatter_mean(x, valid_gvoxel_indices, dim=0, dim_size=grid.total_voxels)
+        # Using PyTorch's native scatter_reduce_ with "mean" reduction.
+        expanded_indices = valid_gvoxel_indices.unsqueeze(1).expand(-1, self.size_output)
+        result = torch.zeros(grid.total_voxels, self.size_output, dtype=x.dtype, device=x.device)
+        result.scatter_reduce_(0, expanded_indices, x, reduce="mean", include_self=False)
+        x = result
         assert x.ndim == 2
         assert x.shape[0] == grid.total_voxels
         assert x.shape[1] == self.size_output
