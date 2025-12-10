@@ -221,6 +221,9 @@ class PointEncoder(tnn.Module):
             # output vector that's the same size as the original voxel grid.
             # Using PyTorch's native scatter_reduce_ with "amax" reduction.
             pooled = torch.zeros(grid.total_voxels, self.size_hidden, dtype=x.dtype, device=x.device)
+            # scatter_reduce_ requires indices to match the source shape. valid_gvoxel_indices is 1D
+            # (one voxel index per point), but x is 2D (points × features). We unsqueeze to add the
+            # feature dimension, then expand to broadcast the same voxel index across all features.
             expanded_indices = valid_gvoxel_indices.unsqueeze(1).expand(-1, self.size_hidden)
             pooled.scatter_reduce_(0, expanded_indices, x, reduce="amax", include_self=False)
             assert pooled.ndim == 2
@@ -261,6 +264,9 @@ class PointEncoder(tnn.Module):
         # Because this is a mean pooling, the ordering doesn't matter.
         # Note: Voxels with no overlapping input points will have zero features.
         # Using PyTorch's native scatter_reduce_ with "mean" reduction.
+        # scatter_reduce_ requires indices to match the source shape. valid_gvoxel_indices is 1D
+        # (one voxel index per point), but x is 2D (points × features). We unsqueeze to add the
+        # feature dimension, then expand to broadcast the same voxel index across all features.
         expanded_indices = valid_gvoxel_indices.unsqueeze(1).expand(-1, self.size_output)
         result = torch.zeros(grid.total_voxels, self.size_output, dtype=x.dtype, device=x.device)
         result.scatter_reduce_(0, expanded_indices, x, reduce="mean", include_self=False)
