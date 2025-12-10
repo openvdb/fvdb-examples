@@ -22,6 +22,10 @@ class PointEncoder(tnn.Module):
     voxel conversion is done inside this class, it is assumed to be handled externally. The
     voxel space converts to ijks via floor.
 
+    References:
+        Qi et al., "PointNet: Deep Learning on Point Sets for 3D Classification
+        and Segmentation", CVPR 2017.
+
     Args:
         size_feature: Feature dimension of the input points (e.g., 3 for position only,
             6 for position + normal).
