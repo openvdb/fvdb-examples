@@ -63,9 +63,7 @@ def create_grid_from_points(
     coords_jagged = fvdb.JaggedTensor(coords_list)
 
     grid = fvdb.GridBatch.from_ijk(
-        coords_jagged,
-        voxel_sizes=[[voxel_size, voxel_size, voxel_size]] * len(coords_list),
-        origins=[0.0] * 3,
+        coords_jagged
     )
 
     feats_jagged = fvdb.JaggedTensor(feats_list)
@@ -195,7 +193,6 @@ class PointTransformerV3(PointModule):
             grid, jfeats, original_coord_to_voxel_idx = create_grid_from_points(
                 grid_coord, feat, offset, voxel_size=0.02
             )
-            # import pdb; pdb.set_trace()
             # TODO: check the downsampling behavior is the same or not?
             assert (
                 grid_coord.shape == grid.ijk.jdata.shape

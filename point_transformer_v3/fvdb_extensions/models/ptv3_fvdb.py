@@ -161,10 +161,10 @@ class PTV3_Unpooling(torch.nn.Module):
         self.out_channels = out_channels
 
         self.proj = FJTM(torch.nn.Linear(in_channels, out_channels))
-        self.norm = FJTM(norm_layer_module(out_channels))
-        self.act_layer = FJTM(torch.nn.GELU())
         self.proj_skip = FJTM(torch.nn.Linear(skip_channels, out_channels))
+        self.norm = FJTM(norm_layer_module(out_channels))
         self.norm_skip = FJTM(norm_layer_module(out_channels))
+        self.act_layer = FJTM(torch.nn.GELU())
         self.act_layer_skip = FJTM(torch.nn.GELU())
 
     def __call__(
@@ -180,7 +180,7 @@ class PTV3_Unpooling(torch.nn.Module):
             # The conversion is to avoid the bug when enabled AMP,
             # despite both feats.jdata and linear.weights are float32,
             # the output becomes float16 which causes the subsequent convolution operation to fail.
-            feats = self.proj(feats).to(torch.float32)
+            feats = self.proj(feats) #.to(torch.float32)
             feats = self.norm(feats)
             feats = self.act_layer(feats)
 
@@ -387,7 +387,7 @@ class PTV3_Block(FVDBGridModule):
             sliding_window_attention,
             order_index,
             order_types,
-        )
+        ) # temporary disable attention
         self.norm2 = FJTM(torch.nn.LayerNorm(hidden_size))
         self.order_index = order_index
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
@@ -397,16 +397,18 @@ class PTV3_Block(FVDBGridModule):
         assert isinstance(feats, fvdb.JaggedTensor), "Input feats must be a JaggedTensor"
         assert isinstance(grid, fvdb.GridBatch), "Input grid must be a GridBatch"
         with NVTXRange("PTV3_Block"):
-            feats = self.cpe(feats, grid)
             short_cut = feats
-
-            feats = self.norm1(feats)
-            feats = self.attn(feats, grid)
-            # The drop_path is applied to each point independently.
-            feats = self.drop_path(feats)
+            feats = self.cpe(feats, grid)
             feats = fvdb.add(short_cut, feats)
             short_cut = feats
 
+            feats = self.norm1(feats)
+            feats = self.attn(feats, grid) # temporary disable attention
+            feats = self.drop_path(feats) # temporary disable attention
+            # The drop_path is applied to each point independently.
+            feats = fvdb.add(short_cut, feats)
+
+            short_cut = feats
             feats = self.norm2(feats)
             feats = self.mlp(feats)
             feats = self.drop_path(feats)
@@ -634,23 +636,23 @@ class PTV3(FVDBGridModule):
                     )
                 )
 
-    def _shuffle_order(self):
+    def _shuffle_order(self, shuffled_order):
         """
         Randomly shuffle the order tuple to create variation across forward passes.
         Returns a new shuffled tuple of order types.
         """
         if self.shuffle_orders:
-            indices = torch.randperm(len(self.order_type))
-            return tuple(self.order_type[i] for i in indices)
+            indices = torch.randperm(len(shuffled_order))
+            return tuple(shuffled_order[i] for i in indices)
         else:
-            return self.order_type
+            return shuffled_order
 
     def forward(self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch) -> fvdb.JaggedTensor:
         original_grid = grid
         with NVTXRange("PTV3_Forward"):
 
             # Shuffle order at the beginning of forward pass (matching reference implementation)
-            shuffled_order = self._shuffle_order()
+            shuffled_order = self._shuffle_order(self.order_type)
 
             # Store shuffled order in grid metadata so all blocks can access it
             grid._shuffled_order = shuffled_order  # type: ignore
@@ -670,7 +672,7 @@ class PTV3(FVDBGridModule):
                         feats, grid = pooler(feats, grid)
 
                         # Shuffle order after pooling for the next (downsampled) stage
-                        shuffled_order = self._shuffle_order()
+                        shuffled_order = self._shuffle_order(shuffled_order)
                         grid._shuffled_order = shuffled_order  # type: ignore
                         layer_id += 1
                 with NVTXRange(f"PTV3_Encoder_{layer_id}"):
