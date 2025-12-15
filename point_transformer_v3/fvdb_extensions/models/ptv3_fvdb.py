@@ -180,7 +180,7 @@ class PTV3_Unpooling(torch.nn.Module):
             # The conversion is to avoid the bug when enabled AMP,
             # despite both feats.jdata and linear.weights are float32,
             # the output becomes float16 which causes the subsequent convolution operation to fail.
-            feats = self.proj(feats) #.to(torch.float32)
+            feats = self.proj(feats)  # .to(torch.float32)
             feats = self.norm(feats)
             feats = self.act_layer(feats)
 
@@ -387,7 +387,7 @@ class PTV3_Block(FVDBGridModule):
             sliding_window_attention,
             order_index,
             order_types,
-        ) # temporary disable attention
+        )  # temporary disable attention
         self.norm2 = FJTM(torch.nn.LayerNorm(hidden_size))
         self.order_index = order_index
         self.mlp = PTV3_MLP(hidden_size, proj_drop)
@@ -403,8 +403,8 @@ class PTV3_Block(FVDBGridModule):
             short_cut = feats
 
             feats = self.norm1(feats)
-            feats = self.attn(feats, grid) # temporary disable attention
-            feats = self.drop_path(feats) # temporary disable attention
+            feats = self.attn(feats, grid)  # temporary disable attention
+            feats = self.drop_path(feats)  # temporary disable attention
             # The drop_path is applied to each point independently.
             feats = fvdb.add(short_cut, feats)
 

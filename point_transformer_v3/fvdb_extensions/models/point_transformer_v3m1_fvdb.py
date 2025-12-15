@@ -62,9 +62,7 @@ def create_grid_from_points(
 
     coords_jagged = fvdb.JaggedTensor(coords_list)
 
-    grid = fvdb.GridBatch.from_ijk(
-        coords_jagged
-    )
+    grid = fvdb.GridBatch.from_ijk(coords_jagged)
 
     feats_jagged = fvdb.JaggedTensor(feats_list)
     feats_vdb_order = grid.inject_from_ijk(coords_jagged, feats_jagged)  #
