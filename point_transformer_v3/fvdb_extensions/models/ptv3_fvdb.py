@@ -168,13 +168,21 @@ class PTV3_Unpooling(torch.nn.Module):
         self.act_layer_skip = FJTM(torch.nn.GELU())
 
     def __call__(
-        self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch, last_feats: fvdb.JaggedTensor, last_grid: fvdb.GridBatch
+        self,
+        feats: fvdb.JaggedTensor,
+        grid: fvdb.GridBatch,
+        last_feats: fvdb.JaggedTensor,
+        last_grid: fvdb.GridBatch,
     ) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
         """Override __call__ to preserve type hints from forward."""
         return super().__call__(feats, grid, last_feats, last_grid)
 
     def forward(
-        self, feats: fvdb.JaggedTensor, grid: fvdb.GridBatch, last_feats: fvdb.JaggedTensor, last_grid: fvdb.GridBatch
+        self,
+        feats: fvdb.JaggedTensor,
+        grid: fvdb.GridBatch,
+        last_feats: fvdb.JaggedTensor,
+        last_grid: fvdb.GridBatch,
     ) -> tuple[fvdb.JaggedTensor, fvdb.GridBatch]:
         with NVTXRange("PTV3_Unpooling"):
             # The conversion is to avoid the bug when enabled AMP,
@@ -296,7 +304,12 @@ class PTV3_Attention(FVDBGridModule):
 
 
 class PTV3_CPE(FVDBGridModule):
-    def __init__(self, hidden_size: int, no_conv_in_cpe: bool = False, shared_plan_cache: dict | None = None):
+    def __init__(
+        self,
+        hidden_size: int,
+        no_conv_in_cpe: bool = False,
+        shared_plan_cache: dict | None = None,
+    ):
         """
         Args:
             hidden_size (int): Number of channels in the input features.
