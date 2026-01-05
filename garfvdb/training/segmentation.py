@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
+import os
 import pathlib
 import random
 from typing import Any
@@ -23,7 +24,11 @@ from garfvdb.config import GARfVDBModelConfig, GaussianSplatSegmentationTraining
 from garfvdb.loss import calculate_loss
 from garfvdb.model import GARfVDBModel
 from garfvdb.optim import ExponentaLRWithRampUpScheduler
-from garfvdb.training.dataset import GARfVDBInputCollateFn, SegmentationDataset
+from garfvdb.training.dataset import (
+    GARfVDBInputCollateFn,
+    InfiniteSampler,
+    SegmentationDataset,
+)
 from garfvdb.training.dataset_transforms import (
     RandomSamplePixels,
     RandomSelectMaskIDAndScale,
@@ -571,13 +576,24 @@ class GaussianSplatScaleConditionedSegmentation:
             raise ValueError("This runner was not created with an optimizer. Cannot run training.")
         logging.debug(f"Training with batch size {self._cfg.batch_size}")
 
+        # Pre-warm the cache BEFORE creating DataLoader workers
+        # Workers inherit the populated cache via fork, eliminating disk I/O during training
+        self._training_dataset.warmup_cache()
+
+        num_workers = min(16, os.cpu_count() or 4)
+
+        # Use InfiniteSampler to avoid pauses at epoch boundaries
+        # The sampler never stops, so we track epochs by counting batches
+        infinite_sampler = InfiniteSampler(self._training_dataset, shuffle=True, seed=self._cfg.seed)
+
         trainloader = torch.utils.data.DataLoader(
             self._training_dataset,
             batch_size=self._cfg.batch_size,
-            shuffle=True,
-            num_workers=self._cfg.batch_size * 2,
-            persistent_workers=True,
+            sampler=infinite_sampler,  # Use infinite sampler instead of shuffle
+            num_workers=num_workers,
+            persistent_workers=True if num_workers > 0 else False,
             pin_memory=True,
+            prefetch_factor=2 if num_workers > 0 else None,
             collate_fn=GARfVDBInputCollateFn,
         )
 
@@ -586,9 +602,6 @@ class GaussianSplatScaleConditionedSegmentation:
 
         pbar = tqdm.tqdm(range(self.total_steps), desc="Training")
 
-        # Flag to break out of outer epoch loop when max_steps is reached
-        reached_max_steps = False
-
         # Gradient accumulation settings
         gradient_accumulation_steps = self._cfg.accumulate_grad_steps
         accumulated_loss = 0.0
@@ -596,125 +609,117 @@ class GaussianSplatScaleConditionedSegmentation:
         # Zero out gradients before training in case we resume training
         self._optimizer.zero_grad()
 
-        for epoch in range(self._cfg.max_epochs):
-            for step, minibatch in enumerate(trainloader):
-                batch_size = minibatch["image"].shape[0]
-                # Skip steps before the start step
-                if self._global_step < self._start_step:
-                    if pbar is not None:
-                        pbar.set_description(
-                            f"Skipping step {self._global_step:,} (before start step {self._start_step:,})"
-                        )
-                        pbar.update(batch_size)
-                        self._global_step = pbar.n
-                    else:
-                        self._global_step += batch_size
-                    continue
+        # Track epochs by samples processed (global_step), not batches
+        # This correctly aligns with how InfiniteSampler yields exactly dataset_size indices per epoch
+        samples_per_epoch = len(self._training_dataset)
+        prev_epoch = -1
 
-                # Move to device
-                for k, v in minibatch.items():
-                    minibatch[k] = v.to(self.device)
+        for step, minibatch in enumerate(trainloader):
 
-                logging.debug(f"Minibatch keys: {minibatch.keys()}")
+            batch_size = minibatch["image"].shape[0]
 
-                # Debug prints for first iteration
-                if step == 0:
-                    logging.debug(f"Training with sample_pixels_per_image={self._cfg.sample_pixels_per_image}")
-                    logging.debug(f"Image size: {minibatch['image_full'].shape}")
-                    logging.debug(f"Batch size: {minibatch['image'].shape[0]}")
-                    logging.debug(f"scales shape: {minibatch['scales'].shape}")
-                    logging.debug(f"mask_ids shape: {minibatch['mask_ids'].shape}")
-                    logging.debug(f"pixel_coords shape: {minibatch['pixel_coords'].shape}")
-                    logging.debug(f"mean2d shape: {self._model.gs_model.means.shape}")
-                    logging.debug(f"Using gradient accumulation over {gradient_accumulation_steps} steps")
-
-                ### Forward pass ###
-                cam_enc_feats = self._model.get_encoded_features(minibatch)
-                logging.debug(f"Cam enc feats shape: {cam_enc_feats.shape}")
-
-                loss_dict = calculate_loss(self._model, cam_enc_feats, minibatch)
-                loss = loss_dict["total_loss"]
-                logging.debug(f"Loss: {loss.item()}")
-
-                # Scale loss by accumulation steps to maintain same effective learning rate
-                loss = loss / gradient_accumulation_steps
-                accumulated_loss += loss.item()
-
-                # Zero gradients only at the beginning of accumulation cycle
-                if step % gradient_accumulation_steps == 0:
-                    self._optimizer.zero_grad()
-                logging.debug(f"Backward pass")
-                loss.backward()
-
-                # Perform optimizer step and gradient clipping only after accumulating gradients
-                if (step + 1) % gradient_accumulation_steps == 0:
-                    logging.debug(f"Optimizer step")
-                    # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self._optimizer.step()
-                    self._scheduler.step()
-
-                    # Reset accumulated loss
-                    accumulated_loss = 0.0
-
-                # For display purposes, show the scaled loss
-                display_loss = loss.item() * gradient_accumulation_steps
-
-                pbar.set_postfix(loss=f"{display_loss:.4g}")
-                del loss
-                torch.cuda.empty_cache()
-
-                ## Logging and checkpointing
-                # Log train metrics
-                if self._global_step % self._log_interval_steps == 0:
-                    mem_allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
-                    mem_reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
-                    self._writer.log_metric(self._global_step, f"{log_tag}/loss", display_loss)
-                    self._writer.log_metric(self._global_step, f"{log_tag}/mem_allocated", mem_allocated)
-                    self._writer.log_metric(self._global_step, f"{log_tag}/mem_reserved", mem_reserved)
-
-                # Update the progress bar and global step
+            # Skip steps before the start step
+            if self._global_step < self._start_step:
                 if pbar is not None:
+                    pbar.set_description(
+                        f"Skipping step {self._global_step:,} (before start step {self._start_step:,})"
+                    )
                     pbar.update(batch_size)
                     self._global_step = pbar.n
                 else:
                     self._global_step += batch_size
+                continue
 
-                # Check if we've reached max_steps and break out of training
-                if self._cfg.max_steps is not None and self._global_step >= self._cfg.max_steps:
-                    reached_max_steps = True
-                    break
+            # Move to device
+            minibatch = minibatch.to(self.device)
 
-            # Check if we've reached max_steps and break out of outer epoch loop
-            if reached_max_steps:
+            # Debug prints for first iteration
+            if step == 0:
+                logging.debug(f"Training with sample_pixels_per_image={self._cfg.sample_pixels_per_image}")
+                logging.debug(f"Batch size: {minibatch['image'].shape[0]}")
+                logging.debug(f"scales shape: {minibatch['scales'].shape}")
+                logging.debug(f"mask_ids shape: {minibatch['mask_ids'].shape}")
+                if "pixel_coords" in minibatch and minibatch["pixel_coords"] is not None:
+                    logging.debug(f"pixel_coords shape: {minibatch['pixel_coords'].shape}")
+                logging.debug(f"mean2d shape: {self._model.gs_model.means.shape}")
+                logging.debug(f"Using gradient accumulation over {gradient_accumulation_steps} steps")
+
+            ### Forward pass ###
+            cam_enc_feats = self._model.get_encoded_features(minibatch)
+            logging.debug(f"Cam enc feats shape: {cam_enc_feats.shape}")
+
+            loss_dict = calculate_loss(self._model, cam_enc_feats, minibatch)
+            loss = loss_dict["total_loss"]
+            logging.debug(f"Loss: {loss.item()}")
+
+            # Scale loss by accumulation steps to maintain same effective learning rate
+            loss = loss / gradient_accumulation_steps
+            accumulated_loss += loss.item()
+
+            # Zero gradients only at the beginning of accumulation cycle
+            if step % gradient_accumulation_steps == 0:
+                self._optimizer.zero_grad()
+            logging.debug(f"Backward pass")
+            loss.backward()
+
+            # Perform optimizer step and gradient clipping only after accumulating gradients
+            if (step + 1) % gradient_accumulation_steps == 0:
+                logging.debug(f"Optimizer step")
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self._optimizer.step()
+                self._scheduler.step()
+
+                # Reset accumulated loss
+                accumulated_loss = 0.0
+
+            ## Logging and checkpointing
+            # Log train metrics
+            if self._global_step % self._log_interval_steps == 0:
+                display_loss = loss.item() * gradient_accumulation_steps
+                # For display purposes, show the scaled loss
+                pbar.set_postfix(loss=f"{display_loss:.4g}")
+
+                mem_allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
+                mem_reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
+                self._writer.log_metric(self._global_step, f"{log_tag}/loss", display_loss)
+                self._writer.log_metric(self._global_step, f"{log_tag}/mem_allocated", mem_allocated)
+                self._writer.log_metric(self._global_step, f"{log_tag}/mem_reserved", mem_reserved)
+
+            # Update the progress bar and global step
+            if pbar is not None:
+                pbar.update(batch_size)
+                self._global_step = pbar.n
+            else:
+                self._global_step += batch_size
+
+            # Calculate current epoch from samples processed
+            epoch = self._global_step // samples_per_epoch
+
+            # Check for epoch boundary - run save/eval only once per epoch transition
+            if epoch > prev_epoch:
+                prev_epoch = epoch
+
+                # Save the model if we've reached a percentage of the total epochs specified in save_at_percent
+                if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.save_at_percent]:
+                    logging.info(f"Saving checkpoint at epoch {epoch}")
+                    logging.info(f"Global step: {self._global_step}")
+                    if self._global_step > self._start_step:
+                        self._logger.info(f"Saving checkpoint at global step {self._global_step}.")
+                        self._writer.save_checkpoint(self._global_step, f"{log_tag}_ckpt.pt", self.state_dict())
+
+                # Run evaluation if we've reached a percentage of the total epochs specified in eval_at_percent
+                if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.eval_at_percent]:
+                    logging.info(f"Running evaluation at epoch {epoch}")
+                    if len(self._validation_dataset) > 0 and self._global_step > self._start_step:
+                        self.eval(log_tag=log_tag + "_eval")
+
+            # Check if we've reached max_steps or max_epochs
+            if self._cfg.max_steps is not None and self._global_step >= self._cfg.max_steps:
                 logging.debug(f"Reached max steps: {self._cfg.max_steps}")
                 break
-
-            # Save the model if we've reached a percentage of the total epochs specified in save_at_percent
-            if epoch in [(pct * self._cfg.max_epochs // 100) - 1 for pct in self._cfg.save_at_percent]:
-                logging.info(f"Saving checkpoint at epoch {epoch + 1}")
-                logging.info(f"Global step: {self._global_step}")
-                logging.info([(pct * self._cfg.max_epochs // 100) - 1 for pct in self._cfg.save_at_percent])
-                if self._global_step <= self._start_step:
-                    self._logger.info(
-                        f"Skipping checkpoint save at epoch {epoch + 1} (before start step {self._start_step})."
-                    )
-                    continue
-                self._logger.info(f"Saving checkpoint at global step {self._global_step}.")
-
-                # TODO Next: Figure out how to checkpoint 3dgs and the trained model
-                self._writer.save_checkpoint(self._global_step, f"{log_tag}_ckpt.pt", self.state_dict())
-
-            # Run evaluation if we've reached a percentage of the total epochs specified in eval_at_percent
-            if epoch in [(pct * self._cfg.max_epochs // 100) - 1 for pct in self._cfg.eval_at_percent]:
-                logging.info(f"Running evaluation at epoch {epoch + 1}")
-                if len(self._validation_dataset) == 0:
-                    continue
-                if self._global_step <= self._start_step:
-                    self._logger.info(
-                        f"Skipping evaluation at epoch {epoch + 1} (before start step {self._start_step})."
-                    )
-                    continue
-                self.eval(log_tag=log_tag + "_eval")
+            if epoch >= self._cfg.max_epochs:
+                logging.debug(f"Reached max epochs: {self._cfg.max_epochs}")
+                break
 
         self._logger.info("Training completed.")
 

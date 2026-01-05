@@ -58,7 +58,7 @@ def main(
         visualize_every (int): Update the viewer every n epochs. If -1, do not visualize.
         verbose (bool): Whether to log debug messages.
     """
-    log_level = logging.DEBUG if verbose else logging.INFO
+    log_level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
     logger = logging.getLogger(__name__)
 

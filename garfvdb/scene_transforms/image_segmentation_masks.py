@@ -61,6 +61,50 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
 
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
+    @staticmethod
+    def _smallest_int_dtype(values: torch.Tensor) -> torch.dtype:
+        """Return the smallest signed integer dtype that can hold values in [min_val, max_val]."""
+        min_val, max_val = int(values.min().item()), int(values.max().item())
+        if min_val >= -128 and max_val <= 127:
+            return torch.int8
+        elif min_val >= -32768 and max_val <= 32767:
+            return torch.int16
+        elif min_val >= -2147483648 and max_val <= 2147483647:
+            return torch.int32
+        else:
+            return torch.int64
+
+    @staticmethod
+    def rle_encode(tensor: torch.Tensor) -> dict[str, Any]:
+        flat = tensor.flatten()
+        # Find where values change
+        changes = torch.where(flat[1:] != flat[:-1])[0] + 1
+        starts = torch.cat([torch.tensor([0]), changes])
+        lengths = torch.diff(torch.cat([starts, torch.tensor([len(flat)])])).to(torch.int32)
+        values = flat[starts]
+
+        if values.dtype in [torch.int8, torch.int16, torch.int32, torch.int64]:
+            # Use smallest dtype that can represent the values
+            optimal_dtype = ComputeImageSegmentationMasksWithScales._smallest_int_dtype(values)
+            values = values.to(optimal_dtype)
+
+        return {
+            "values": values,
+            "lengths": lengths.to(ComputeImageSegmentationMasksWithScales._smallest_int_dtype(lengths)),
+            "shape": tensor.shape,
+            "dtype": tensor.dtype,
+        }
+
+    @staticmethod
+    def rle_decode(encoded: dict[str, Any]) -> torch.Tensor:
+        lengths = encoded["lengths"]
+        if lengths.dtype in [torch.int8, torch.int16]:
+            lengths = lengths.to(torch.int32)
+        flat = torch.repeat_interleave(encoded["values"], lengths)
+        if flat.dtype in [torch.int8, torch.int16]:
+            flat = flat.to(torch.int32)
+        return flat.reshape(encoded["shape"])  # .to(encoded["dtype"])
+
     def __call__(
         self,
         input_scene: SfmScene,
@@ -161,7 +205,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             max_scale = gs3d_extents.max().item()
 
             self._logger.info(f"Generating segmentation masks with scales and saving to cache.")
-            pbar = tqdm.tqdm(input_scene.images, unit="masks")
+            pbar = tqdm.tqdm(input_scene.images, unit="masks", desc="Generating segmentation masks with scales")
             for _, image_meta in enumerate(pbar):
                 image_filename = pathlib.Path(image_meta.image_path).name
                 image_path = image_meta.image_path
@@ -182,7 +226,9 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                     name=cache_image_filename,
                     data={
                         "scales": scales.detach().cpu(),
-                        "pixel_to_mask_id": pixel_to_mask_id.detach().cpu(),
+                        "pixel_to_mask_id": pixel_to_mask_id.to(self._smallest_int_dtype(pixel_to_mask_id))
+                        .detach()
+                        .cpu(),
                         "mask_cdf": mask_cdf.detach().cpu(),
                     },
                     data_type=self._image_type,

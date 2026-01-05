@@ -1,7 +1,6 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-import random
 from typing import cast
 
 import numpy as np
@@ -37,6 +36,10 @@ class TransformedSegmentationDataset(Dataset):
     @property
     def indices(self) -> np.ndarray:
         return self._base_dataset.indices
+
+    def warmup_cache(self) -> None:
+        """Pre-load all data into cache before DataLoader workers are spawned."""
+        self._base_dataset.warmup_cache()
 
 
 class RandomSelectMaskIDAndScale:
@@ -125,7 +128,7 @@ class RandomSamplePixels:
         Returns:
             SegmentationDataItem: SegmentationDataItem where image, mask_ids, mask_cdf consist of only the sampled pixels whose original image coordinates are in 'pixel_coords'.
         """
-        h, w = int(cast(torch.Tensor, item["image_h"]).item()), int(cast(torch.Tensor, item["image_w"]).item())
+        h, w = item["image_h"], item["image_w"]
 
         if self.scale_bias_strength > 0.0 and "scales" in item:
             # Use importance sampling based on scales (smaller scales = higher probability)
@@ -170,15 +173,21 @@ class RandomSamplePixels:
             total_pixels = h * w
             num_samples = min(self.num_samples_per_image, total_pixels)
 
-            # Sample according to probabilities
-            flat_indices = torch.multinomial(flat_probs, num_samples, replacement=False).tolist()
-            pixels = torch.tensor([(idx // w, idx % w) for idx in flat_indices])  # (x, y) format
+            # Sample according to probabilities - keep as tensor for vectorized ops
+            flat_indices = torch.multinomial(flat_probs, num_samples, replacement=False)
+            # Compute row/col directly
+            pixels = torch.empty((num_samples, 2), dtype=torch.long)
+            pixels[:, 0] = flat_indices // w  # row
+            pixels[:, 1] = flat_indices % w  # col
         else:
-            # Fall back to uniform random sampling
+            # Uniform random sampling (with replacement, but duplicates are negligible)
+            # For 4096 samples from 2M pixels: ~4 expected duplicates (0.1%)
             total_pixels = h * w
             num_samples = min(self.num_samples_per_image, total_pixels)
-            flat_indices = random.sample(range(total_pixels), k=num_samples)
-            pixels = torch.tensor([(idx // w, idx % w) for idx in flat_indices])  # (x, y) format
+            flat_indices = torch.randint(0, total_pixels, (num_samples,))
+            pixels = torch.empty((num_samples, 2), dtype=torch.long)
+            pixels[:, 0] = flat_indices // w  # row
+            pixels[:, 1] = flat_indices % w  # col
 
         item["image_full"] = item["image"]
         item["image"] = item["image"][pixels[:, 0], pixels[:, 1]]
@@ -214,8 +223,8 @@ class Resize:
         )  # back to [H * scale, W * scale, 3]
 
         # Update dimensions
-        item["image_h"] = torch.tensor(int(item["image_h"] * self.scale), dtype=torch.int32)
-        item["image_w"] = torch.tensor(int(item["image_w"] * self.scale), dtype=torch.int32)
+        item["image_h"] = [int(item["image_h"][0] * self.scale)]
+        item["image_w"] = [int(item["image_w"][0] * self.scale)]
 
         # Resize masks similarly
         item["mask_cdf"] = (

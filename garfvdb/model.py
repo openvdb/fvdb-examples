@@ -113,7 +113,7 @@ class GARfVDBModel(torch.nn.Module):
         self.gs_model = gs_model
 
         # Build the quantile transformer
-        self.max_scale = float(torch.max(scale_stats).item())
+        self.max_scale = torch.max(scale_stats)
         self.quantile_transformer = self._get_quantile_func(scale_stats)
 
         ###  Encoded Features ###
@@ -210,7 +210,7 @@ class GARfVDBModel(torch.nn.Module):
         """
         return self.encoder_gridbatch.jagged_like(self.encoder_gridbatch_features_data)
 
-    def get_max_grouping_scale(self) -> float:
+    def get_max_grouping_scale(self) -> torch.Tensor:
         """Get the maximum grouping scale.
 
         Returns:
@@ -310,7 +310,7 @@ class GARfVDBModel(torch.nn.Module):
             Callable: The quantile transformer
         """
         scales = scales.flatten()
-        scales = scales[(scales > 0) & (scales < self.get_max_grouping_scale())]
+        scales = scales[(scales > 0) & (scales < self.get_max_grouping_scale().item())]
 
         scales = scales.detach().cpu().numpy()  # type: ignore
 
@@ -349,8 +349,8 @@ class GARfVDBModel(torch.nn.Module):
         Returns:
             Encoded feature tensor [B, R, S, F] or [B, H, W, S, F]
         """
-        img_w = int(input["image_w"][0].item())
-        img_h = int(input["image_h"][0].item())
+        img_w = input["image_w"][0]
+        img_h = input["image_h"][0]
         if not self.model_config.use_grid:
             intrinsics = input["projection"]
             world_to_cam = input["world_to_camera"]
@@ -559,8 +559,8 @@ class GARfVDBModel(torch.nn.Module):
         Returns:
             Mask output [B, H, W, mlp_output_dim]
         """
-        img_w = int(input["image_w"][0].item())
-        img_h = int(input["image_h"][0].item())
+        img_w = input["image_w"][0]
+        img_h = input["image_h"][0]
 
         intrinsics = input["projection"]
         cam_to_world = input["camera_to_world"]
