@@ -1,6 +1,8 @@
 # <img src="https://www.garfield.studio/data/favicon.png" height="30px"> GARField: Group Anything with Radiance Fields
 
-This code is based on the official implementation for [GARField](https://github.com/chungmin99/garfield).
+This code comes from the official implementation for [GARField](https://github.com/chungmin99/garfield).
+
+This code is here largely as a reference validation.  It has had minor changes to update it for CUDA 12 and later PyTorch versions which we utlize for ƒVDB.  We have also provided updated supporting environment definitions for certain supporting packages we've had to build for CUDA 12.
 
 ## Installation
 
