@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garfvdb"
+version = "0.0.1"
+description = "GARƒVDB: Gaussian Splatting with Scale-Conditioned Segmentation"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.8.0",
+    "torchvision",
+    "numpy",
+    "scikit-learn",
+    "opencv-python",
+    "tqdm",
+    "tyro",
+    "tensorboard",
+    "fvdb-core",
+    "fvdb-reality-capture",
+    "pycocotools",
+    "matplotlib",
+    "pillow",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["garfvdb*"]

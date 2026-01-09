@@ -1,0 +1,12 @@
+data/
+results/
+sam2/checkpoints
+nsys/
+__pycache__
+*.egg-info
+
+**/garfvdb_logs/
+**/frgs_logs/
+**/fvdb_gslogs
+**/logs/
+**/*.ply

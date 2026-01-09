@@ -1,0 +1,30 @@
+name: fvdb_garfvdb
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - blas=*=mkl
+  - python=3.12
+  - pytorch-gpu=2.8.0
+  - cuda-version=12.9
+  - pip
+  - git
+  - gitpython
+  - ipython
+  - tqdm
+  - numpy
+  - tyro
+  - scikit-learn
+  - py-opencv
+  - imageio
+  - sam2
+  - pyproj
+  - transformers
+  - pycocotools
+  - tensorboard
+  - boto3
+  - requests
+  - scikit-image
+  - scipy
+  - torchvision
+  - msgpack-python
