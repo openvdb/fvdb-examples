@@ -2,16 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from typing import (
-    List,
-    Literal,
-    NotRequired,
-    Sequence,
-    Sized,
-    TypedDict,
-    cast,
-    overload,
-)
+from typing import Literal, NotRequired, Sequence, Sized, TypedDict, cast, overload
 
 import fvdb
 import numpy as np
@@ -21,25 +12,43 @@ from fvdb_reality_capture.sfm_scene import SfmScene
 
 
 class SegmentationDataItem(TypedDict):
-    """Type definition for a single item in the SegmentationDataset for linting convenience."""
+    """Type definition for a single item in the SegmentationDataset.
 
-    image: torch.Tensor  # [H, W, 3] or [num_samples, 3]
-    projection: torch.Tensor  # [3, 3]
-    camera_to_world: torch.Tensor  # [4, 4]
-    world_to_camera: torch.Tensor  # [4, 4]
-    scales: torch.Tensor  # [NM] i.e. [0.6053, 0.4358, 0.2108, 0.2107, 0.2090, 0.1880, 0.1320,
-    mask_cdf: torch.Tensor  # [H, W, MM] or [num_samples, MM] i.e. [0.5014, 1., 1., 1.]
-    mask_ids: torch.Tensor  # [H, W, MM] or [num_samples, MM] i.e. [12, 14, -1, -1],
+    Attributes:
+        image: RGB image tensor of shape ``[H, W, 3]`` or ``[num_samples, 3]``.
+        projection: Camera projection matrix of shape ``[3, 3]``.
+        camera_to_world: Camera-to-world transformation of shape ``[4, 4]``.
+        world_to_camera: World-to-camera transformation of shape ``[4, 4]``.
+        scales: Per-mask scale values of shape ``[num_masks]``.
+        mask_cdf: Cumulative distribution for mask selection, shape ``[H, W, max_masks]``.
+        mask_ids: Per-pixel mask IDs of shape ``[H, W, max_masks]``, where -1 indicates
+            no mask.
+        image_h: Image height in pixels.
+        image_w: Image width in pixels.
+        image_full: Optional full-resolution image before pixel sampling.
+        pixel_coords: Optional sampled pixel coordinates of shape ``[num_samples, 2]``.
+    """
+
+    image: torch.Tensor
+    projection: torch.Tensor
+    camera_to_world: torch.Tensor
+    world_to_camera: torch.Tensor
+    scales: torch.Tensor
+    mask_cdf: torch.Tensor
+    mask_ids: torch.Tensor
     image_h: int
     image_w: int
-    image_full: NotRequired[torch.Tensor]  # [H, W, 3]
-    pixel_coords: NotRequired[torch.Tensor]  # [num_samples, 2]
+    image_full: NotRequired[torch.Tensor]
+    pixel_coords: NotRequired[torch.Tensor]
 
 
 class SegmentationDataset(SfmDataset):
-    """Dataset for loading the SegmentationDataset which loads the images, intrinsics, cam_to_worlds,
-    scales, mask_cdfs, mask_ids from disk.  Members of this class can then be modified by further
-    data transforms."""
+    """Dataset for loading segmentation training data from an SfmScene.
+
+    Extends SfmDataset to also load pre-computed segmentation masks and scale
+    information. The loaded data includes images, camera parameters, and mask
+    data that can be further processed by transforms.
+    """
 
     def __init__(
         self,
@@ -178,10 +187,12 @@ class SegmentationDataset(SfmDataset):
 
 
 class InfiniteSampler(torch.utils.data.Sampler):
-    """A sampler that yields indices infinitely, avoiding DataLoader iterator recreation pauses.
+    """Sampler that yields dataset indices infinitely without stopping.
 
-    This sampler never raises StopIteration, so the DataLoader iterator can run indefinitely.
-    Epoch boundaries must be tracked manually by counting batches.
+    Unlike standard samplers, this never raises StopIteration, allowing the
+    DataLoader iterator to run indefinitely. This avoids the performance
+    overhead of recreating the iterator between epochs. Epoch boundaries
+    must be tracked manually by counting samples processed.
     """
 
     def __init__(self, dataset: Sized, shuffle: bool = True, seed: int = 0):
@@ -252,12 +263,15 @@ class GARfVDBInput(dict[str, torch.Tensor | fvdb.JaggedTensor | list[int] | None
         )
 
 
-def GARfVDBInputCollateFn(batch: List[SegmentationDataItem], collate_full_image: bool = False) -> GARfVDBInput:
-    """Collate function for a DataLoader to stack the SegmentationDataItems into a GARfVDBInput.
+def GARfVDBInputCollateFn(batch: list[SegmentationDataItem], collate_full_image: bool = False) -> GARfVDBInput:
+    """Collate SegmentationDataItems into a batched GARfVDBInput.
+
     Args:
-        batch: List of SegmentationDataItems.
+        batch: List of SegmentationDataItems to collate.
+        collate_full_image: If True, also stack the full-resolution images.
+
     Returns:
-        GARfVDBInput: A dictionary of tensors that is expected as input to the GARfVDB model.
+        Batched input dictionary for the GARfVDB model.
     """
 
     kwargs = {

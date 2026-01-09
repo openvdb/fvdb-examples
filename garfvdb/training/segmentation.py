@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 from garfvdb.config import GARfVDBModelConfig, GaussianSplatSegmentationTrainingConfig
 from garfvdb.loss import calculate_loss
 from garfvdb.model import GARfVDBModel
-from garfvdb.optim import ExponentaLRWithRampUpScheduler
+from garfvdb.optim import ExponentialLRWithRampUpScheduler
 from garfvdb.training.dataset import (
     GARfVDBInputCollateFn,
     InfiniteSampler,
@@ -36,18 +36,20 @@ from garfvdb.util import pca_projection_fast
 
 
 class TensorboardLogger:
-    """
-    A utility class to log training metrics to TensorBoard.
-    """
+    """Utility class for logging training metrics to TensorBoard."""
 
-    def __init__(self, log_dir: pathlib.Path, log_every_step: int = 100, log_images_to_tensorboard: bool = False):
-        """
-        Create a new `TensorboardLogger` instance which is used to track training and evaluation progress in tensorboard.
+    def __init__(
+        self,
+        log_dir: pathlib.Path,
+        log_every_step: int = 100,
+        log_images_to_tensorboard: bool = False,
+    ) -> None:
+        """Initialize TensorBoard logger.
 
         Args:
-            log_dir (pathlib.Path): Directory to save TensorBoard logs.
-            log_every_step (int): Log every `log_every_step` steps.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
+            log_dir: Directory to save TensorBoard event files.
+            log_every_step: Logging frequency in training steps.
+            log_images_to_tensorboard: Whether to log rendered images.
         """
         self._log_every_step = log_every_step
         self._log_dir = log_dir
@@ -113,7 +115,19 @@ class TensorboardLogger:
 
 
 class GaussianSplatScaleConditionedSegmentation:
-    """Engine for training and testing"""
+    """Training and evaluation engine for scale-conditioned Gaussian splat segmentation.
+
+    This class manages the complete training pipeline for GARfVDB segmentation models,
+    including dataset loading, optimization, checkpointing, and evaluation. It supports
+    both training from scratch and resuming from checkpoints.
+
+    Attributes:
+        version: Checkpoint format version string.
+        model: The GARfVDB segmentation model.
+        gs_model: The underlying GaussianSplat3d radiance field.
+        sfm_scene: The transformed SfmScene with segmentation masks.
+        config: Training configuration parameters.
+    """
 
     version = "0.1.0"
 
@@ -210,7 +224,7 @@ class GaussianSplatScaleConditionedSegmentation:
         self._model = model
         self._optimizer = optimizer
         self._scheduler = scheduler
-        if type(self._scheduler) == ExponentaLRWithRampUpScheduler:
+        if isinstance(self._scheduler, ExponentialLRWithRampUpScheduler):
             self._scheduler.max_steps = self.total_steps
 
         self._global_step: int = 0
@@ -375,12 +389,9 @@ class GaussianSplatScaleConditionedSegmentation:
             weight_decay=1e-6,
         )
 
-        # Add ExponentaLRWithRampUpScheduler for each parameter group
-        base_lr = optimizer.param_groups[0]["lr"]  # MLP learning rate (1e-4)
-
-        ## Scheduler
         # Create scheduler for all parameters using base_lr as reference
-        scheduler = ExponentaLRWithRampUpScheduler(
+        base_lr = optimizer.param_groups[0]["lr"]
+        scheduler = ExponentialLRWithRampUpScheduler(
             optimizer=optimizer,
             lr_init=base_lr,
             lr_final=1e-6,
@@ -528,9 +539,9 @@ class GaussianSplatScaleConditionedSegmentation:
         )
         optimizer.load_state_dict(state_dict["optimizer"])
 
-        # Initialize scheduler
+        # Create scheduler for all parameters using base_lr as reference
         base_lr = optimizer.param_groups[0]["lr"]
-        scheduler = ExponentaLRWithRampUpScheduler(
+        scheduler = ExponentialLRWithRampUpScheduler(
             optimizer=optimizer,
             lr_init=base_lr,
             lr_final=1e-6,

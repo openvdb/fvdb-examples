@@ -22,7 +22,21 @@ from garfvdb.scene_transforms import ComputeImageSegmentationMasksWithScales
 
 @dataclass
 class GARfVDBModelConfig:
-    """Configuration parameters specific to the GARfVDB model."""
+    """Configuration parameters for the GARfVDB segmentation model.
+
+    Attributes:
+        depth_samples: Number of depth samples per ray for feature computation.
+        use_grid: If True, use 3D feature grids (GARField-style). If False, use
+            per-Gaussian features.
+        use_grid_conv: If True, apply sparse convolutions to grid features.
+        enc_feats_one_idx_per_ray: If True, stochastically sample one feature
+            per ray instead of weighted averaging.
+        num_grids: Number of feature grids at different resolutions.
+        grid_feature_dim: Feature dimension per grid.
+        mlp_hidden_dim: Hidden layer dimension in the MLP.
+        mlp_num_layers: Number of hidden layers in the MLP.
+        mlp_output_dim: Output dimension of the MLP (feature embedding size).
+    """
 
     depth_samples: int = 24
     use_grid: bool = True
@@ -37,11 +51,23 @@ class GARfVDBModelConfig:
 
 @dataclass
 class GaussianSplatSegmentationTrainingConfig:
-    """Configuration parameters for the training process."""
+    """Configuration parameters for the segmentation training process.
 
-    # Random seed
+    Attributes:
+        seed: Random seed for reproducibility.
+        max_steps: Maximum number of training steps. If None, uses max_epochs.
+        max_epochs: Maximum number of training epochs.
+        sample_pixels_per_image: Number of pixels to sample per image for training.
+        batch_size: Number of images per training batch.
+        accumulate_grad_steps: Number of gradient accumulation steps.
+        model: Model architecture configuration.
+        log_test_images: Whether to log test images during training.
+        eval_at_percent: Percentages of total epochs at which to run evaluation
+            (e.g., [10, 50, 100] runs eval at 10%, 50%, and 100% of training).
+        save_at_percent: Percentages of total epochs at which to save checkpoints.
+    """
+
     seed: int = 42
-    # Number of training iterations
     max_steps: int | None = None
     max_epochs: int = 100
     sample_pixels_per_image: int = 256
@@ -49,38 +75,41 @@ class GaussianSplatSegmentationTrainingConfig:
     accumulate_grad_steps: int = 1
     model: GARfVDBModelConfig = field(default_factory=GARfVDBModelConfig)
     log_test_images: bool = False
-
-    # Percentage of total epochs at which we perform evaluation on the validation set. i.e. 10 means perform evaluation after 10% of the epochs.
     eval_at_percent: list[int] = field(default_factory=lambda: [10, 20, 30, 40, 50, 75, 100])
-    # Percentage of total epochs at which we save the model checkpoint. i.e. 10 means save a checkpoint after 10% of the epochs.
     save_at_percent: list[int] = field(default_factory=lambda: [10, 20, 100])
 
 
 @dataclass
 class SfmSceneSegmentationTransformConfig:
-    """
-    Configuration for the transforms to apply to the SfmScene for segmentation training.
+    """Configuration for SfmScene transforms applied before segmentation training.
+
+    Attributes:
+        image_downsample_factor: Factor by which to downsample images.
+        rescale_jpeg_quality: JPEG quality (0-100) when resaving downsampled images.
+        points_percentile_filter: Percentile of outlier points to filter based on
+            distance from median (0.0 = no filtering).
+        crop_bbox: Optional bounding box to crop the scene to, specified as
+            (xmin, xmax, ymin, ymax, zmin, zmax) in normalized coordinates.
+        crop_to_points: If True, crop scene bounds to the point cloud extent.
+        min_points_per_image: Minimum visible 3D points required for an image
+            to be included in training.
+        compute_segmentation_masks: Whether to compute SAM2 segmentation masks.
+        sam2_points_per_side: SAM2 grid density for automatic mask generation.
+        sam2_pred_iou_thresh: SAM2 predicted IoU threshold for mask filtering.
+        sam2_stability_score_thresh: SAM2 stability score threshold for mask filtering.
+        device: Device for SAM2 model inference.
     """
 
-    # Downsample images by this factor
     image_downsample_factor: int = 1
-    # JPEG quality to use when resaving images after downsampling
     rescale_jpeg_quality: int = 95
-    # Percentile of points to filter out based on their distance from the median point
     points_percentile_filter: float = 0.0
-    # Optional bounding box (in the normalized space) to crop the scene to (xmin, xmax, ymin, ymax, zmin, zmax)
     crop_bbox: tuple[float, float, float, float, float, float] | None = None
-    # Whether to crop the scene to the bounding box or not
     crop_to_points: bool = False
-    # Minimum number of 3D points that must be visible in an image for it to be included in training
     min_points_per_image: int = 5
-    # Whether to compute segmentation masks with scales
     compute_segmentation_masks: bool = True
-    # SAM2 model parameters
     sam2_points_per_side: int = 40
     sam2_pred_iou_thresh: float = 0.80
     sam2_stability_score_thresh: float = 0.80
-    # Device to use for the SAM2 model
     device: torch.device | str = "cuda"
 
     def build_scene_transforms(self, gs3d: GaussianSplat3d, normalization_transform: torch.Tensor | None):

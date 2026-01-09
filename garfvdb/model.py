@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
-from typing import Any, Callable, Literal, Union, cast
+from typing import Any, Callable, Literal, cast
 
 import fvdb
 import numpy as np
@@ -16,17 +16,25 @@ from garfvdb.util import rgb_to_sh
 
 
 class SparseConvWithSkips(torch.nn.Module):
-    """
-    PyTorch module that implements an fVDB sparse convolutional network with skip connections.
+    """Sparse convolutional network with skip connections for sparse grids.
+
+    Attributes:
+        kernel_size: Convolution kernel size.
+        relu: ReLU activation function.
     """
 
-    def __init__(self, num_grids: int):
+    def __init__(self, num_grids: int) -> None:
+        """Initialize the sparse convolutional network.
+
+        Args:
+            num_grids: Number of grids to create convolutional layers for.
+        """
         super().__init__()
 
         self.kernel_size = 3
         self.relu = torch.nn.ReLU()
 
-        # Initialize weights and ensure they require gradients
+        # Create 3 convolutional layers per grid with Xavier initialization
         for i in range(num_grids):
             for j in range(3):
                 self.add_module(f"conv_{i}_{j}", fvdb.nn.SparseConv3d(8, 8, self.kernel_size, bias=False))
@@ -50,7 +58,7 @@ class SparseConvWithSkips(torch.nn.Module):
             x = self.get_submodule(f"conv_{i}_1")(x, plan)
             x = self.relu(x, out_grid)
 
-            # # Third conv layer with skip connection
+            # Third conv layer with residual skip connection
             x = self.get_submodule(f"conv_{i}_2")(x, plan)
             x.data.jdata += in_data.jdata
 
@@ -105,7 +113,7 @@ class GARfVDBModel(torch.nn.Module):
         gs_model: GaussianSplat3d,
         scale_stats: torch.Tensor,
         model_config: GARfVDBModelConfig = GARfVDBModelConfig(),
-        device: Union[str, torch.device] = torch.device("cuda"),
+        device: str | torch.device = torch.device("cuda"),
     ):
         """Initialize the GARfVDBModel from gsplat checkpoint and scale statistics from the entire training dataset.
 
@@ -129,19 +137,19 @@ class GARfVDBModel(torch.nn.Module):
         self._max_scale = torch.max(scale_stats)
         self._quantile_transformer = self._get_quantile_func(scale_stats)
 
-        ###  Encoded Features ###
-        # When `use_grid` is True, we will use the GARField method of encoding features at different scales using
-        # a set of 3D feature grids at a range of scene scales.  At training time, these features are sampled from the
-        # grids using the 3D means of the rendered gaussians and weighted by their transmittance.
-        # When `use_grid` is False, we will store the encoded features per-3d-gaussian and render the features directly
+        # --- Encoded Features ---
+        # When use_grid=True: Use GARField-style encoding with 3D feature grids at
+        # multiple scales. Features are sampled using Gaussian means and weighted
+        # by transmittance. When use_grid=False: Store features per-Gaussian and
+        # render directly.
         if self.model_config.use_grid:
-            # GARField Encoder grids consist of two sets of 3D feature grids:
-            # 1. 12 grids of number of voxels along each axis ranging from 16 -> 256
-            # 2. 12 grids of number of voxels along each axis ranging from 256 -> 2048
+            # GARField encoder uses two sets of grids with exponentially-spaced resolutions:
+            # - 12 grids from 16 to 256 voxels per axis (coarse to medium)
+            # - 12 grids from 256 to 2048 voxels per axis (medium to fine)
             # Each grid has 8 feature channels
             resolution_range = [(16, 256), (256, 2048)]
             num_grids = [self.model_config.num_grids // 2, self.model_config.num_grids // 2]
-            # get the spatial extent of the means
+            # Get the spatial extent of the Gaussian means
             means = self.gs_model.means.detach()
             extent = means.max(dim=0).values - means.min(dim=0).values
             max_extent = extent.max().item()
@@ -195,9 +203,10 @@ class GARfVDBModel(torch.nn.Module):
                 ),
             )
 
-        ### MLP ###
-        # GARField MLP ('instance net') uses 4 hidden layers with 256 units each, 256 output channels
-        # input channels is the concatenation of the encoder grids and a spatial scale encoding
+        # --- MLP ---
+        # GARField-style MLP ("instance net") with configurable hidden layers.
+        # NOTE: GARField had used 4 hidden layers with 256 units each, 256 output channels
+        # Input: concatenation of multi-scale encoder features and spatial scale encoding
         if self.model_config.use_grid:
             i_channels = self.model_config.grid_feature_dim * np.sum(num_grids) + 1
         else:
@@ -398,12 +407,10 @@ class GARfVDBModel(torch.nn.Module):
                         far=1e10,
                     )
 
-                # TOOD:  There are Nans coming out of weights, need to fix this
-                # if there's any nans print a warning
+                # TODO: Investigate NaN values in contributing gaussian weights
                 if torch.isnan(weights.jdata).any():
-                    logging.warning("WARNING: Nans in weights")
-                    raise ValueError("Nans in contributing gaussian weights")
-                    # weights = torch.where(torch.isnan(weights), torch.zeros_like(weights), weights)
+                    logging.warning("NaN values detected in contributing gaussian weights")
+                    raise ValueError("NaN values in contributing gaussian weights")
 
             if self.model_config.enc_feats_one_idx_per_ray:
                 # Stochastically pick the depth_sample for each pixel based on the weights as probabilities

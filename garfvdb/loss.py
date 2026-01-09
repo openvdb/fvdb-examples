@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn import functional as F
@@ -14,18 +14,25 @@ if TYPE_CHECKING:
     from garfvdb.model import GARfVDBModel
 
 
-def chunked_norm(features_flat, mask_0, mask_1, chunk_size=10000) -> torch.Tensor:
-    """
-    Calculate all individual L2 norms efficiently by pre-allocating result tensor
-    and filling it chunk by chunks.
+def chunked_norm(
+    features_flat: torch.Tensor,
+    mask_0: torch.Tensor,
+    mask_1: torch.Tensor,
+    chunk_size: int = 10000,
+) -> torch.Tensor:
+    """Calculate L2 norms between feature pairs efficiently using chunked processing.
+
+    Pre-allocates the result tensor and processes pairs in chunks to avoid
+    memory spikes when computing norms for large numbers of feature pairs.
 
     Args:
-        features_flat: Feature tensor [N, feature_dim]
-        mask_0, mask_1: Index tensors for pairs
-        chunk_size: Number of pairs to process at once
+        features_flat: Feature tensor of shape ``[N, feature_dim]``.
+        mask_0: Index tensor for first element of pairs.
+        mask_1: Index tensor for second element of pairs.
+        chunk_size: Number of pairs to process at once.
 
     Returns:
-        torch.Tensor: All individual L2 norms [total_pairs]
+        L2 norms of shape ``[total_pairs]`` for all feature pairs.
     """
     total_pairs = len(mask_0)
     device = features_flat.device
@@ -33,7 +40,7 @@ def chunked_norm(features_flat, mask_0, mask_1, chunk_size=10000) -> torch.Tenso
     # Pre-allocate result tensor
     all_norms = torch.empty(total_pairs, dtype=torch.float32, device=device)
 
-    # Process in chunks to avoid additional memory spikes
+    # Process in chunks to avoid memory spikes
     for i in range(0, total_pairs, chunk_size):
         end_idx = min(i + chunk_size, total_pairs)
 
@@ -58,9 +65,9 @@ def chunked_norm(features_flat, mask_0, mask_1, chunk_size=10000) -> torch.Tenso
 def calculate_loss(
     model: GARfVDBModel,
     enc_feats: torch.Tensor,
-    input: Dict[str, torch.Tensor],
+    input: dict[str, torch.Tensor],
     return_loss_images: bool = False,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """
     Calculate contrastive loss for GARfVDB instance grouping/segmentation.
 
@@ -85,13 +92,13 @@ def calculate_loss(
 
     Returns:
         Dict[str, torch.Tensor]: Dictionary containing:
-            - "total_loss": Normalized total contrastive loss value (scalar)
+            - "total_loss": Normalized total contrastive loss value (scalar).
             - "instance_loss_1_img": (if return_loss_images=True) Visualization of loss 1
-              per pixel/point, normalized to [0,1]
+              per pixel/point, normalized to [0, 1].
             - "instance_loss_2_img": (if return_loss_images=True) Visualization of loss 2
-              per pixel/point, normalized to [0,1]
+              per pixel/point, normalized to [0, 1].
             - "instance_loss_4_img": (if return_loss_images=True) Visualization of loss 4
-              per pixel/point, normalized to [0,1]
+              per pixel/point, normalized to [0, 1].
 
     Loss Components:
         1. **Instance Loss 1**: Pulls together features of points with the same mask ID
@@ -101,83 +108,73 @@ def calculate_loss(
            features of points with the same mask ID but at larger scales to enforce
            multi-scale consistency.
 
-        3. **Instance Loss 4**: Pushes apart features of points with different mask IDs
+        4. **Instance Loss 4**: Pushes apart features of points with different mask IDs
            using a margin-based hinge loss (ReLU(margin - distance)).
 
     Implementation Details:
-        - Uses block masking to prevent cross-image comparisons in batched inputs
-        - Only considers upper triangular pairs to avoid double-counting
-        - Excludes diagonal pairs (same point with itself) from grouping supervision
-        - Filters out invalid pairs where mask_ids == -1
+        - Uses block masking to prevent cross-image comparisons in batched inputs.
+        - Only considers upper triangular pairs to avoid double-counting.
+        - Excludes diagonal pairs (same point with itself) from grouping supervision.
+        - Filters out invalid pairs where mask_ids == -1.
         - Loss visualization images are computed by scattering loss values back to
-          their corresponding spatial locations in the input image
-        - Normalizes final loss by the total number of valid pairs considered
+          their corresponding spatial locations in the input image.
     """
 
     return_loss_dict = {}
 
-    # Using a product of this form to accomodate 'image' inputs of the form [B, num_samples, C] and [B, H, W, C]
+    # Accommodate 'image' inputs of shape [B, num_samples, C] and [B, H, W, C]
     samples_per_img = math.prod(input["image"].shape[1:-1])
 
     num_chunks = enc_feats.shape[0]
 
     input_id1 = input_id2 = input["mask_ids"].flatten()
 
-    # Debug prints
     logging.debug(
         f"calc_loss shapes: enc_feats={enc_feats.shape}, input_id1={input_id1.shape}, mask_ids={input['mask_ids'].shape}"
     )
 
-    # Expand labels
+    # Expand labels for pairwise comparison
     labels1_expanded = input_id1.unsqueeze(1).expand(-1, input_id1.shape[0])
     labels2_expanded = input_id2.unsqueeze(0).expand(input_id2.shape[0], -1)
 
-    # Mask for positive/negative pairs across the entire matrix
+    # Masks for positive/negative pairs across the entire matrix
     mask_full_positive = labels1_expanded == labels2_expanded
     mask_full_negative = ~mask_full_positive
 
-    # # Debug print
     logging.debug(
         f"num_chunks = {num_chunks}, input_id1.shape[0] = {input_id1.shape[0]}, samples_per_img = {samples_per_img}"
     )
 
-    # Create a block mask to only consider pairs within the same image -- no cross-image pairs
-    block_mask = torch.kron(  # [samples_per_img*num_chunks, samples_per_img*num_chunks] dtype: torch.bool
+    # Block-diagonal matrix to consider only pairs within the same image (no cross-image pairs)
+    block_mask = torch.kron(
         torch.eye(num_chunks, device=labels1_expanded.device, dtype=torch.bool),
         torch.ones(
             (samples_per_img, samples_per_img),
             device=labels1_expanded.device,
             dtype=torch.bool,
         ),
-    )  # block-diagonal matrix, to consider only pairs within the same image
+    )
 
     logging.debug(f"block_mask.shape = {block_mask.shape}")
 
     # Only consider upper triangle to avoid double-counting
-    block_mask = torch.triu(
-        block_mask, diagonal=0
-    )  # [samples_per_img*num_chunks, samples_per_img*num_chunks] dtype: torch.bool
-    # Only consider pairs where both points are valid (-1 means not in mask / invalid)
+    block_mask = torch.triu(block_mask, diagonal=0)
+    # Only consider pairs where both points are valid (-1 indicates invalid/no mask)
     block_mask = block_mask * (labels1_expanded != -1) * (labels2_expanded != -1)
 
-    # Mask for diagonal elements (i.e., pairs of the same point).
-    # Don't consider these pairs for grouping supervision (pulling), since they are trivially similar.
+    # Exclude diagonal elements (same-point pairs are trivially similar)
     diag_mask = torch.eye(block_mask.shape[0], device=block_mask.device, dtype=torch.bool)
 
     scales = input["scales"]
 
-    ####################################################################################
-    # Grouping supervision
-    ####################################################################################
-
-    # Get instance features - will return a 3D tensor [batch_size, samples_per_img, feat_dim]
+    # --- Grouping supervision ---
+    # Get instance features: [batch_size, samples_per_img, feat_dim]
     instance_features = model.get_mlp_output(enc_feats, scales)
 
-    # Flatten the instance features to match the masking operations
-    # [batch_size, samples_per_img, feat_dim] -> [batch_size*samples_per_img, feat_dim]
+    # Flatten for masking: [batch_size * samples_per_img, feat_dim]
     instance_features_flat = instance_features.reshape(-1, instance_features.shape[-1])
 
-    # 1. If (A, s_A) and (A', s_A) in same group, then supervise the features to be similar
+    # 1. If (A, s_A) and (A', s_A) are in the same group, supervise the features to be similar.
     mask = torch.where(mask_full_positive * block_mask * (~diag_mask))
 
     logging.debug(f"mask0 shape: {mask[0].shape}")
@@ -199,27 +196,19 @@ def calculate_loss(
     if return_loss_images:
         with torch.no_grad():
             loss_1_img = torch.zeros(input["image"].shape[:-1], device=instance_loss_1.device)
-            # Use scatter_reduce_ to accumulate values
-            loss_1_img.view(-1).scatter_reduce_(
-                0,  # dim to reduce along
-                mask[0],  # indices
-                instance_loss_1,  # values to scatter
-                reduce="sum",  # reduction operation
-                include_self=True,  # include values in the output
-            )
-            # rescale loss_1_img to [0, 1]
+            # Accumulate loss values at pixel locations
+            loss_1_img.view(-1).scatter_reduce_(0, mask[0], instance_loss_1, reduce="sum", include_self=True)
+            # Normalize to [0, 1]
             loss_1_img = loss_1_img / torch.max(loss_1_img)
             return_loss_dict["instance_loss_1_img"] = loss_1_img.detach()
             del loss_1_img
     del instance_loss_1
 
-    # 2. If ", then also supervise them to be similar at s > s_A
-    # if self.config.use_hierarchy_losses and (not self.config.use_single_scale):
-
+    # 2. If (A, s_A) and (A', s_A) are in the same group, also supervise them to be similar at s > s_A.
     scale_diff = torch.max(torch.zeros_like(scales), (model.max_grouping_scale - scales))
     larger_scale = scales + scale_diff * torch.rand(size=(1,), device=scales.device)
 
-    # Get larger scale features and flatten
+    # Get larger scale features and flatten.
     larger_scale_instance_features = model.get_mlp_output(enc_feats, larger_scale)
     larger_scale_instance_features_flat = larger_scale_instance_features.reshape(
         -1, larger_scale_instance_features.shape[-1]
@@ -238,26 +227,15 @@ def calculate_loss(
 
     if return_loss_images:
         with torch.no_grad():
-            # image of instance_loss_2
             loss_2_img = torch.zeros(input["image"].shape[:-1], device=instance_loss_2.device)
-            # Use scatter_reduce_ to accumulate values, using 'sum' as the reduction operation
-            loss_2_img.view(-1).scatter_reduce_(
-                0,  # dim to reduce along
-                mask[0],  # indices
-                instance_loss_2,  # values to scatter
-                reduce="sum",  # reduction operation
-                include_self=True,  # include values in the output
-            )
+            loss_2_img.view(-1).scatter_reduce_(0, mask[0], instance_loss_2, reduce="sum", include_self=True)
             loss_2_img = loss_2_img / loss_2_img.max()
             return_loss_dict["instance_loss_2_img"] = loss_2_img.detach()
             del loss_2_img
     del instance_loss_2
 
-    # 4. Also supervising A, B to be dissimilar at scales s_A, s_B respectively seems to help.
+    # 4. Supervise A, B to be dissimilar at scales s_A, s_B respectively.
     mask = torch.where(mask_full_negative * block_mask)
-
-    # if return_loss_images:
-    #     instance_features_flat = instance_features_flat.to(torch.float16)
 
     margin = 1.0
 
@@ -274,18 +252,10 @@ def calculate_loss(
 
     if return_loss_images:
         with torch.no_grad():
-            #  image of instance_loss_4
             loss_4_img = torch.zeros(
                 input["image"].shape[:-1], device=instance_loss_4.device, dtype=instance_loss_4.dtype
             )
-            # Use scatter_reduce_ to accumulate values, using 'sum' as the reduction operation
-            loss_4_img.view(-1).scatter_reduce_(
-                0,  # dim to reduce along
-                mask[0],  # indices
-                instance_loss_4,  # values to scatter
-                reduce="sum",  # reduction operation
-                include_self=True,  # include values in the output
-            )
+            loss_4_img.view(-1).scatter_reduce_(0, mask[0], instance_loss_4, reduce="sum", include_self=True)
             loss_4_img = loss_4_img / loss_4_img.max()
             return_loss_dict["instance_loss_4_img"] = loss_4_img.detach()
             del loss_4_img

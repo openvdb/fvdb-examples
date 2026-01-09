@@ -5,7 +5,7 @@ import logging
 import pathlib
 import time
 from dataclasses import dataclass
-from typing import Annotated, Optional
+from typing import Annotated
 
 import cv2
 import fvdb.viz as fviz
@@ -33,24 +33,21 @@ def load_segmentation_runner_from_checkpoint(
     gs_model_path: pathlib.Path,
     device: str | torch.device = "cuda",
 ) -> GaussianSplatScaleConditionedSegmentation:
-    """
-    Load a GaussianSplatScaleConditionedSegmentation runner from a checkpoint file.
+    """Load a segmentation runner from a checkpoint file.
 
-    This loads the complete training state including the transformed SfmScene (with correct
-    scale statistics), the GARfVDB segmentation model, and the GaussianSplat3d model.
+    Restores the complete training state including the transformed SfmScene
+    (with correct scale statistics), the GARfVDB segmentation model, and
+    the GaussianSplat3d model.
 
     Args:
         checkpoint_path: Path to the segmentation checkpoint (.pt or .pth).
-        gs_model: GaussianSplat3d model.
-        gs_model_path: Path to the GaussianSplat3d model.
+        gs_model: GaussianSplat3d model for the scene.
+        gs_model_path: Path to the GaussianSplat3d model file.
         device: Device to load the model onto.
 
     Returns:
-        The loaded GaussianSplatScaleConditionedSegmentation runner with access to:
-        - runner.model: The GARfVDB segmentation model
-        - runner.gs_model: The GaussianSplat3d model
-        - runner.sfm_scene: The transformed SfmScene with correct scales
-        - runner.config: The training configuration
+        Loaded runner with access to ``model``, ``gs_model``, ``sfm_scene``,
+        and ``config`` attributes.
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
@@ -68,19 +65,33 @@ def load_segmentation_runner_from_checkpoint(
 
 
 class SegmentationRenderer:
+    """Renderer for visualizing segmentation masks from a GARfVDB model.
+
+    Renders the segmentation model's mask features at a specified scale and
+    projects them to RGB using PCA for visualization.
+
+    Attributes:
+        gs_model: The underlying Gaussian splat model.
+        segmentation_model: The GARfVDB segmentation model.
+        device: Device for computation.
+        scale: Current rendering scale (world-space units).
+        mask_blend: Blend factor for mask overlay (0=transparent, 1=opaque).
+        freeze_pca: If True, use frozen PCA projection for consistent colors.
+        frozen_pca_projection: Cached PCA projection matrix when freeze_pca=True.
+    """
+
     def __init__(
         self,
         gs_model: GaussianSplat3d,
         segmentation_model: GARfVDBModel,
         device: torch.device,
-    ):
-        """
-        Initialize the segmentation renderer.
+    ) -> None:
+        """Initialize the segmentation renderer.
 
         Args:
-            gs_model: The GaussianSplat3d model for rendering beauty images.
-            segmentation_model: The trained GARfVDBModel for segmentation.
-            device: The torch device.
+            gs_model: The Gaussian splat model for the scene.
+            segmentation_model: The trained GARfVDB segmentation model.
+            device: Device for computation (e.g., cuda).
         """
         self.gs_model = gs_model
         self.segmentation_model = segmentation_model
@@ -90,7 +101,7 @@ class SegmentationRenderer:
         self.scale = float(segmentation_model.max_grouping_scale.item()) * 0.1
         self.mask_blend = 0.5
         self.freeze_pca = False
-        self.frozen_pca_projection: Optional[torch.Tensor] = None
+        self.frozen_pca_projection: torch.Tensor | None = None
 
         self._logger = logging.getLogger(__name__)
 
@@ -98,7 +109,7 @@ class SegmentationRenderer:
         self,
         features: torch.Tensor,
         n_components: int = 3,
-        valid_feature_mask: Optional[torch.Tensor] = None,
+        valid_feature_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply PCA projection, either using frozen parameters or computing fresh ones."""
         if self.freeze_pca and self.frozen_pca_projection is not None:
@@ -190,62 +201,56 @@ class SegmentationRenderer:
 
 @dataclass
 class ViewCheckpoint:
-    """
-    Interactive viewer for GARfVDB segmentation models.
+    """Interactive viewer for GARfVDB segmentation models.
 
-    This command starts an interactive 3D viewer that displays the Gaussian splat
-    radiance field with a live segmentation mask overlay that updates as you
-    move the camera.
+    Launches a 3D viewer displaying the Gaussian splat radiance field with a
+    live segmentation mask overlay that updates as the camera moves.
 
-    Example usage:
+    Example:
+        View a trained segmentation model::
 
-        # View a trained segmentation model (loads SfM scene and GS model from checkpoint)
-        python view_checkpoint.py --segmentation-path ./segmentation_checkpoint.pt
-
-        # View with explicit paths (overrides checkpoint paths)
-        python view_checkpoint.py --segmentation-path ./segmentation_checkpoint.pt \\
-            --reconstruction-path ./gsplat_checkpoint.ply
-
+            python view_checkpoint.py \\
+                --segmentation-path ./segmentation_checkpoint.pt \\
+                --reconstruction-path ./gsplat_checkpoint.ply
     """
 
-    # Path to the GarfVDB segmentation checkpoint (.pt or .pth)
-    # This checkpoint contains the transformed SfmScene and reference to the GS model
+    #: Path to the GARfVDB segmentation checkpoint (.pt or .pth).
     segmentation_path: Annotated[pathlib.Path, arg(aliases=["-s"])]
 
-    # Optional: Path to the Gaussian splat reconstruction checkpoint (overrides checkpoint path)
+    #: Path to the Gaussian splat reconstruction checkpoint.
     reconstruction_path: Annotated[pathlib.Path, arg(aliases=["-r"])]
 
-    # The port to expose the viewer server on
+    #: Port to expose the viewer server on.
     viewer_port: Annotated[int, arg(aliases=["-p"])] = 8080
 
-    # The IP address to expose the viewer server on
+    #: IP address to expose the viewer server on.
     viewer_ip_address: Annotated[str, arg(aliases=["-ip"])] = "127.0.0.1"
 
-    # If True, then the viewer will log verbosely
+    #: Enable verbose logging.
     verbose: Annotated[bool, arg(aliases=["-v"])] = False
 
-    # Device to use for computation
+    #: Device for computation (e.g., "cuda" or "cpu").
     device: str | torch.device = "cuda"
 
-    # Initial segmentation scale (fraction of max scale)
+    #: Initial segmentation scale as a fraction of max scale.
     initial_scale: float = 0.1
 
-    # Initial mask blend factor (0 = beauty only, 1 = mask only)
+    #: Initial mask blend factor (0=beauty only, 1=mask only).
     initial_blend: float = 0.5
 
-    # How often to check for camera changes (seconds)
+    #: Camera change polling interval in seconds.
     camera_check_interval: float = 0.5
 
-    # Disable the segmentation overlay (just show Gaussian splats)
+    #: Disable the segmentation overlay (show Gaussian splats only).
     no_overlay: bool = False
 
-    # Width of the segmentation overlay in the viewer
+    #: Width of the segmentation overlay in pixels.
     overlay_width: int = 1920
 
-    # Height of the segmentation overlay in the viewer
+    #: Height of the segmentation overlay in pixels.
     overlay_height: int = 1080
 
-    # Downsample factor for rendering (renders at overlay_size / overlay_downsample, then scales up)
+    #: Downsample factor for rendering (renders at overlay_size/downsample).
     overlay_downsample: int = 2
 
     def execute(self) -> None:

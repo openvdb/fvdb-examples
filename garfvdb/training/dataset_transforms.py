@@ -14,9 +14,13 @@ from garfvdb.training.dataset import SegmentationDataItem, SegmentationDataset
 
 
 class TransformedSegmentationDataset(Dataset):
-    """A dataset that applies Torchvision-style transforms to the base dataset."""
+    """Wrapper dataset that applies transforms to a SegmentationDataset.
 
-    def __init__(self, base_dataset: SegmentationDataset, transform=None):
+    Applies torchvision-style transforms to each item returned by the base
+    dataset, enabling data augmentation and preprocessing pipelines.
+    """
+
+    def __init__(self, base_dataset: SegmentationDataset, transform=None) -> None:
         self._base_dataset = base_dataset
         self._transform = transform
 
@@ -43,15 +47,21 @@ class TransformedSegmentationDataset(Dataset):
 
 
 class RandomSelectMaskIDAndScale:
-    """A dataset transform that picks a per-image random mask ID based on the mask CDF and interpolates scale values.
-    This is used to create a smooth transition between different mask groups."""
+    """Transform that randomly selects a mask ID and interpolates scale values.
+
+    For each pixel, randomly selects one of the overlapping masks based on the
+    mask CDF (which biases towards smaller masks) and interpolates the scale
+    value to create smooth transitions between hierarchical groupings.
+    """
 
     def __call__(self, item: SegmentationDataItem) -> SegmentationDataItem:
-        """Pick a per-image random mask ID based on the mask CDF and interpolate scale values.
+        """Apply random mask selection and scale interpolation.
+
         Args:
-            item: SegmentationDataItem to pick a random mask ID and interpolate scale values from.
+            item: Input data item with multi-mask information per pixel.
+
         Returns:
-            SegmentationDataItem: SegmentationDataItem where mask_ids and scales are updated.
+            Modified item with single mask ID and interpolated scale per pixel.
         """
 
         per_pixel_index = item["mask_ids"]  # [H, W, MM] or [num_samples, MM]
@@ -104,10 +114,12 @@ class RandomSelectMaskIDAndScale:
 
 
 class RandomSamplePixels:
-    """A dataset transform that samples pixels from the image.
-    Can use importance sampling based on scales to bias towards smaller scale pixels.
-    Equivalent pixels will also be filtered out of mask_ids and mask_cdf and the original image
-    will be preserved in 'image_full'.
+    """Transform that randomly samples pixels from an image.
+
+    Samples a subset of pixels for efficient training. Supports optional
+    importance sampling to bias towards smaller-scale regions, which can
+    improve learning of fine-grained segmentation boundaries. The original
+    full image is preserved in the ``image_full`` field.
     """
 
     def __init__(self, num_samples_per_image: int, scale_bias_strength: float = 0.0):
@@ -122,11 +134,15 @@ class RandomSamplePixels:
         self.scale_bias_strength = scale_bias_strength
 
     def __call__(self, item: SegmentationDataItem) -> SegmentationDataItem:
-        """Sample pixels from the image, optionally biased towards smaller scales.
+        """Sample pixels from the image.
+
         Args:
-            item: SegmentationDataItem to sample pixels from.
+            item: Input data item with full-resolution data.
+
         Returns:
-            SegmentationDataItem: SegmentationDataItem where image, mask_ids, mask_cdf consist of only the sampled pixels whose original image coordinates are in 'pixel_coords'.
+            Modified item where ``image``, ``mask_ids``, and ``mask_cdf``
+            contain only the sampled pixels. Original coordinates are stored
+            in ``pixel_coords`` and the full image in ``image_full``.
         """
         h, w = item["image_h"], item["image_w"]
 
@@ -199,17 +215,24 @@ class RandomSamplePixels:
 
 
 class Resize:
-    """A dataset transform that resizes the image and masks."""
+    """Transform that resizes images and masks by a scale factor."""
 
-    def __init__(self, scale: float):
+    def __init__(self, scale: float) -> None:
+        """Initialize the resize transform.
+
+        Args:
+            scale: Scale factor to apply (e.g., 0.5 for half resolution).
+        """
         self.scale = scale
 
     def __call__(self, item: SegmentationDataItem) -> SegmentationDataItem:
-        """Resize the image and masks.
+        """Resize image, masks, and update projection matrix.
+
         Args:
-            item: SegmentationDataItem to resize.
+            item: Input data item to resize.
+
         Returns:
-            SegmentationDataItem: SegmentationDataItem where image, mask_cdf, mask_ids, image_h, image_w are resized by 'scale'.
+            Resized item with updated dimensions and scaled projection matrix.
         """
         # Resize image from [H, W, 3] to [H * scale, W * scale, 3]
         item["image"] = (

@@ -27,21 +27,27 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
 
     def __init__(
         self,
-        gs3d: GaussianSplat3d,
+        gs3d: GaussianSplat3d | None = None,
         checkpoint: Literal["large", "small", "tiny", "base_plus"] = "large",
         points_per_side=40,
         pred_iou_thresh=0.80,
         stability_score_thresh=0.80,
         device: torch.device | str = "cuda",
+        gs3d_hash: str | None = None,
     ):
         """Create a transform that uses SAM2 to compute segmentation masks with scale information for each image.
 
         Args:
+            gs3d (GaussianSplat3d | None): The GaussianSplat3d model to use for computing scales.
+                If None, the transform can only be used with precomputed cached results (requires gs3d_hash).
             checkpoint (Literal["large", "small", "tiny", "base_plus"]): The checkpoint to use for the SAM2 model.
             points_per_side (int): The number of points to use per side for the segmentation mask.
             pred_iou_thresh (float): The IoU threshold for the segmentation mask.
             stability_score_thresh (float): The stability score threshold for the segmentation mask.
             device (torch.device | str): The device to use for the SAM2 model.
+            gs3d_hash (str | None): Precomputed hash of gs3d.means for cache lookup.
+                If provided, this is used instead of computing from gs3d. Useful when restoring
+                from state_dict with precomputed cached results.
         """
         self._checkpoint = checkpoint
         self._gs3d = gs3d
@@ -50,14 +56,18 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
         self._pred_iou_thresh = pred_iou_thresh
         self._stability_score_thresh = stability_score_thresh
         self._device = device
+        self._gs3d_hash = gs3d_hash
 
-        self._sam2 = SAM2Model(
-            checkpoint=checkpoint,
-            points_per_side=points_per_side,
-            pred_iou_thresh=pred_iou_thresh,
-            stability_score_thresh=stability_score_thresh,
-            device=device,
-        )
+        # Only initialize SAM2 model if gs3d is provided (needed for computation)
+        self._sam2: SAM2Model | None = None
+        if gs3d is not None:
+            self._sam2 = SAM2Model(
+                checkpoint=checkpoint,
+                points_per_side=points_per_side,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                device=device,
+            )
 
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
@@ -131,7 +141,17 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
 
         # hash of the transform parameters
         # TODO: In PyTorch 2.9 we can use torch.hash_tensor instead
-        hash_str = hashlib.sha256(self._gs3d.means.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+        if self._gs3d_hash is not None:
+            # Use precomputed hash (e.g., from state_dict restoration)
+            hash_str = self._gs3d_hash
+        elif self._gs3d is not None:
+            hash_str = hashlib.sha256(self._gs3d.means.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+            self._gs3d_hash = hash_str  # Cache for state_dict
+        else:
+            raise RuntimeError(
+                "Cannot compute cache hash: neither gs3d nor gs3d_hash was provided. "
+                "Provide either a GaussianSplat3d model or restore from a state_dict that includes gs3d_hash."
+            )
 
         cache_prefix = f"segmentation_masks_scales_{hash_str}_p{self._points_per_side}_i{int(self._pred_iou_thresh * 100)}_s{int(self._stability_score_thresh * 100)}"
         output_cache = input_cache.make_folder(
@@ -199,6 +219,12 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                 break
 
         if regenerate_cache:
+            if self._gs3d is None or self._sam2 is None:
+                raise RuntimeError(
+                    "Cannot regenerate segmentation masks: gs3d was not provided. "
+                    "Either provide a GaussianSplat3d when creating the transform, "
+                    "or ensure the cache already contains valid precomputed results."
+                )
             min = self._gs3d.means.min(dim=0)[0]
             max = self._gs3d.means.max(dim=0)[0]
             gs3d_extents = torch.abs(max - min)
@@ -309,6 +335,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
         world_pts = gs3d.means[g_ids].squeeze(2)  # [H, W, 3]
 
         # Generate a set of masks for the current image using SAM2
+        assert self._sam2 is not None  # Guaranteed by check in __call__
         with torch.autocast("cuda", dtype=torch.bfloat16):
             sam_masks = self._sam2.predict_masks(img)
             sam_masks = sorted(sam_masks, key=(lambda x: x["area"]), reverse=True)
@@ -414,12 +441,17 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             "pred_iou_thresh": self._pred_iou_thresh,
             "stability_score_thresh": self._stability_score_thresh,
             "device": self._device,
+            "gs3d_hash": self._gs3d_hash,
         }
 
     @staticmethod
     def from_state_dict(state_dict: dict[str, Any]) -> "ComputeImageSegmentationMasksWithScales":
         """
         Create a ComputeImageSegmentationMasksWithScales transform from a state dictionary.
+
+        When restored from state_dict, the transform does not have gs3d or the SAM2 model loaded.
+        It can only be used with scenes that have precomputed cached results. The gs3d_hash
+        stored in the state_dict is used to locate the correct cache folder.
 
         Args:
             state_dict (dict[str, Any]): A dictionary containing information to serialize/deserialize the transform.
@@ -437,11 +469,13 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             )
 
         return ComputeImageSegmentationMasksWithScales(
+            gs3d=None,  # Not needed for cached results
             checkpoint=state_dict["checkpoint"],
             points_per_side=state_dict["points_per_side"],
             pred_iou_thresh=state_dict["pred_iou_thresh"],
             stability_score_thresh=state_dict["stability_score_thresh"],
             device=state_dict["device"],
+            gs3d_hash=state_dict.get("gs3d_hash"),  # Use stored hash for cache lookup
         )
 
 

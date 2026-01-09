@@ -1,61 +1,98 @@
+# GARƒVDB
+
+Scale-conditioned segmentation for Gaussian splatting using ƒVDB.
+
 ## Setup Environment
 
 ```bash
 conda env create -f ./garfvdb_environment.yml
+conda activate fvdb_garfvdb
 ```
 
-### Build and Install ƒVDB wheel
+### Build and Install ƒVDB
 
 ```bash
-# Clone ƒVDB repository
+# Clone and build ƒVDB
 git clone https://github.com/openvdb/fvdb-core.git
 cd fvdb-core
-# Build ƒVDB wheel in build environment
 conda env create -f env/build_environment.yml
 conda activate fvdb_build
 ./build.sh wheel verbose
 
-# Install ƒVDB wheel in garfvdb environment
+# Install in garfvdb environment
 conda activate fvdb_garfvdb
-pip install ./dist/[fvdb wheel]
+pip install ./dist/<fvdb_wheel>.whl
 
-# Clone ƒVDB Reality Capture repository
+# Install ƒVDB Reality Capture
+cd ..
 git clone https://github.com/openvdb/fvdb-reality-capture.git
-cd ../fvdb-reality-capture
-# Install ƒVDB Reality Capture wheel in garfvdb environment
+cd fvdb-reality-capture
 pip install .
-
 ```
 
-## GARƒVDB on ƒVDB Reality Capture dataset
+## Quick Start
 
-### Train Gaussian Splat Scene on Scene
+This example uses the Safety Park dataset from ƒVDB Reality Capture.
 
-1. Download
-    ```bash
-    frgs download safety_park
-    ```
-1. Train 3d gaussian splatting on safety_park scene
-    ```bash
-    frgs reconstruct  --run-name safety_park_1 --tx.image-downsample-factor 1  data/safety_park/
-    ```
+### 1. Download Dataset and Train Gaussian Splats
 
-
-### Train GARƒVDB
-
-1. Run the following command to train GARƒVDB
-    ```bash
-    python train_segmentation.py --sfm-dataset-path data/safety_park/ --reconstruction-path frgs_logs/safety_park_1/checkpoints/00024800/reconstruct_ckpt.pt --use-every-n-as-val 80 --io.use-tensorboard --io.save-images-to-tensorboard --io.save-images  --config.max-epochs 300 --tx.image-downsample-factor 2
-    ```
-1. Launch Tensorboard to monitor the training progress
-    ```bash
-    tensorboard --logdir ./garfvdb_logs
-    ```
-1. Go to http://localhost:6006/ to monitor the training progress
-
-### Visualize Results of GARƒVDB
-1. Start the viewer.  Choose a blend factor between 0 and 1 to control the opacity of the segmentation mask.  Choose a scale between 0 and 1 to control the scale of the segmentation mask (as a fraction of the max scale of the scene).
 ```bash
-python view_checkpoint.py  --reconstruction-path frgs_logs/safety_park_1/checkpoints/00024800/reconstruct_ckpt.pt  --segmentation-path garfvdb_logs/[datetime directory]/checkpoints/00036600/train_ckpt.pt --initial-blend 0.2 --initial-scale 0.1
+# Download the dataset
+frgs download safety_park
+
+# Train 3D Gaussian splatting
+frgs reconstruct \
+    --run-name safety_park_1 \
+    --tx.image-downsample-factor 2 \
+    data/safety_park/
 ```
-1. Go to http://localhost:8080/ to visualize the results
+
+### 2. Train GARƒVDB Segmentation
+
+```bash
+python train_segmentation.py \
+    --sfm-dataset-path data/safety_park/ \
+    --reconstruction-path frgs_logs/safety_park_1/checkpoints/00024800/reconstruct_ckpt.pt \
+    --use-every-n-as-val 80 \
+    --io.use-tensorboard \
+    --io.save-images-to-tensorboard \
+    --io.save-images \
+    --config.max-epochs 300 \
+    --tx.image-downsample-factor 2
+```
+
+Monitor training progress with TensorBoard:
+
+```bash
+tensorboard --logdir ./garfvdb_logs
+# Open http://localhost:6006/
+```
+
+[In Development] Monitor training progress with the 3D viewer:
+
+Add the following argument to the `train_segmentation.py` command to enable mask visualization updates every 10 epochs:
+
+```bash
+--visualize-every 10
+# Open http://localhost:8080/ to view the training progress in the 3D NanoVDB Editor Visualization.
+```
+
+
+
+### 3. [In Development] Visualize Results
+
+Launch the interactive viewer:
+
+```bash
+python view_checkpoint.py \
+    --reconstruction-path frgs_logs/safety_park_1/checkpoints/00024800/reconstruct_ckpt.pt \
+    --segmentation-path garfvdb_logs/<run_name>/checkpoints/00036600/train_ckpt.pt \
+    --initial-blend 0.2 \
+    --initial-scale 0.1
+# Open http://localhost:8080/ to view the results.
+```
+
+
+**Viewer Controls:**
+- `--initial-blend`: Mask opacity (0 = transparent, 1 = opaque)
+- `--initial-scale`: Segmentation scale as fraction of max scene scale (0-1)

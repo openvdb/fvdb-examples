@@ -44,7 +44,7 @@ def main(
     camera_check_interval: float = 0.5,
     overlay_width: int = 1920,
     overlay_height: int = 1080,
-    render_downsample: int = 2,
+    overlay_downsample: int = 2,
     mask_scale: float = 0.1,
     mask_blend: float = 0.5,
     verbose: bool = False,
@@ -74,7 +74,7 @@ def main(
             overlay will update when the viewer camera moves.
         overlay_width (int): Width of the segmentation overlay in the viewer.
         overlay_height (int): Height of the segmentation overlay in the viewer.
-        render_downsample (int): Downsample factor for rendering. Renders at overlay_size / render_downsample
+        overlay_downsample (int): Downsample factor for rendering. Renders at overlay_size / overlay_downsample
             and then scales up for better performance.
         mask_scale (float): Fraction of scene max scale to use for rendering segmentation masks (0.1 = 10%).
         mask_blend (float): Blend factor for the segmentation overlay (0.0 = transparent, 1.0 = opaque).
@@ -131,8 +131,8 @@ def main(
         image_sizes = metadata.get("image_sizes", None)
 
         # Compute render dimensions (smaller for performance)
-        render_w = overlay_width // render_downsample
-        render_h = overlay_height // render_downsample
+        render_w = overlay_width // overlay_downsample
+        render_h = overlay_height // overlay_downsample
 
         # Try to set up the segmentation overlay image at full resolution
         image_view = None
@@ -271,7 +271,7 @@ def main(
                     rgba_uint8 = (rgba.clip(0.0, 1.0) * 255).astype(np.uint8)
 
                     # Scale up to overlay resolution
-                    if render_downsample > 1:
+                    if overlay_downsample > 1:
                         rgba_uint8 = cv2.resize(
                             rgba_uint8, (overlay_width, overlay_height), interpolation=cv2.INTER_LINEAR
                         )

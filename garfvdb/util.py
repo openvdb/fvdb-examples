@@ -1,9 +1,8 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-import logging
 import pathlib
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 from fvdb import GaussianSplat3d
@@ -62,20 +61,31 @@ def load_sfm_scene(path: pathlib.Path, dataset_type: DatasetType) -> SfmScene:
 
 
 def center_features(features: torch.Tensor) -> torch.Tensor:
-    """Center the features."""
+    """Center features by subtracting the mean across samples.
+
+    Args:
+        features: Tensor of shape [N, C] where N is the number of samples and C is the feature dimension.
+
+    Returns:
+        Zero-mean features with the same shape as input.
+    """
     mean = torch.mean(features, dim=0, keepdim=True)
     return features - mean
 
 
 def calculate_pca_projection(features: torch.Tensor, n_components: int = 3, center: bool = True) -> torch.Tensor:
-    """Calculate the PCA projection matrix.
+    """Calculate the PCA projection matrix from feature data.
+
+    Computes the principal components of the input features using low-rank SVD.
 
     Args:
-        features: A 4D tensor of shape [B, H, W, C] containing features to project
-        n_components: The number of principal components to use
+        features: Feature tensor of shape ``[B, H, W, C]`` or ``[N, C]``.
+        n_components: Number of principal components to compute.
+        center: If True, center features before computing PCA.
 
     Returns:
-        A 2D tensor of shape [C, n_components] containing the PCA projection matrix
+        Projection matrix of shape ``[C, n_components]`` containing the
+        principal component vectors.
     """
     features_flat = features.reshape(-1, features.shape[-1])
 
@@ -91,17 +101,27 @@ def calculate_pca_projection(features: torch.Tensor, n_components: int = 3, cent
 
 
 def pca_projection_fast(
-    features: torch.Tensor, n_components: int = 3, V: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None
+    features: torch.Tensor,
+    n_components: int = 3,
+    V: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project features using PCA to a lower dimension.
+    """Project features to a lower dimension using PCA.
+
+    Projects high-dimensional features onto the first few principal components
+    and normalizes the result to [0, 1] range for visualization.
 
     Args:
-        features: A 4D tensor of shape [B, H, W, C] containing features to project
-        n_components: The number of principal components to use
-        mask: A tensor of shape [B, H, W] containing a mask of valid features
+        features: Feature tensor of shape ``[B, H, W, C]``.
+        n_components: Number of principal components to project onto.
+        V: Optional pre-computed projection matrix of shape ``[C, n_components]``.
+            If None, PCA is computed from the input features.
+        mask: Optional boolean mask of shape ``[B, H, W]`` indicating valid
+            features. Invalid features are set to zero in the output.
 
     Returns:
-        A 4D tensor of shape [B, H, W, n_components] containing the projected features
+        Projected features of shape ``[B, H, W, n_components]`` normalized
+        to [0, 1] range.
     """
     B, H, W, C = features.shape
 
@@ -133,13 +153,16 @@ def pca_projection_fast(
 
 
 def unique_values_to_colors(tensor: torch.Tensor) -> torch.Tensor:
-    """Convert a 2D tensor to a 3D RGB tensor with distinct colors.
+    """Map unique integer values to distinct RGB colors.
+
+    Generates evenly-spaced hues in HSV space for each unique value and
+    converts to RGB for visualization of segmentation masks or labels.
 
     Args:
-        tensor: A 2D tensor of shape [H, W]
+        tensor: Integer tensor of shape ``[H, W]`` containing label values.
 
     Returns:
-        A 3D tensor of shape [H, W, 3] where each unique value is mapped to a distinct RGB color
+        RGB color tensor of shape ``[H, W, 3]`` with values in [0, 1].
     """
     # Get unique values and their indices
     unique_values, inverse_indices = torch.unique(tensor, return_inverse=True)

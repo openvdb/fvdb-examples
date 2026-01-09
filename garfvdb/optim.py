@@ -1,17 +1,19 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-from typing import Literal, Optional
+from typing import Literal
 
 import numpy as np
-import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 
-class ExponentaLRWithRampUpScheduler(LRScheduler):
-    """Exponential decay scheduler with linear or cosine warmup ramp. Scheduler first ramps up to `lr_init` in `warmup_steps`
-    steps, then exponentially decays to `lr_final` in `max_steps` steps.
+class ExponentialLRWithRampUpScheduler(LRScheduler):
+    """Exponential decay scheduler with linear or cosine warmup ramp.
+
+    The scheduler first ramps up to ``lr_init`` over ``warmup_steps`` steps,
+    then exponentially decays to ``lr_final`` over the remaining steps until
+    ``max_steps``.
     """
 
     def __init__(
@@ -19,7 +21,7 @@ class ExponentaLRWithRampUpScheduler(LRScheduler):
         optimizer: Optimizer,
         lr_init: float,
         lr_pre_warmup: float = 1e-8,
-        lr_final: Optional[float] = None,
+        lr_final: float | None = None,
         warmup_steps: int = 0,
         max_steps: int = 100000,
         ramp: Literal["linear", "cosine"] = "cosine",
