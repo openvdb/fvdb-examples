@@ -50,6 +50,52 @@ from garfvdb.training.segmentation_writer import (
 )
 from garfvdb.util import load_splats_from_file
 
+# NVOS ground truth mask images that should be excluded from training
+# Maps: scene_dir_name -> gt_mask_image_filename (without extension)
+NVOS_GT_MASK_IMAGES = {
+    "fern_undistort": "IMG_4027",
+    "flower_undistort": "IMG_2962",
+    "fortress_undistort": "IMG_1800",
+    "horns_undistort": "DJI_20200223_163024_597",
+    "leaves_undistort": "IMG_2997",
+    "orchids_undistort": "IMG_4480",
+    "trex_undistort": "DJI_20200223_163619_411",
+}
+
+
+def get_image_id_for_filename(sfm_scene: SfmScene, image_name: str) -> int | None:
+    """
+    Find the image_id for a given image filename in an SfmScene.
+
+    Args:
+        sfm_scene: The SfmScene to search
+        image_name: Name of the image file (without extension)
+
+    Returns:
+        The image_id if found, None otherwise
+    """
+    for img_meta in sfm_scene.images:
+        img_filename = pathlib.Path(img_meta.image_path).stem
+        if img_filename.lower() == image_name.lower():
+            return img_meta.image_id
+    return None
+
+
+def exclude_images_by_id(sfm_scene: SfmScene, image_ids_to_exclude: list[int]) -> SfmScene:
+    """
+    Return a new SfmScene with specified images excluded.
+
+    Args:
+        sfm_scene: The SfmScene to filter
+        image_ids_to_exclude: List of image_ids to exclude
+
+    Returns:
+        A new SfmScene with the specified images removed
+    """
+    exclude_set = set(image_ids_to_exclude)
+    mask = [img.image_id not in exclude_set for img in sfm_scene.images]
+    return sfm_scene.filter_images(mask)
+
 
 def get_lan_ip() -> str:
     """
@@ -373,6 +419,7 @@ def run_segmentation_training(
     log_path: pathlib.Path,
     config: PipelineConfig,
     logger: logging.Logger,
+    exclude_images: list[str] | None = None,
 ) -> bool:
     """
     Run segmentation training on a reconstructed scene.
@@ -384,6 +431,8 @@ def run_segmentation_training(
         log_path: Path for segmentation training logs.
         config: Pipeline configuration.
         logger: Logger instance.
+        exclude_images: Optional list of image filenames (without extension) to exclude
+            from training. For NVOS evaluation, the GT mask images should be excluded.
 
     Returns:
         True if training succeeded, False otherwise.
@@ -402,6 +451,21 @@ def run_segmentation_training(
 
         # Fix camera metadata to match actual image dimensions (important for undistorted images)
         sfm_scene = fix_camera_metadata_from_images(sfm_scene, logger)
+
+        # Exclude specified images from training (e.g., NVOS GT mask images)
+        if exclude_images:
+            image_ids_to_exclude = []
+            for img_name in exclude_images:
+                img_id = get_image_id_for_filename(sfm_scene, img_name)
+                if img_id is not None:
+                    image_ids_to_exclude.append(img_id)
+                    logger.info(f"Excluding image '{img_name}' (id={img_id}) from training")
+                else:
+                    logger.warning(f"Could not find image '{img_name}' to exclude")
+
+            if image_ids_to_exclude:
+                sfm_scene = exclude_images_by_id(sfm_scene, image_ids_to_exclude)
+                logger.info(f"After exclusions: {sfm_scene.num_images} images")
 
         # Configure scene transforms for segmentation
         seg_transforms = [
@@ -573,6 +637,13 @@ def run_pipeline(config: PipelineConfig, scene_filter: list[str] | None = None):
                 continue
 
             logger.info(f"Running segmentation training for {scene_name}...")
+
+            # Get the GT mask image to exclude from training (per NVOS evaluation protocol)
+            exclude_images = []
+            if scene_name in NVOS_GT_MASK_IMAGES:
+                exclude_images.append(NVOS_GT_MASK_IMAGES[scene_name])
+                logger.info(f"Will exclude GT mask image '{NVOS_GT_MASK_IMAGES[scene_name]}' from training")
+
             success = run_segmentation_training(
                 scene_path=scene_dir,
                 reconstruction_path=ply_path,
@@ -580,6 +651,7 @@ def run_pipeline(config: PipelineConfig, scene_filter: list[str] | None = None):
                 log_path=seg_logs_dir,
                 config=config,
                 logger=logger,
+                exclude_images=exclude_images if exclude_images else None,
             )
             results["segmentation"][scene_name] = "success" if success else "failed"
 
