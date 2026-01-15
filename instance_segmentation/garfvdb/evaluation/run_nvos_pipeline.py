@@ -12,6 +12,9 @@ Usage:
     python run_nvos_pipeline.py --dataset-root /media/datasets/segmentation_evaluation/nvos/scenes
     python run_nvos_pipeline.py --dataset-root /media/datasets/segmentation_evaluation/nvos/scenes --output-root ./nvos_results
     python run_nvos_pipeline.py --dataset-root /media/datasets/segmentation_evaluation/nvos/scenes --scenes fern_undistort flower_undistort
+
+    # Using MCMC optimizer with Gaussian limits:
+    python run_nvos_pipeline.py --dataset-root /path/to/scenes --use-mcmc-optimizer --max-gaussians 500000 --insertion-rate 1.1
 """
 import argparse
 import logging
@@ -25,6 +28,7 @@ import numpy as np
 import torch
 from fvdb_reality_capture.radiance_fields import (
     GaussianSplatOptimizerConfig,
+    GaussianSplatOptimizerMCMCConfig,
     GaussianSplatReconstruction,
     GaussianSplatReconstructionConfig,
     GaussianSplatReconstructionWriter,
@@ -61,40 +65,6 @@ NVOS_GT_MASK_IMAGES = {
     "orchids_undistort": "IMG_4480",
     "trex_undistort": "DJI_20200223_163619_411",
 }
-
-
-def get_image_id_for_filename(sfm_scene: SfmScene, image_name: str) -> int | None:
-    """
-    Find the image_id for a given image filename in an SfmScene.
-
-    Args:
-        sfm_scene: The SfmScene to search
-        image_name: Name of the image file (without extension)
-
-    Returns:
-        The image_id if found, None otherwise
-    """
-    for img_meta in sfm_scene.images:
-        img_filename = pathlib.Path(img_meta.image_path).stem
-        if img_filename.lower() == image_name.lower():
-            return img_meta.image_id
-    return None
-
-
-def exclude_images_by_id(sfm_scene: SfmScene, image_ids_to_exclude: list[int]) -> SfmScene:
-    """
-    Return a new SfmScene with specified images excluded.
-
-    Args:
-        sfm_scene: The SfmScene to filter
-        image_ids_to_exclude: List of image_ids to exclude
-
-    Returns:
-        A new SfmScene with the specified images removed
-    """
-    exclude_set = set(image_ids_to_exclude)
-    mask = [img.image_id not in exclude_set for img in sfm_scene.images]
-    return sfm_scene.filter_images(mask)
 
 
 def get_lan_ip() -> str:
@@ -245,6 +215,12 @@ class ReconstructionSettings:
     # Reconstruction config overrides
     max_epochs: int = 30
     refine_every_epoch: float = 0.65
+    refine_stop_epoch: int = 100  # At which epoch to stop refining Gaussians
+
+    # MCMC optimizer settings
+    use_mcmc_optimizer: bool = False
+    max_gaussians: int = -1  # -1 means no limit
+    insertion_rate: float = 1.05
 
     def build_scene_transform(self) -> Compose:
         """Build the scene transform pipeline for reconstruction."""
@@ -359,8 +335,20 @@ def run_reconstruction(
         recon_config = GaussianSplatReconstructionConfig(
             max_epochs=config.reconstruction.max_epochs,
             refine_every_epoch=config.reconstruction.refine_every_epoch,
+            refine_stop_epoch=config.reconstruction.refine_stop_epoch,
         )
-        optimizer_config = GaussianSplatOptimizerConfig()
+
+        # Choose optimizer config based on settings
+        if config.reconstruction.use_mcmc_optimizer:
+            logger.info("Using MCMC optimizer")
+            optimizer_config = GaussianSplatOptimizerMCMCConfig(
+                max_gaussians=config.reconstruction.max_gaussians,
+                insertion_rate=config.reconstruction.insertion_rate,
+            )
+        else:
+            optimizer_config = GaussianSplatOptimizerConfig(
+                max_gaussians=config.reconstruction.max_gaussians,
+            )
 
         # Configure writer
         writer_config = GaussianSplatReconstructionWriterConfig(
@@ -452,20 +440,17 @@ def run_segmentation_training(
         # Fix camera metadata to match actual image dimensions (important for undistorted images)
         sfm_scene = fix_camera_metadata_from_images(sfm_scene, logger)
 
-        # Exclude specified images from training (e.g., NVOS GT mask images)
+        # Get image INDICES to exclude BEFORE transforms (we need positional indices for cache consistency)
+        # The mask cache uses positional indices, so we track indices not IDs
+        exclude_image_indices = []
         if exclude_images:
-            image_ids_to_exclude = []
-            for img_name in exclude_images:
-                img_id = get_image_id_for_filename(sfm_scene, img_name)
-                if img_id is not None:
-                    image_ids_to_exclude.append(img_id)
-                    logger.info(f"Excluding image '{img_name}' (id={img_id}) from training")
-                else:
-                    logger.warning(f"Could not find image '{img_name}' to exclude")
-
-            if image_ids_to_exclude:
-                sfm_scene = exclude_images_by_id(sfm_scene, image_ids_to_exclude)
-                logger.info(f"After exclusions: {sfm_scene.num_images} images")
+            # Create a case-insensitive lookup set
+            exclude_names_lower = {name.lower() for name in exclude_images}
+            for i, img_meta in enumerate(sfm_scene.images):
+                img_filename = pathlib.Path(img_meta.image_path).stem
+                if img_filename.lower() in exclude_names_lower:
+                    exclude_image_indices.append(i)
+                    logger.info(f"Will exclude image '{img_filename}' (index={i}) from training")
 
         # Configure scene transforms for segmentation
         seg_transforms = [
@@ -487,7 +472,7 @@ def run_segmentation_training(
                 gs3d=gs_model,
                 checkpoint="large",
                 points_per_side=40,
-                pred_iou_thresh=0.80,
+                pred_iou_thresh=0.88,
                 stability_score_thresh=0.80,
                 device=config.device,
             ),
@@ -498,12 +483,16 @@ def run_segmentation_training(
         sfm_scene = scene_transform(sfm_scene)
         logger.info(f"After transforms: {sfm_scene.num_images} images")
 
+        # Note: We don't filter the scene here. Instead, we pass exclude_image_indices
+        # to the runner so mask cache indices remain consistent.
+
         # Configure segmentation training
         seg_config = GaussianSplatSegmentationTrainingConfig(
             max_epochs=config.segmentation.max_epochs,
             batch_size=config.segmentation.batch_size,
             sample_pixels_per_image=config.segmentation.sample_pixels_per_image,
             eval_at_percent=config.segmentation.eval_at_percent,
+            save_at_percent=[100],
         )
 
         # Configure writer
@@ -519,6 +508,13 @@ def run_segmentation_training(
             exist_ok=True,
         )
 
+        # Set up visualization if enabled
+        viewer_update_interval = -1
+        if config.update_viz_every > 0:
+            logger.info(f"Starting viewer server on {config.viewer_ip}:{config.viewer_port}")
+            fviz.init(ip_address=config.viewer_ip, port=config.viewer_port, verbose=config.verbose)
+            viewer_update_interval = int(config.update_viz_every)
+
         # Create segmentation runner
         runner = GaussianSplatScaleConditionedSegmentation.new(
             sfm_scene=sfm_scene,
@@ -528,12 +524,17 @@ def run_segmentation_training(
             config=seg_config,
             device=config.device,
             use_every_n_as_val=config.segmentation.use_every_n_as_val,
-            viewer_update_interval_epochs=-1,  # No visualization
+            exclude_indices=exclude_image_indices if exclude_image_indices else None,
+            viewer_update_interval_epochs=viewer_update_interval,
             log_interval_steps=config.segmentation.log_every,
         )
 
         # Run training
         logger.info("Starting segmentation training...")
+        if viewer_update_interval > 0:
+            logger.info(f"Viewer running at http://{config.viewer_ip}:{config.viewer_port}")
+            logger.info(f"Visualization updates every {viewer_update_interval} epoch(s)")
+            fviz.show()
         runner.train()
 
         # Save final checkpoint
@@ -561,7 +562,7 @@ def run_pipeline(config: PipelineConfig, scene_filter: list[str] | None = None):
         scene_filter: Optional list of scene names to process. If None, process all scenes.
     """
     # Set up logging
-    log_level = logging.DEBUG if config.verbose else logging.INFO
+    log_level = logging.DEBUG if config.verbose else logging.WARNING
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -751,10 +752,33 @@ def main():
         help="Number of epochs for reconstruction",
     )
     parser.add_argument(
+        "--refine-stop-epoch",
+        type=int,
+        default=100,
+        help="At which epoch to stop refining Gaussians (inserting/deleting based on optimization)",
+    )
+    parser.add_argument(
         "--recon-image-downsample",
         type=int,
         default=1,
         help="Image downsample factor for reconstruction",
+    )
+    parser.add_argument(
+        "--use-mcmc-optimizer",
+        action="store_true",
+        help="Use the MCMC optimizer instead of the standard optimizer for reconstruction",
+    )
+    parser.add_argument(
+        "--max-gaussians",
+        type=int,
+        default=-1,
+        help="Maximum number of Gaussians for reconstruction (-1 for no limit)",
+    )
+    parser.add_argument(
+        "--insertion-rate",
+        type=float,
+        default=1.05,
+        help="Insertion rate for MCMC optimizer (e.g., 1.05 means 5%% more Gaussians per refinement step)",
     )
 
     # Segmentation settings
@@ -801,7 +825,11 @@ def main():
         update_viz_every=args.update_viz_every,
         reconstruction=ReconstructionSettings(
             max_epochs=args.recon_epochs,
+            refine_stop_epoch=args.refine_stop_epoch,
             image_downsample_factor=args.recon_image_downsample,
+            use_mcmc_optimizer=args.use_mcmc_optimizer,
+            max_gaussians=args.max_gaussians,
+            insertion_rate=args.insertion_rate,
         ),
         segmentation=SegmentationSettings(
             max_epochs=args.seg_epochs,
