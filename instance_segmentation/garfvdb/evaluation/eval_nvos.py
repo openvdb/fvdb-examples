@@ -18,19 +18,37 @@ The NVOS dataset structure:
     │   └── scribbles/<scene_name>/pos_0_<scene>.png, neg_0_<scene>.png
     └── scenes/<scene>_undistort/  (colmap data)
 
-The evaluation uses positive scribbles on the reference image to get a click point,
-then evaluates mask prediction on the test image against ground truth masks.
+Input Modes:
+    The script supports two input modes for specifying query points:
+
+    1. "scribbles" (default): Uses NVOS scribble annotations on the reference image
+       to get a single click point (centroid of positive scribble region).
+
+    2. "points": Uses hardcoded input points from a JSON file (SAGA v2 style).
+       Multiple points can be specified per scene, and the evaluation computes
+       the UNION of all matching regions (max affinity across all points).
+       This is useful for scenes with multiple parts belonging to the same object.
 
 Usage:
+    # Default: use scribbles
     python eval_nvos.py --nvos-root /ai/segmentation_datasets/nvos --results-root ./nvos_results
+
+    # Use SAGA v2 style hardcoded input points (supports multiple points per scene)
+    python eval_nvos.py --nvos-root /path --results-root ./results --input-mode points
+
+    # Use custom input points file
+    python eval_nvos.py --input-mode points --input-points-file /path/to/points.json
+
+    # Evaluate specific scenes
     python eval_nvos.py --nvos-root /ai/segmentation_datasets/nvos --results-root ./nvos_results --scenes fern flower
 """
 import argparse
+import json
 import logging
 import pathlib
 import sys
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Tuple
 
 import cv2
 import matplotlib
@@ -138,6 +156,50 @@ def get_scribble_click_point(scribbles_dir: pathlib.Path, scene_name: str) -> Tu
     y_click = y_pixel * 4
 
     return (x_click, y_click)
+
+
+def get_input_points_from_file(
+    input_points_file: pathlib.Path,
+    scene_name: str,
+    logger: logging.Logger,
+) -> list[Tuple[int, int]]:
+    """
+    Get input points from a JSON file (SAGA v2 style).
+
+    Args:
+        input_points_file: Path to the JSON file containing input points.
+        scene_name: Name of the scene (e.g., 'fern', 'horns_center').
+        logger: Logger instance.
+
+    Returns:
+        List of (x, y) coordinate tuples at original image resolution.
+    """
+    if not input_points_file.exists():
+        raise FileNotFoundError(f"Input points file not found: {input_points_file}")
+
+    with open(input_points_file, "r") as f:
+        all_points = json.load(f)
+
+    # Try exact match first, then try without _undistort suffix
+    if scene_name in all_points:
+        points = all_points[scene_name]
+    elif scene_name.replace("_undistort", "") in all_points:
+        points = all_points[scene_name.replace("_undistort", "")]
+    else:
+        # Try base scene name (e.g., horns_center -> horns)
+        base_scene = scene_name.split("_")[0] if "_" in scene_name else scene_name
+        if base_scene in all_points:
+            points = all_points[base_scene]
+        else:
+            raise ValueError(
+                f"Scene '{scene_name}' not found in input points file. "
+                f"Available scenes: {[k for k in all_points.keys() if not k.startswith('_')]}"
+            )
+
+    # Convert to list of tuples
+    result = [(int(p[0]), int(p[1])) for p in points]
+    logger.info(f"Loaded {len(result)} input points for scene '{scene_name}': {result}")
+    return result
 
 
 def load_segmentation_runner(
@@ -253,6 +315,12 @@ class EvaluationConfig:
     affinity_threshold: float = 0.90  # Threshold for mask selection
     verbose: bool = False
 
+    # Input mode configuration
+    input_mode: Literal["scribbles", "points"] = "scribbles"
+    input_points_file: pathlib.Path = field(
+        default_factory=lambda: pathlib.Path(__file__).parent / "saga_v2_input_points.json"
+    )
+
 
 def run_nvos_evaluation(
     scene_name: str,
@@ -314,12 +382,24 @@ def run_nvos_evaluation(
     max_scale = model.max_grouping_scale
     model.eval()
 
-    # Get click point from positive scribble (this is on the reference image)
+    # Get click points (this is on the reference image)
+    # Can come from scribbles (single point) or input points file (multiple points)
+    click_points: list[Tuple[int, int]] = []
     try:
-        click_x, click_y = get_scribble_click_point(scribbles_dir, mask_dir_name)
-        logger.info(f"Click point from scribble (on reference image): ({click_x}, {click_y})")
+        if config.input_mode == "scribbles":
+            click_x, click_y = get_scribble_click_point(scribbles_dir, mask_dir_name)
+            click_points = [(click_x, click_y)]
+            logger.info(f"Click point from scribble (on reference image): ({click_x}, {click_y})")
+        else:
+            # Load from input points file (SAGA v2 style)
+            click_points = get_input_points_from_file(config.input_points_file, scene_name, logger)
+            logger.info(f"Loaded {len(click_points)} input points from file: {click_points}")
     except Exception as e:
-        logger.error(f"Failed to get click point: {e}")
+        logger.error(f"Failed to get click point(s): {e}")
+        return None
+
+    if not click_points:
+        logger.error("No click points available for evaluation")
         return None
 
     # Load ground truth mask (on test/novel view image)
@@ -396,22 +476,23 @@ def run_nvos_evaluation(
         if ref_img_bgr is not None:
             ref_orig_height, ref_orig_width = ref_img_bgr.shape[:2]
 
-    # Scale click point from original resolution to model input resolution
+    # Scale all click points from original resolution to model input resolution
     scale_x = ref_img_w / ref_orig_width
     scale_y = ref_img_h / ref_orig_height
-    click_x_scaled = int(click_x * scale_x)
-    click_y_scaled = int(click_y * scale_y)
 
-    logger.info(f"Click point scaling: original=({click_x}, {click_y}) at {ref_orig_width}x{ref_orig_height}")
-    logger.info(
-        f"  -> scaled=({click_x_scaled}, {click_y_scaled}) at {ref_img_w}x{ref_img_h} (scale={scale_x:.4f}x{scale_y:.4f})"
-    )
+    click_points_scaled: list[Tuple[int, int]] = []
+    for i, (click_x, click_y) in enumerate(click_points):
+        click_x_scaled = int(click_x * scale_x)
+        click_y_scaled = int(click_y * scale_y)
 
-    # Clamp to valid range
-    click_x_scaled = max(0, min(click_x_scaled, ref_img_w - 1))
-    click_y_scaled = max(0, min(click_y_scaled, ref_img_h - 1))
+        # Clamp to valid range
+        click_x_scaled = max(0, min(click_x_scaled, ref_img_w - 1))
+        click_y_scaled = max(0, min(click_y_scaled, ref_img_h - 1))
+        click_points_scaled.append((click_x_scaled, click_y_scaled))
 
-    logger.info(f"Click point clamped: ({click_x_scaled}, {click_y_scaled})")
+        logger.info(f"Click point {i}: original=({click_x}, {click_y}) -> scaled=({click_x_scaled}, {click_y_scaled})")
+
+    logger.info(f"All click points scaled ({scale_x:.4f}x{scale_y:.4f}): {click_points_scaled}")
 
     # Prepare model inputs for BOTH reference and test views
     ref_c2w = ref_c2w.unsqueeze(0).to(device)
@@ -454,7 +535,7 @@ def run_nvos_evaluation(
     first_iteration = True
     for curr_scale in tqdm.tqdm(scale_range, desc=f"Mining scales for {scene_name}", leave=False):
         with torch.no_grad():
-            # Get features from REFERENCE view (to extract query feature at click point)
+            # Get features from REFERENCE view (to extract query features at click points)
             ref_feats, _ = model.get_mask_output(ref_model_input, scale=float(curr_scale))
             ref_feats = ref_feats[0]  # Remove batch dimension [H, W, F]
 
@@ -472,12 +553,16 @@ def run_nvos_evaluation(
                 logger.info(f"Reference feature variance across pixels: {feat_var:.6f}")
 
             # Features from get_mask_output are already normalized in the model
-            # Get query feature at click point on reference image
-            click_feat = ref_feats[click_y_scaled, click_x_scaled, :]
+            # Get query features at ALL click points on reference image
+            click_feats = []
+            for i, (cx, cy) in enumerate(click_points_scaled):
+                click_feat = ref_feats[cy, cx, :]
+                click_feats.append(click_feat)
+                if first_iteration:
+                    logger.info(f"Click feature {i} at ({cx}, {cy}): norm={click_feat.norm().item():.4f}")
 
-            if first_iteration:
-                logger.info(f"Click feature shape: {click_feat.shape}, norm: {click_feat.norm().item():.4f}")
-                logger.info(f"Click feature first 5 values: {click_feat[:5].tolist()}")
+            if first_iteration and len(click_feats) > 0:
+                logger.info(f"Total click features: {len(click_feats)}")
 
             # Get features from TEST view (novel view where GT mask is)
             test_feats, _ = model.get_mask_output(test_model_input, scale=float(curr_scale))
@@ -500,9 +585,19 @@ def run_nvos_evaluation(
                 logger.info(f"Test feat at ({mid_h},{mid_w}) first 5: {test_feats[mid_h, mid_w, :5].tolist()}")
                 first_iteration = False
 
-        # Calculate affinity (dot product) between click feature and all test view pixels
+        # Calculate affinity (dot product) between each click feature and all test view pixels
         # Features are already normalized in the model, so this is cosine similarity
-        affinity = torch.einsum("hwf,f->hw", test_feats, click_feat)
+        # For multiple click points, take the MAX affinity (union of all matching regions)
+        affinities = []
+        for click_feat in click_feats:
+            aff = torch.einsum("hwf,f->hw", test_feats, click_feat)
+            affinities.append(aff)
+
+        # Union: take max across all click features
+        if len(affinities) == 1:
+            affinity = affinities[0]
+        else:
+            affinity = torch.stack(affinities, dim=0).max(dim=0)[0]
 
         # Threshold to get mask
         mask = (affinity >= config.affinity_threshold).cpu().numpy().astype(np.uint8)
@@ -526,10 +621,20 @@ def run_nvos_evaluation(
     with torch.no_grad():
         ref_feats, _ = model.get_mask_output(ref_model_input, scale=float(best_scale))
         ref_feats = ref_feats[0]
-        click_feat = ref_feats[click_y_scaled, click_x_scaled, :]
         test_feats, _ = model.get_mask_output(test_model_input, scale=float(best_scale))
         test_feats = test_feats[0]
-        best_affinity = torch.einsum("hwf,f->hw", test_feats, click_feat).cpu().numpy()
+
+        # Compute union affinity from all click points
+        affinities = []
+        for (cx, cy) in click_points_scaled:
+            click_feat = ref_feats[cy, cx, :]
+            aff = torch.einsum("hwf,f->hw", test_feats, click_feat)
+            affinities.append(aff)
+
+        if len(affinities) == 1:
+            best_affinity = affinities[0].cpu().numpy()
+        else:
+            best_affinity = torch.stack(affinities, dim=0).max(dim=0)[0].cpu().numpy()
 
     logger.info(
         f"Best affinity stats: min={best_affinity.min():.4f}, max={best_affinity.max():.4f}, mean={best_affinity.mean():.4f}"
@@ -585,19 +690,27 @@ def run_nvos_evaluation(
     fig, axes = plt.subplots(2, 5, figsize=(25, 10))
 
     # Row 1: Reference and Test images
-    # Reference image with click point (original resolution)
+    # Reference image with click points (original resolution)
     axes[0, 0].imshow(ref_img)
-    axes[0, 0].scatter([click_x], [click_y], c="red", s=100, marker="*")
+    # Plot all click points with different colors
+    colors = plt.cm.Set1(np.linspace(0, 1, max(len(click_points), 1)))
+    for i, (cx, cy) in enumerate(click_points):
+        axes[0, 0].scatter([cx], [cy], c=[colors[i]], s=150, marker="*", edgecolors="white", linewidths=1)
+        axes[0, 0].annotate(f"{i}", (cx, cy), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8)
+    num_pts = len(click_points)
+    pts_str = f"{num_pts} pts" if num_pts > 1 else f"({click_points[0][0]}, {click_points[0][1]})"
     axes[0, 0].set_title(
-        f"Reference Image ({ref_image_id})\nClick ({click_x}, {click_y}) @ {ref_orig_width}x{ref_orig_height}"
+        f"Reference Image ({ref_image_id})\n{pts_str} @ {ref_orig_width}x{ref_orig_height}"
     )
     axes[0, 0].axis("off")
 
-    # Rendered reference at model resolution with scaled click point
+    # Rendered reference at model resolution with scaled click points
     axes[0, 1].imshow(ref_render_np)
-    axes[0, 1].scatter([click_x_scaled], [click_y_scaled], c="red", s=100, marker="*")
+    for i, (cx, cy) in enumerate(click_points_scaled):
+        axes[0, 1].scatter([cx], [cy], c=[colors[i]], s=150, marker="*", edgecolors="white", linewidths=1)
+        axes[0, 1].annotate(f"{i}", (cx, cy), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8)
     axes[0, 1].set_title(
-        f"Rendered Ref (model res)\nClick ({click_x_scaled}, {click_y_scaled}) @ {ref_img_w}x{ref_img_h}"
+        f"Rendered Ref (model res)\n{num_pts} pts @ {ref_img_w}x{ref_img_h}"
     )
     axes[0, 1].axis("off")
 
@@ -676,7 +789,9 @@ def run_nvos_evaluation(
         "best_acc": best_acc,
         "best_scale": best_scale,
         "gt_mask_path": str(gt_mask_path),
-        "click_point": (click_x, click_y),
+        "click_points": click_points,
+        "input_mode": config.input_mode,
+        "num_click_points": len(click_points),
     }
 
 
@@ -729,6 +844,20 @@ def main():
         help="Affinity threshold for mask selection (GARField uses 0.90)",
     )
     parser.add_argument(
+        "--input-mode",
+        type=str,
+        choices=["scribbles", "points"],
+        default="scribbles",
+        help="Input mode for click points: 'scribbles' uses NVOS scribble annotations, "
+        "'points' uses hardcoded points from JSON file (SAGA v2 style)",
+    )
+    parser.add_argument(
+        "--input-points-file",
+        type=pathlib.Path,
+        default=pathlib.Path(__file__).parent / "saga_v2_input_points.json",
+        help="JSON file containing input points for each scene (only used with --input-mode points)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -754,7 +883,13 @@ def main():
         num_scale_samples=args.num_scale_samples,
         affinity_threshold=args.affinity_threshold,
         verbose=args.verbose,
+        input_mode=args.input_mode,
+        input_points_file=args.input_points_file,
     )
+
+    logger.info(f"Input mode: {config.input_mode}")
+    if config.input_mode == "points":
+        logger.info(f"Input points file: {config.input_points_file}")
 
     # Determine which scenes to evaluate
     if args.scenes:
@@ -822,6 +957,8 @@ def main():
                     "config": {
                         "num_scale_samples": config.num_scale_samples,
                         "affinity_threshold": config.affinity_threshold,
+                        "input_mode": config.input_mode,
+                        "input_points_file": str(config.input_points_file) if config.input_mode == "points" else None,
                     },
                 },
                 f,
