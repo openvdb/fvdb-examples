@@ -374,7 +374,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
         # Filter out masks whose scale is too large since very scattered 3D points are likely noise
         self._logger.debug("world_pts " + str(world_pts.shape))
         self._logger.debug("scale " + str(world_pts[eroded_masks[1]].std(dim=0) * 2.0))
-        scales = torch.stack([world_pts[mask].std(dim=0).norm() for mask in eroded_masks])  # [M]
+        scales = torch.stack([world_pts[mask].unique(dim=0).std(dim=0).norm() for mask in eroded_masks])  # [M]
         keep = scales < max_scale  # [M]
         eroded_masks = eroded_masks[keep]  # [M', H, W]
         scales = scales[keep]  # [M']
