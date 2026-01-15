@@ -8,11 +8,10 @@ import fvdb
 import numpy as np
 import torch
 from fvdb import GaussianSplat3d
-from sklearn.preprocessing import QuantileTransformer
-
 from garfvdb.config import GARfVDBModelConfig
 from garfvdb.training.dataset import GARfVDBInput
 from garfvdb.util import rgb_to_sh
+from sklearn.preprocessing import QuantileTransformer
 
 
 class SparseConvWithSkips(torch.nn.Module):
@@ -172,8 +171,9 @@ class GARfVDBModel(torch.nn.Module):
             self.encoder_gridbatch = self.encoder_gridbatch.dual_grid()
 
             # Initialize the encoded features
-            enc_features = 1e-4 * torch.rand(
-                [self.encoder_gridbatch.total_voxels, self.model_config.grid_feature_dim], device=device
+            enc_features = (
+                torch.randn([self.encoder_gridbatch.total_voxels, self.model_config.grid_feature_dim], device=device)
+                * 1e-3
             )
             # Store as a parameter to make it a leaf tensor
             self.encoder_gridbatch_features_data = torch.nn.Parameter(enc_features)
@@ -223,9 +223,16 @@ class GARfVDBModel(torch.nn.Module):
             torch.nn.Linear(n_neurons, o_channels, bias=False),
         ).to(device)
 
-        for layer in self.mlp:
-            if isinstance(layer, torch.nn.Linear):
+        # Initialize MLP: Kaiming for ReLU layers, Xavier for final layer, zero biases
+        mlp_layers = [layer for layer in self.mlp if isinstance(layer, torch.nn.Linear)]
+        for i, layer in enumerate(mlp_layers):
+            is_final_layer = i == len(mlp_layers) - 1
+            if is_final_layer:
                 torch.nn.init.xavier_uniform_(layer.weight)
+            else:
+                torch.nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+            if layer.bias is not None:
+                torch.nn.init.zeros_(layer.bias)
 
     ### Properties ###
     @property

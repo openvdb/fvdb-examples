@@ -5,7 +5,7 @@ import logging
 import os
 import pathlib
 import random
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -15,8 +15,6 @@ import tqdm
 from fvdb import GaussianSplat3d
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import filter_splats_above_scale
-from torch.utils.tensorboard import SummaryWriter
-
 from garfvdb.config import GARfVDBModelConfig, GaussianSplatSegmentationTrainingConfig
 from garfvdb.loss import calculate_loss
 from garfvdb.model import GARfVDBModel
@@ -33,6 +31,7 @@ from garfvdb.training.dataset_transforms import (
 )
 from garfvdb.training.segmentation_writer import GaussianSplatSegmentationWriter
 from garfvdb.util import pca_projection_fast
+from torch.utils.tensorboard import SummaryWriter
 
 
 class TensorboardLogger:
@@ -308,6 +307,7 @@ class GaussianSplatScaleConditionedSegmentation:
         config: GaussianSplatSegmentationTrainingConfig = GaussianSplatSegmentationTrainingConfig(),
         device: str | torch.device = "cuda",
         use_every_n_as_val: int = 100,
+        exclude_indices: Sequence[int] | None = None,
         viewer_update_interval_epochs: int = 10,
         log_interval_steps: int = 10,
         viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
@@ -323,6 +323,9 @@ class GaussianSplatScaleConditionedSegmentation:
             config (GaussianSplatSegmentationTrainingConfig): Configuration object containing model parameters.
             device (str | torch.device): The device to run the model on (e.g., "cuda" or "cpu").
             use_every_n_as_val (int): Use every nth image as validation data.
+            exclude_indices (Sequence[int] | None): Indices to exclude from both training and validation.
+                These images will still be used for computing scale statistics but won't be trained on.
+                This is useful for excluding test/evaluation images from training (e.g., NVOS benchmark).
             viewer_update_interval_epochs (int): How often to update the viewer.
             log_interval_steps (int): How often to log metrics to TensorBoard.
             viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
@@ -341,6 +344,13 @@ class GaussianSplatScaleConditionedSegmentation:
         ## SfmScene
         ## Split into train and validation sets
         indices = np.arange(sfm_scene.num_images)
+
+        # Exclude specified indices (e.g., test images for evaluation benchmarks)
+        if exclude_indices is not None and len(exclude_indices) > 0:
+            exclude_set = set(exclude_indices)
+            indices = np.array([i for i in indices if i not in exclude_set], dtype=int)
+            logger.info(f"Excluding {len(exclude_indices)} images from training: {list(exclude_indices)}")
+
         if use_every_n_as_val > 0:
             mask = np.ones(len(indices), dtype=bool)
             mask[::use_every_n_as_val] = False
