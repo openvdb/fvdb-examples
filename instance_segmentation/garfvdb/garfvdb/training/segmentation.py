@@ -155,6 +155,7 @@ class GaussianSplatScaleConditionedSegmentation:
         viewer_update_interval_epochs: int,
         grouping_scale_stats: torch.Tensor | None = None,
         viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
+        cache_dataset: bool = True,
         _private: object | None = None,
     ) -> None:
         """
@@ -181,6 +182,8 @@ class GaussianSplatScaleConditionedSegmentation:
             grouping_scale_stats (torch.Tensor | None): The scale statistics of the GaussianSplat3d model.
             viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
                 The callback receives the runner instance and the current epoch number.
+            cache_dataset (bool): If True, cache images and masks in memory to speed up data loading.
+                Set to False to reduce memory usage for large datasets. Default is True.
             _private (object | None): Private object to ensure this class is only initialized
                 through `new` or `resume_from_checkpoint`.
         """
@@ -203,11 +206,25 @@ class GaussianSplatScaleConditionedSegmentation:
         if grouping_scale_stats is not None:
             self._grouping_scale_stats = grouping_scale_stats
         else:
-            _full_dataset_for_scales = SegmentationDataset(sfm_scene=sfm_scene)
+            _full_dataset_for_scales = SegmentationDataset(
+                sfm_scene=sfm_scene,
+                cache_loaded_masks=cache_dataset,
+                cache_images=cache_dataset,
+            )
             self._grouping_scale_stats = _full_dataset_for_scales.scales
 
-        self._training_dataset = SegmentationDataset(sfm_scene=sfm_scene, dataset_indices=train_indices)
-        self._validation_dataset = SegmentationDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
+        self._training_dataset = SegmentationDataset(
+            sfm_scene=sfm_scene,
+            dataset_indices=train_indices,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
+        self._validation_dataset = SegmentationDataset(
+            sfm_scene=sfm_scene,
+            dataset_indices=val_indices,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
         self._train_transforms = train_transform
         self._val_transforms = val_transform
         self._training_dataset = TransformedSegmentationDataset(
@@ -313,6 +330,7 @@ class GaussianSplatScaleConditionedSegmentation:
         viewer_update_interval_epochs: int = 10,
         log_interval_steps: int = 10,
         viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
+        cache_dataset: bool = True,
     ) -> "GaussianSplatScaleConditionedSegmentation":
         """
         Create a `GaussianSplatScaleConditionedSegmentation` instance for a new training run.
@@ -332,6 +350,8 @@ class GaussianSplatScaleConditionedSegmentation:
             log_interval_steps (int): How often to log metrics to TensorBoard.
             viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
                 The callback receives the runner instance and the current epoch number.
+            cache_dataset (bool): If True, cache images and masks in memory to speed up data loading.
+                Set to False to reduce memory usage for large datasets. Default is True.
 
         Returns:
             GaussianSplatScaleConditionedSegmentation: A `GaussianSplatScaleConditionedSegmentation` instance initialized with the specified configuration and datasets.
@@ -380,7 +400,11 @@ class GaussianSplatScaleConditionedSegmentation:
 
         ## Initialize Model
         # Scale grouping stats
-        full_dataset = SegmentationDataset(sfm_scene)
+        full_dataset = SegmentationDataset(
+            sfm_scene,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
         grouping_scale_stats = full_dataset.scales
 
         gs_model = filter_splats_above_scale(gs_model, 0.1)
@@ -425,6 +449,7 @@ class GaussianSplatScaleConditionedSegmentation:
             viewer_update_interval_epochs=viewer_update_interval_epochs,
             start_step=0,
             viz_callback=viz_callback,
+            cache_dataset=cache_dataset,
             _private=GaussianSplatScaleConditionedSegmentation.__PRIVATE__,
         )
 
