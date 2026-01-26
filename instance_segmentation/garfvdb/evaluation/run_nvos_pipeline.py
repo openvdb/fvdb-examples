@@ -472,7 +472,7 @@ def run_segmentation_training(
                 gs3d=gs_model,
                 checkpoint="large",
                 points_per_side=40,
-                pred_iou_thresh=0.88,
+                pred_iou_thresh=0.80,
                 stability_score_thresh=0.80,
                 device=config.device,
             ),
