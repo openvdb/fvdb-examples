@@ -5,18 +5,17 @@ import logging
 import os
 import pathlib
 import random
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 import torchvision
 import torchvision.transforms.functional as tvF
 import tqdm
 from fvdb import GaussianSplat3d
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import filter_splats_above_scale
-from torch.utils.tensorboard import SummaryWriter
-
 from garfvdb.config import GARfVDBModelConfig, GaussianSplatSegmentationTrainingConfig
 from garfvdb.loss import calculate_loss
 from garfvdb.model import GARfVDBModel
@@ -27,12 +26,14 @@ from garfvdb.training.dataset import (
     SegmentationDataset,
 )
 from garfvdb.training.dataset_transforms import (
+    GPURandomSelectMaskIDAndScale,
     RandomSamplePixels,
     RandomSelectMaskIDAndScale,
     TransformedSegmentationDataset,
 )
 from garfvdb.training.segmentation_writer import GaussianSplatSegmentationWriter
 from garfvdb.util import pca_projection_fast
+from torch.utils.tensorboard import SummaryWriter
 
 
 class TensorboardLogger:
@@ -154,6 +155,7 @@ class GaussianSplatScaleConditionedSegmentation:
         viewer_update_interval_epochs: int,
         grouping_scale_stats: torch.Tensor | None = None,
         viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
+        cache_dataset: bool = True,
         _private: object | None = None,
     ) -> None:
         """
@@ -180,6 +182,8 @@ class GaussianSplatScaleConditionedSegmentation:
             grouping_scale_stats (torch.Tensor | None): The scale statistics of the GaussianSplat3d model.
             viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
                 The callback receives the runner instance and the current epoch number.
+            cache_dataset (bool): If True, cache images and masks in memory to speed up data loading.
+                Set to False to reduce memory usage for large datasets. Default is True.
             _private (object | None): Private object to ensure this class is only initialized
                 through `new` or `resume_from_checkpoint`.
         """
@@ -202,11 +206,25 @@ class GaussianSplatScaleConditionedSegmentation:
         if grouping_scale_stats is not None:
             self._grouping_scale_stats = grouping_scale_stats
         else:
-            _full_dataset_for_scales = SegmentationDataset(sfm_scene=sfm_scene)
+            _full_dataset_for_scales = SegmentationDataset(
+                sfm_scene=sfm_scene,
+                cache_loaded_masks=cache_dataset,
+                cache_images=cache_dataset,
+            )
             self._grouping_scale_stats = _full_dataset_for_scales.scales
 
-        self._training_dataset = SegmentationDataset(sfm_scene=sfm_scene, dataset_indices=train_indices)
-        self._validation_dataset = SegmentationDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
+        self._training_dataset = SegmentationDataset(
+            sfm_scene=sfm_scene,
+            dataset_indices=train_indices,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
+        self._validation_dataset = SegmentationDataset(
+            sfm_scene=sfm_scene,
+            dataset_indices=val_indices,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
         self._train_transforms = train_transform
         self._val_transforms = val_transform
         self._training_dataset = TransformedSegmentationDataset(
@@ -308,9 +326,11 @@ class GaussianSplatScaleConditionedSegmentation:
         config: GaussianSplatSegmentationTrainingConfig = GaussianSplatSegmentationTrainingConfig(),
         device: str | torch.device = "cuda",
         use_every_n_as_val: int = 100,
+        exclude_indices: Sequence[int] | None = None,
         viewer_update_interval_epochs: int = 10,
         log_interval_steps: int = 10,
         viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
+        cache_dataset: bool = True,
     ) -> "GaussianSplatScaleConditionedSegmentation":
         """
         Create a `GaussianSplatScaleConditionedSegmentation` instance for a new training run.
@@ -323,10 +343,15 @@ class GaussianSplatScaleConditionedSegmentation:
             config (GaussianSplatSegmentationTrainingConfig): Configuration object containing model parameters.
             device (str | torch.device): The device to run the model on (e.g., "cuda" or "cpu").
             use_every_n_as_val (int): Use every nth image as validation data.
+            exclude_indices (Sequence[int] | None): Indices to exclude from both training and validation.
+                These images will still be used for computing scale statistics but won't be trained on.
+                This is useful for excluding test/evaluation images from training (e.g., NVOS benchmark).
             viewer_update_interval_epochs (int): How often to update the viewer.
             log_interval_steps (int): How often to log metrics to TensorBoard.
             viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
                 The callback receives the runner instance and the current epoch number.
+            cache_dataset (bool): If True, cache images and masks in memory to speed up data loading.
+                Set to False to reduce memory usage for large datasets. Default is True.
 
         Returns:
             GaussianSplatScaleConditionedSegmentation: A `GaussianSplatScaleConditionedSegmentation` instance initialized with the specified configuration and datasets.
@@ -341,6 +366,13 @@ class GaussianSplatScaleConditionedSegmentation:
         ## SfmScene
         ## Split into train and validation sets
         indices = np.arange(sfm_scene.num_images)
+
+        # Exclude specified indices (e.g., test images for evaluation benchmarks)
+        if exclude_indices is not None and len(exclude_indices) > 0:
+            exclude_set = set(exclude_indices)
+            indices = np.array([i for i in indices if i not in exclude_set], dtype=int)
+            logger.info(f"Excluding {len(exclude_indices)} images from training: {list(exclude_indices)}")
+
         if use_every_n_as_val > 0:
             mask = np.ones(len(indices), dtype=bool)
             mask[::use_every_n_as_val] = False
@@ -352,16 +384,15 @@ class GaussianSplatScaleConditionedSegmentation:
 
         ## SegmentationDataset transforms
         # For training, randomly sample pixels from each image
+        # Note: RandomSelectMaskIDAndScale is applied on GPU after data transfer for better performance
         train_transforms = torchvision.transforms.Compose(
             [
                 RandomSamplePixels(config.sample_pixels_per_image, scale_bias_strength=0.0),
-                RandomSelectMaskIDAndScale(),
             ]
         )
         val_transforms = torchvision.transforms.Compose(
             [
                 RandomSamplePixels(config.sample_pixels_per_image),
-                RandomSelectMaskIDAndScale(),
             ]
         )
         # For testing, use the full image, scaled down for memory reasons
@@ -369,7 +400,11 @@ class GaussianSplatScaleConditionedSegmentation:
 
         ## Initialize Model
         # Scale grouping stats
-        full_dataset = SegmentationDataset(sfm_scene)
+        full_dataset = SegmentationDataset(
+            sfm_scene,
+            cache_loaded_masks=cache_dataset,
+            cache_images=cache_dataset,
+        )
         grouping_scale_stats = full_dataset.scales
 
         gs_model = filter_splats_above_scale(gs_model, 0.1)
@@ -414,6 +449,7 @@ class GaussianSplatScaleConditionedSegmentation:
             viewer_update_interval_epochs=viewer_update_interval_epochs,
             start_step=0,
             viz_callback=viz_callback,
+            cache_dataset=cache_dataset,
             _private=GaussianSplatScaleConditionedSegmentation.__PRIVATE__,
         )
 
@@ -580,13 +616,34 @@ class GaussianSplatScaleConditionedSegmentation:
 
         # Pre-warm the cache BEFORE creating DataLoader workers
         # Workers inherit the populated cache via fork, eliminating disk I/O during training
-        self._training_dataset.warmup_cache()
+        with nvtx.range("dataset_warmup_cache"):
+            self._training_dataset.warmup_cache()
 
-        num_workers = min(16, os.cpu_count() or 4)
+        # Scale num_workers based on dataset size to avoid IPC overhead dominating
+        # Even for small datasets, use a few workers to overlap CPU transforms with GPU training
+        dataset_size = len(self._training_dataset)
+        if dataset_size <= self._cfg.batch_size * 2:
+            num_workers = 2
+            self._logger.info(f"Small dataset ({dataset_size} images): using num_workers=2")
+        elif dataset_size <= 64:
+            # Small dataset: limit workers to avoid contention
+            num_workers = min(4, os.cpu_count() or 4)
+        else:
+            num_workers = min(8, os.cpu_count() or 4)
 
         # Use InfiniteSampler to avoid pauses at epoch boundaries
         # The sampler never stops, so we track epochs by counting batches
         infinite_sampler = InfiniteSampler(self._training_dataset, shuffle=True, seed=self._cfg.seed)
+
+        # Use collate function with mask_cdf included for GPU-based mask selection
+        from functools import partial
+
+        collate_fn = partial(GARfVDBInputCollateFn, include_mask_cdf=True)
+
+        # For small datasets, use smaller prefetch to avoid wraparound thrashing
+        prefetch = 2 if num_workers > 0 else None
+        if num_workers > 0 and dataset_size < self._cfg.batch_size * 4:
+            prefetch = 1  # Reduce prefetch for tiny datasets
 
         trainloader = torch.utils.data.DataLoader(
             self._training_dataset,
@@ -595,9 +652,12 @@ class GaussianSplatScaleConditionedSegmentation:
             num_workers=num_workers,
             persistent_workers=True if num_workers > 0 else False,
             pin_memory=True,
-            prefetch_factor=2 if num_workers > 0 else None,
-            collate_fn=GARfVDBInputCollateFn,
+            prefetch_factor=prefetch,
+            collate_fn=collate_fn,
         )
+
+        # GPU transform for mask selection (moved from CPU for better performance)
+        gpu_mask_transform = GPURandomSelectMaskIDAndScale()
 
         self._model.train()
         self._optimizer.zero_grad()
@@ -606,7 +666,8 @@ class GaussianSplatScaleConditionedSegmentation:
 
         # Gradient accumulation settings
         gradient_accumulation_steps = self._cfg.accumulate_grad_steps
-        accumulated_loss = 0.0
+        # Track accumulated loss as a tensor to avoid .item() sync on every step
+        accumulated_loss: torch.Tensor | float = 0.0
 
         # Zero out gradients before training in case we resume training
         self._optimizer.zero_grad()
@@ -616,7 +677,14 @@ class GaussianSplatScaleConditionedSegmentation:
         samples_per_epoch = len(self._training_dataset)
         prev_epoch = -1
 
-        for step, minibatch in enumerate(trainloader):
+        trainloader_iter = iter(trainloader)
+        step = 0
+        while True:
+            with nvtx.range("dataloader_fetch_batch"):
+                try:
+                    minibatch = next(trainloader_iter)
+                except StopIteration:
+                    break
 
             batch_size = minibatch["image"].shape[0]
 
@@ -633,7 +701,12 @@ class GaussianSplatScaleConditionedSegmentation:
                 continue
 
             # Move to device
-            minibatch = minibatch.to(self.device)
+            with nvtx.range("data_to_device"):
+                minibatch = minibatch.to(self.device)
+
+            # Apply GPU-accelerated mask transform
+            with nvtx.range("gpu_mask_transform"):
+                minibatch = gpu_mask_transform(minibatch)
 
             # Debug prints for first iteration
             if step == 0:
@@ -647,29 +720,34 @@ class GaussianSplatScaleConditionedSegmentation:
                 logging.debug(f"Using gradient accumulation over {gradient_accumulation_steps} steps")
 
             ### Forward pass ###
-            cam_enc_feats = self._model.get_encoded_features(minibatch)
-            logging.debug(f"Cam enc feats shape: {cam_enc_feats.shape}")
+            with nvtx.range("forward_pass"):
+                cam_enc_feats = self._model.get_encoded_features(minibatch)
+                logging.debug(f"Cam enc feats shape: {cam_enc_feats.shape}")
 
-            loss_dict = calculate_loss(self._model, cam_enc_feats, minibatch)
-            loss = loss_dict["total_loss"]
-            logging.debug(f"Loss: {loss.item()}")
+            with nvtx.range("loss_calculation"):
+                loss_dict = calculate_loss(self._model, cam_enc_feats, minibatch)
+                loss = loss_dict["total_loss"]
+                logging.debug(f"Loss: {loss.item()}")
 
             # Scale loss by accumulation steps to maintain same effective learning rate
             loss = loss / gradient_accumulation_steps
-            accumulated_loss += loss.item()
+            # Accumulate as tensor to avoid .item() sync on every step
+            accumulated_loss = accumulated_loss + loss.detach()
 
             # Zero gradients only at the beginning of accumulation cycle
             if step % gradient_accumulation_steps == 0:
                 self._optimizer.zero_grad()
             logging.debug(f"Backward pass")
-            loss.backward()
+            with nvtx.range("backward_pass"):
+                loss.backward()
 
             # Perform optimizer step and gradient clipping only after accumulating gradients
             if (step + 1) % gradient_accumulation_steps == 0:
                 logging.debug(f"Optimizer step")
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self._optimizer.step()
-                self._scheduler.step()
+                with nvtx.range("optimizer_step"):
+                    # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self._optimizer.step()
+                    self._scheduler.step()
 
                 # Reset accumulated loss
                 accumulated_loss = 0.0
@@ -734,6 +812,8 @@ class GaussianSplatScaleConditionedSegmentation:
                 logging.debug(f"Reached max epochs: {self._cfg.max_epochs}")
                 break
 
+            step += 1
+
         self._logger.info("Training completed.")
 
     @torch.inference_mode()
@@ -751,15 +831,21 @@ class GaussianSplatScaleConditionedSegmentation:
             batch_size=1,
             shuffle=False,
             num_workers=1,
-            collate_fn=lambda batch: GARfVDBInputCollateFn(batch, collate_full_image=True),
+            collate_fn=lambda batch: GARfVDBInputCollateFn(batch, collate_full_image=True, include_mask_cdf=True),
         )
+
+        # GPU transform for mask selection
+        gpu_mask_transform = GPURandomSelectMaskIDAndScale()
 
         ## Log metrics
         metrics = {"psnr": [], "loss": []}
         for val_batch in valloader:
             val_batch = val_batch.to(self.device)
-            val_enc_feats = self._model.get_encoded_features(val_batch)
-            val_loss_dict = calculate_loss(self._model, val_enc_feats, val_batch)
+            val_batch = gpu_mask_transform(val_batch)
+            with nvtx.range("eval_forward_pass"):
+                val_enc_feats = self._model.get_encoded_features(val_batch)
+            with nvtx.range("eval_loss_calculation"):
+                val_loss_dict = calculate_loss(self._model, val_enc_feats, val_batch)
             metrics["loss"].append(val_loss_dict["total_loss"])
 
         loss_mean = torch.stack(metrics["loss"]).mean().cpu()
@@ -774,19 +860,21 @@ class GaussianSplatScaleConditionedSegmentation:
 
         ## Validation image
         val_batch = next(iter(valloader)).to(self.device)
+        val_batch = gpu_mask_transform(val_batch)
 
         world_to_cam_matrix = val_batch["world_to_camera"]
         projection_matrix = val_batch["projection"]
         beauty_gt = val_batch["image_full"]
         img_w, img_h = val_batch["image_w"][0], val_batch["image_h"][0]
-        beauty_output, _ = self.gs_model.render_images(
-            world_to_cam_matrix,
-            projection_matrix,
-            img_w,
-            img_h,
-            0.01,
-            1e10,
-        )
+        with nvtx.range("eval_render_beauty"):
+            beauty_output, _ = self.gs_model.render_images(
+                world_to_cam_matrix,
+                projection_matrix,
+                img_w,
+                img_h,
+                0.01,
+                1e10,
+            )
         # Ground truth and rendered image for reference
         beauty_output = torch.clamp(beauty_output, 0.0, 1.0)
 
@@ -803,10 +891,12 @@ class GaussianSplatScaleConditionedSegmentation:
         # Mask outputs at 10% of the maximum scale
         desired_scale = torch.max(val_batch["scales"]) * 0.1
 
-        val_mask_output, mask_alpha = self._model.get_mask_output(val_batch, desired_scale.item())
+        with nvtx.range("eval_get_mask_output"):
+            val_mask_output, mask_alpha = self._model.get_mask_output(val_batch, desired_scale.item())
         logging.debug(f"mask_alpha zeros: {mask_alpha.sum()}")
 
-        pca_output = pca_projection_fast(val_mask_output, 3, mask=mask_alpha.squeeze(-1) > 0)
+        with nvtx.range("eval_pca_projection"):
+            pca_output = pca_projection_fast(val_mask_output, 3, mask=mask_alpha.squeeze(-1) > 0)
         pca_output = pca_output.clamp(0.0, 1.0)  # [B, H, W, 3]
         self._writer.save_image(self._global_step, f"{log_tag}/mask.jpg", downscale(pca_output).cpu())
         alpha = 0.7

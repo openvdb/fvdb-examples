@@ -320,7 +320,22 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             near=0.01,
             far=1e10,
         )
-        g_ids = g_ids.jdata.squeeze().reshape(h, w, 1)  # [H, W, 1]
+        # The JaggedTensor has h*w entries, but some may be empty (pixels with no contributing gaussians).
+        # We need to create a full tensor with -1 for empty entries.
+        num_pixels = h * w
+        offsets = g_ids.joffsets  # [h*w + 1]
+
+        # Create output tensor initialized with -1 (no gaussian)
+        g_ids_full = torch.full((num_pixels,), -1, dtype=g_ids.jdata.dtype, device=g_ids.jdata.device)
+
+        # Find which pixels have data (where the entry has length > 0)
+        has_data = offsets[1:] > offsets[:-1]  # [h*w] bool tensor
+
+        # Fill in the values where we have data
+        if g_ids.jdata.numel() > 0:
+            g_ids_full[has_data] = g_ids.jdata.view(-1)
+
+        g_ids = g_ids_full.reshape(h, w, 1)  # [H, W, 1]
 
         self._logger.debug("g_ids.shape " + str(g_ids.shape))
         if g_ids.max() >= gs3d.means.shape[0]:
@@ -359,7 +374,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
         # Filter out masks whose scale is too large since very scattered 3D points are likely noise
         self._logger.debug("world_pts " + str(world_pts.shape))
         self._logger.debug("scale " + str(world_pts[eroded_masks[1]].std(dim=0) * 2.0))
-        scales = torch.stack([world_pts[mask].std(dim=0).norm() for mask in eroded_masks])  # [M]
+        scales = torch.stack([world_pts[mask].unique(dim=0).std(dim=0).norm() for mask in eroded_masks])  # [M]
         keep = scales < max_scale  # [M]
         eroded_masks = eroded_masks[keep]  # [M', H, W]
         scales = scales[keep]  # [M']

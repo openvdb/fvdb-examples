@@ -48,6 +48,7 @@ def main(
     mask_scale: float = 0.1,
     mask_blend: float = 0.5,
     verbose: bool = False,
+    cache_dataset: bool = True,
 ):
     """
     Train a Gaussian splat segmentation model from a set of images and camera poses.
@@ -79,6 +80,8 @@ def main(
         mask_scale (float): Fraction of scene max scale to use for rendering segmentation masks (0.1 = 10%).
         mask_blend (float): Blend factor for the segmentation overlay (0.0 = transparent, 1.0 = opaque).
         verbose (bool): Whether to log debug messages.
+        cache_dataset (bool): If True, cache images and masks in memory to speed up data loading.
+            Set to False to reduce memory usage for large datasets. Default is True.
     """
     log_level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
@@ -302,6 +305,7 @@ def main(
         viewer_update_interval_epochs=visualize_every,
         log_interval_steps=log_every,
         viz_callback=viz_callback,
+        cache_dataset=cache_dataset,
     )
 
     # Set up camera tracking thread for interactive visualization
