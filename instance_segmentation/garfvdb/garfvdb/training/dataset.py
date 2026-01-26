@@ -276,7 +276,8 @@ class GARfVDBInput(dict[str, torch.Tensor | fvdb.JaggedTensor | list[int] | None
     def __getitem__(self, key: Literal["image_h"]) -> list[int]: ...
     @overload
     def __getitem__(
-        self, key: Literal["image", "projection", "camera_to_world", "world_to_camera", "scales", "mask_ids", "mask_cdf"]
+        self,
+        key: Literal["image", "projection", "camera_to_world", "world_to_camera", "scales", "mask_ids", "mask_cdf"],
     ) -> torch.Tensor: ...
     @overload
     def __getitem__(self, key: Literal["pixel_coords"]) -> torch.Tensor: ...
