@@ -10,3 +10,6 @@ __pycache__
 **/fvdb_gslogs
 **/logs/
 **/*.ply
+**/*.jpg
+**/*.png
+**/*.nsys-rep

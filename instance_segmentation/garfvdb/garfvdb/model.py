@@ -7,6 +7,7 @@ from typing import Any, Callable, Literal, cast
 import fvdb
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 from fvdb import GaussianSplat3d
 from garfvdb.config import GARfVDBModelConfig
 from garfvdb.training.dataset import GARfVDBInput
@@ -39,6 +40,7 @@ class SparseConvWithSkips(torch.nn.Module):
                 self.add_module(f"conv_{i}_{j}", fvdb.nn.SparseConv3d(8, 8, self.kernel_size, bias=False))
                 torch.nn.init.xavier_uniform_(self.get_submodule(f"conv_{i}_{j}").weight)
 
+    @nvtx.range("SparseConvWithSkips.forward")
     def forward(self, data: fvdb.JaggedTensor, grid_batch: fvdb.GridBatch) -> fvdb.JaggedTensor:
         result = []
 
@@ -336,6 +338,7 @@ class GARfVDBModel(torch.nn.Module):
 
         return quantile_transformer_func
 
+    @nvtx.range("GARfVDBModel.get_encoded_features")
     def get_encoded_features(self, input: GARfVDBInput) -> torch.Tensor:
         """Get the per-pixel encoder features for the given input images or pixel samples.
 
@@ -356,8 +359,13 @@ class GARfVDBModel(torch.nn.Module):
             pixel_coords = input.get("pixel_coords", None)  # [B, rays_per_image, 2]
 
             if pixel_coords is not None:
+                B, rays_per_image = pixel_coords.shape[:2]
+                flat_pixel_coords = pixel_coords.reshape(-1, 2)
+                offsets = torch.arange(0, B + 1, device=pixel_coords.device, dtype=torch.long) * rays_per_image
+                pixels_to_render = fvdb.JaggedTensor.from_data_and_offsets(flat_pixel_coords, offsets)
+
                 features, _ = self._gs_model_for_render.sparse_render_images(
-                    pixels_to_render=fvdb.JaggedTensor(list(pixel_coords.unbind())),
+                    pixels_to_render=pixels_to_render,
                     world_to_camera_matrices=world_to_cam,
                     projection_matrices=intrinsics,
                     image_width=img_w,
@@ -392,8 +400,13 @@ class GARfVDBModel(torch.nn.Module):
             # Render the IDs of the gaussians that contribute to each pixel, which we will use to sample the feature grids
             with torch.no_grad():
                 if pixel_coords is not None:
+                    B, rays_per_image = pixel_coords.shape[:2]
+                    flat_pixel_coords = pixel_coords.reshape(-1, 2)
+                    offsets = torch.arange(0, B + 1, device=pixel_coords.device, dtype=torch.long) * rays_per_image
+                    pixels_to_render = fvdb.JaggedTensor.from_data_and_offsets(flat_pixel_coords, offsets)
+
                     ids, weights = self.gs_model.sparse_render_contributing_gaussian_ids(
-                        pixels_to_render=fvdb.JaggedTensor(list(pixel_coords.unbind())),
+                        pixels_to_render=pixels_to_render,
                         top_k_contributors=self.model_config.depth_samples,
                         world_to_camera_matrices=world_to_cam,
                         projection_matrices=intrinsics,
@@ -475,28 +488,59 @@ class GARfVDBModel(torch.nn.Module):
                 ids = fvdb.JaggedTensor(single_ids)
                 # ids = torch.gather(ids.squeeze(-1), dim=2, index=depth_sample_indices)  # [B, R, 1] or [B, H, W, 1]
 
-            # unique ids
-            ids_3dgs = ids % self.gs_model.means.shape[0]
-            unique_ids, unique_ids_inverse = torch.unique(ids_3dgs.jdata, return_inverse=True)
+            # Filter out invalid IDs (-1 indicates no valid gaussian for that position)
+            valid_mask = ids.jdata >= 0
+            valid_ids = ids.jdata[valid_mask]
 
-            unique_world_pts = self.gs_model.means[unique_ids]
+            # Get unique among valid IDs only
+            unique_valid_ids, valid_inverse = torch.unique(valid_ids, return_inverse=True)
+
+            # Look up gaussian positions for valid unique IDs only
+            unique_world_pts = self.gs_model.means[unique_valid_ids]
 
             # sample the encoder grids at the unique world points
-            enc_grid_sample_pts = fvdb.JaggedTensor(
-                [unique_world_pts for _ in range(self.encoder_gridbatch.grid_count)]
-            )
-            if self.model_config.use_grid_conv:
-                conv_output = self.encoder_convnet(self.enc_features, self.encoder_gridbatch)
-                unique_enc_feats = conv_output.sample_trilinear(enc_grid_sample_pts)
+            grid_count = self.encoder_gridbatch.grid_count
+            num_unique_pts = len(unique_valid_ids)
+
+            if num_unique_pts > 0:
+                tiled_pts = unique_world_pts.repeat(grid_count, 1)  # [grid_count * num_unique_pts, 3]
+                offsets = (
+                    torch.arange(0, grid_count + 1, device=unique_world_pts.device, dtype=torch.long) * num_unique_pts
+                )
+                enc_grid_sample_pts = fvdb.JaggedTensor.from_data_and_offsets(tiled_pts, offsets)
+                with nvtx.range("sample_encoder_grids"):
+                    if self.model_config.use_grid_conv:
+                        conv_output = self.encoder_convnet(self.enc_features, self.encoder_gridbatch)
+                        unique_enc_feats = conv_output.sample_trilinear(enc_grid_sample_pts)
+                    else:
+                        unique_enc_feats = self.encoder_gridbatch.sample_trilinear(
+                            enc_grid_sample_pts, self.enc_features
+                        )
+
+                feat_dim = unique_enc_feats.jdata.shape[-1]
+                # jdata is [grid_count * num_unique_pts, feat_dim]
+                # reshape to [grid_count, num_unique_pts, feat_dim], transpose, flatten
+                unique_cam_enc_feats = (
+                    unique_enc_feats.jdata.reshape(grid_count, num_unique_pts, feat_dim)
+                    .transpose(0, 1)
+                    .reshape(num_unique_pts, grid_count * feat_dim)
+                )  # [num_unique_pts, F]
+
+                # Re-assemble enc_feats: valid positions get looked-up features, invalid get zeros
+                total_samples = ids.jdata.shape[0]
+                feat_dim_total = unique_cam_enc_feats.shape[-1]
+                enc_feats_data = torch.zeros(
+                    total_samples, feat_dim_total, device=ids.jdata.device, dtype=unique_cam_enc_feats.dtype
+                )
+                enc_feats_data[valid_mask] = unique_cam_enc_feats[valid_inverse]
             else:
-                unique_enc_feats = self.encoder_gridbatch.sample_trilinear(enc_grid_sample_pts, self.enc_features)
-            # NOTE: Cast is just to satisfy the type checker
-            unique_cam_enc_feats = torch.cat(
-                cast(list[torch.Tensor], unique_enc_feats.unbind()), dim=-1
-            )  # [unique_ids, F]
-            # re-assemble the enc_feats based on the original ids
-            enc_feats = unique_cam_enc_feats[unique_ids_inverse].squeeze(-2)  # [B, R, S, F]
-            enc_feats = fvdb.JaggedTensor.from_data_offsets_and_list_ids(enc_feats, ids.joffsets, ids.jlidx)
+                # Edge case: no valid IDs at all
+                # Determine feature dimension from encoder config
+                feat_dim_total = grid_count * self.enc_features.shape[-1]
+                total_samples = ids.jdata.shape[0]
+                enc_feats_data = torch.zeros(total_samples, feat_dim_total, device=ids.jdata.device)
+
+            enc_feats = ids.jagged_like(enc_feats_data)
 
             if not self.model_config.enc_feats_one_idx_per_ray:
                 # Weighted sum of the enc_feats and transmittance weights
@@ -516,6 +560,7 @@ class GARfVDBModel(torch.nn.Module):
                 # reshape enc_feats to [B, H, W, S, F]
                 return enc_feats.jdata.reshape(len(enc_feats), img_h, img_w, -1, feature_size)
 
+    @nvtx.range("GARfVDBModel.get_mlp_output")
     def get_mlp_output(self, enc_feats: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """Get the MLP output for the given encoder features and scales.
 
@@ -545,6 +590,7 @@ class GARfVDBModel(torch.nn.Module):
         # Reshape back to 3D
         return gfeats
 
+    @nvtx.range("GARfVDBModel.get_mask_output")
     def get_mask_output(self, input: GARfVDBInput, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
         """Get the mask output for the given input and scale
 
