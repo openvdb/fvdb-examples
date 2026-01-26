@@ -16,7 +16,6 @@ from fvdb_reality_capture.transforms import (
     PercentileFilterPoints,
     TransformScene,
 )
-
 from garfvdb.scene_transforms import ComputeImageSegmentationMasksWithScales
 
 
@@ -127,7 +126,11 @@ class SfmSceneSegmentationTransformConfig:
     def build_scene_transforms(self, gs3d: GaussianSplat3d, normalization_transform: torch.Tensor | None):
         # SfmScene transform
         transforms = [
-            TransformScene(normalization_transform.numpy()) if normalization_transform is not None else Identity(),
+            (
+                TransformScene(normalization_transform.cpu().numpy())
+                if normalization_transform is not None
+                else Identity()
+            ),
             PercentileFilterPoints(
                 percentile_min=np.full((3,), self.points_percentile_filter),
                 percentile_max=np.full((3,), 100.0 - self.points_percentile_filter),
