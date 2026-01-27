@@ -640,13 +640,11 @@ class GARfVDBModel(torch.nn.Module):
         Returns:
             Mask output [B, H, W, mlp_output_dim]
         """
-        torch.cuda.synchronize()
         img_w = input["image_w"][0]
         img_h = input["image_h"][0]
 
         intrinsics = input["projection"]
-        cam_to_world = input["camera_to_world"]
-        world_to_cam = torch.linalg.inv(cam_to_world).contiguous()
+        world_to_cam = input["world_to_camera"]
 
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
@@ -668,8 +666,10 @@ class GARfVDBModel(torch.nn.Module):
                 with nvtx.range("encoder_gridbatch.sample_trilinear"):
                     enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
             # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
-            F = enc_feats.jdata.shape[-1]
-            enc_feats = enc_feats.jdata.view(grid_count, num_points, F).permute(1, 0, 2).reshape(num_points, -1)
+            num_features = enc_feats.jdata.shape[-1]
+            enc_feats = (
+                enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
+            )
 
             # Set them as the sh0 features
             enc_feats_state_dict = self.gs_model.state_dict()

@@ -842,8 +842,8 @@ def run_nvos_evaluation(
     ref_model_input = GARfVDBInput(
         intrinsics=ref_K,
         projection=ref_K,
-        cam_to_world=ref_c2w,
         camera_to_world=ref_c2w,
+        world_to_camera=torch.linalg.inv(ref_c2w).contiguous(),
         image_w=[ref_img_w],
         image_h=[ref_img_h],
     )
@@ -851,8 +851,8 @@ def run_nvos_evaluation(
     test_model_input = GARfVDBInput(
         intrinsics=test_K,
         projection=test_K,
-        cam_to_world=test_c2w,
         camera_to_world=test_c2w,
+        world_to_camera=torch.linalg.inv(test_c2w).contiguous(),
         image_w=[test_img_w],
         image_h=[test_img_h],
     )
