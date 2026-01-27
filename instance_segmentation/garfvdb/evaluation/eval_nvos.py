@@ -27,7 +27,39 @@ Input Modes:
     2. "points": Uses hardcoded input points from a JSON file (SAGA v2 style).
        Multiple points can be specified per scene, and the evaluation computes
        the UNION of all matching regions (max affinity across all points).
-       This is useful for scenes with multiple parts belonging to the same object.
+       This is useful for scenes where the SAGA ground truth mask represents multiple
+       objects because SAGA measures affinity of the query point to all potential
+       objects in the scene, GARfVDB produces instance masks for each object at a
+       given scale, so when evaluating GARfVDB against these masks, we need to compute
+       the UNION of all matching regions that would be indicated by each point.
+
+Negative Scribbles:
+    Optionally, negative scribbles from the NVOS dataset can be used to suppress
+    false positives. When enabled with --use-negative-scribbles, three combination
+    modes are available (--negative-mode):
+
+    - "dominate" (default, recommended): Keep pixels where positive affinity
+      exceeds threshold AND positive > negative * weight. This requires positive
+      affinity to "dominate" negative by a configurable factor.
+
+    - "subtract": Original aggressive approach where
+      mask = (pos - weight * neg) >= threshold. Can over-suppress foreground.
+
+    - "veto": Keep pixels where positive >= threshold AND negative < weight.
+      Uses negative_weight as a veto threshold for negative affinity.
+
+    Works with both "scribbles" and "points" input modes.
+
+SAGA-Style Scribble Processing:
+    When --saga-style-scribbles is enabled (with --input-mode scribbles), the
+    scribbles are processed using the SAGA paper approach:
+    1. Skeletonization: thin scribbles to 1-pixel wide strokes
+    2. Random sampling: multiply by random values and threshold
+       - Positive: keep ~2% of skeleton (threshold 0.98)
+       - Negative: keep ~0.5% of skeleton (threshold 0.995)
+
+    This produces multiple well-distributed points along the scribble strokes
+    instead of a single centroid point.
 
 Usage:
     # Default: use scribbles
@@ -38,6 +70,15 @@ Usage:
 
     # Use custom input points file
     python eval_nvos.py --input-mode points --input-points-file /path/to/points.json
+
+    # Use 4x downsampling for evaluation (SAGA-style, reduces memory usage)
+    python eval_nvos.py --eval-downsample 4 --input-mode points
+
+    # Use negative scribbles to suppress false positives
+    python eval_nvos.py --input-mode points --use-negative-scribbles --negative-weight 1.0
+
+    # Use SAGA-style multi-point scribbles with negative scribbles
+    python eval_nvos.py --input-mode scribbles --saga-style-scribbles --use-negative-scribbles
 
     # Evaluate specific scenes
     python eval_nvos.py --nvos-root /ai/segmentation_datasets/nvos --results-root ./nvos_results --scenes fern flower
@@ -51,6 +92,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Tuple
 
 import cv2
+import fvdb
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -101,12 +143,28 @@ def calculate_accuracy(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return correct / total if total > 0 else 0.0
 
 
+def _get_base_scene_name(scene_name: str) -> str:
+    """
+    Get the base scene name for scribble files.
+
+    e.g., horns_center -> horns, horns_left -> horns, fern -> fern
+    """
+    base_scene = (
+        scene_name.split("_")[0]
+        if "_" in scene_name and scene_name not in ["horns_center", "horns_left"]
+        else scene_name
+    )
+    if base_scene in ["horns_center", "horns_left"]:
+        base_scene = "horns"
+    return base_scene
+
+
 def get_scribble_click_point(scribbles_dir: pathlib.Path, scene_name: str) -> Tuple[int, int]:
     """
-    Get a click point from the positive scribble image.
+    Get a single click point from the positive scribble image.
 
     The scribble images are 4x downsampled, so we need to scale the coordinates.
-    We find the centroid of the positive scribble region.
+    We pick a point from the positive scribble region (median index for stability).
 
     Args:
         scribbles_dir: Path to the scribbles directory (e.g., .../scribbles/fern/)
@@ -115,15 +173,7 @@ def get_scribble_click_point(scribbles_dir: pathlib.Path, scene_name: str) -> Tu
     Returns:
         Tuple of (x, y) coordinates at original image resolution
     """
-    # Scene name for scribble files is the base scene name (without _center, _left, etc.)
-    # e.g., horns_center -> horns, fern -> fern
-    base_scene = (
-        scene_name.split("_")[0]
-        if "_" in scene_name and scene_name not in ["horns_center", "horns_left"]
-        else scene_name
-    )
-    if base_scene in ["horns_center", "horns_left"]:
-        base_scene = "horns"
+    base_scene = _get_base_scene_name(scene_name)
 
     pos_scribble_path = scribbles_dir / f"pos_0_{base_scene}.png"
     if not pos_scribble_path.exists():
@@ -156,6 +206,194 @@ def get_scribble_click_point(scribbles_dir: pathlib.Path, scene_name: str) -> Tu
     y_click = y_pixel * 4
 
     return (x_click, y_click)
+
+
+def get_positive_scribble_points(
+    scribbles_dir: pathlib.Path,
+    scene_name: str,
+    max_points: int = 20,
+    logger: logging.Logger | None = None,
+) -> list[Tuple[int, int]]:
+    """
+    Get multiple click points from the positive scribble image using SAGA-style processing.
+
+    Uses skeletonization + random sampling for better point distribution.
+    The scribble images are 4x downsampled, so coordinates are scaled up.
+
+    Args:
+        scribbles_dir: Path to the scribbles directory (e.g., .../scribbles/fern/)
+        scene_name: Name of the scene directory (e.g., 'fern', 'horns_center')
+        max_points: Maximum number of positive points to return
+        logger: Optional logger instance
+
+    Returns:
+        List of (x, y) coordinate tuples at original image resolution.
+        Raises FileNotFoundError if no positive scribble is found.
+    """
+    base_scene = _get_base_scene_name(scene_name)
+
+    pos_scribble_path = scribbles_dir / f"pos_0_{base_scene}.png"
+    if not pos_scribble_path.exists():
+        # Try without the _0 suffix
+        pos_scribble_path = scribbles_dir / f"pos_{base_scene}.png"
+
+    if not pos_scribble_path.exists():
+        raise FileNotFoundError(f"Positive scribble not found: {pos_scribble_path}")
+
+    # Process scribble with SAGA-style skeletonization and sampling
+    # Use threshold 0.98 for positive (keeps ~2% of skeleton pixels)
+    scribble = _load_and_process_scribble(pos_scribble_path, sample_threshold=0.98, logger=logger)
+    if scribble is None:
+        raise ValueError(f"Failed to process positive scribble: {pos_scribble_path}")
+
+    # Extract points (y, x) -> (x, y)
+    positive_pixels = np.where(scribble > 0)
+    if len(positive_pixels[0]) == 0:
+        raise ValueError(f"No positive pixels after processing: {pos_scribble_path}")
+
+    # Convert to (x, y) format and scale up by 4x
+    points = []
+    for y_pixel, x_pixel in zip(positive_pixels[0], positive_pixels[1]):
+        x_click = int(x_pixel) * 4
+        y_click = int(y_pixel) * 4
+        points.append((x_click, y_click))
+
+    # Limit to max_points if we got too many
+    if len(points) > max_points:
+        # Randomly sample to max_points
+        indices = np.random.choice(len(points), max_points, replace=False)
+        points = [points[i] for i in indices]
+
+    if logger:
+        logger.info(f"Loaded {len(points)} positive scribble points (SAGA-style) from {pos_scribble_path}")
+
+    return points
+
+
+def _load_and_process_scribble(
+    scribble_path: pathlib.Path,
+    sample_threshold: float,
+    logger: logging.Logger | None = None,
+) -> np.ndarray | None:
+    """
+    Load a scribble image and process it using SAGA-style skeletonization and sampling.
+
+    This follows the SAGA paper approach:
+    1. Load the scribble image and binarize
+    2. Skeletonize to get 1-pixel wide strokes
+    3. Multiply by random values and threshold to sample points
+
+    Args:
+        scribble_path: Path to the scribble PNG file
+        sample_threshold: Threshold for random sampling (higher = fewer points)
+            SAGA uses 0.98 for positive, 0.995 for negative
+        logger: Optional logger instance
+
+    Returns:
+        Binary mask with sampled points, or None if loading failed
+    """
+    # Read the scribble image (may be grayscale or RGB)
+    scribble = cv2.imread(str(scribble_path), cv2.IMREAD_UNCHANGED)
+    if scribble is None:
+        if logger:
+            logger.warning(f"Failed to read scribble image: {scribble_path}")
+        return None
+
+    # Convert to binary mask
+    if len(scribble.shape) == 3:
+        # RGB image - sum channels and binarize (SAGA approach)
+        scribble = scribble.astype(np.float32).sum(axis=-1)
+        scribble[scribble != 0] = 1
+    else:
+        # Grayscale - just binarize
+        scribble = (scribble > 0).astype(np.float32)
+
+    if scribble.sum() == 0:
+        if logger:
+            logger.warning(f"No pixels found in scribble: {scribble_path}")
+        return None
+
+    # Skeletonize to get 1-pixel wide strokes (SAGA approach)
+    try:
+        from skimage import morphology
+
+        scribble = morphology.skeletonize(scribble).astype(np.float32)
+    except ImportError:
+        if logger:
+            logger.warning("skimage not available, using raw scribble without skeletonization")
+
+    # Random sampling with threshold (SAGA approach)
+    # Multiply by random values and keep only high values
+    scribble *= np.random.rand(scribble.shape[0], scribble.shape[1])
+    scribble[scribble < sample_threshold] = 0
+
+    return scribble
+
+
+def get_negative_scribble_points(
+    scribbles_dir: pathlib.Path,
+    scene_name: str,
+    max_points: int = 10,
+    logger: logging.Logger | None = None,
+) -> list[Tuple[int, int]]:
+    """
+    Get multiple click points from the negative scribble image.
+
+    Uses SAGA-style processing: skeletonization + random sampling.
+    The scribble images are 4x downsampled, so coordinates are scaled up.
+
+    Args:
+        scribbles_dir: Path to the scribbles directory (e.g., .../scribbles/fern/)
+        scene_name: Name of the scene directory (e.g., 'fern', 'horns_center')
+        max_points: Maximum number of negative points to return
+        logger: Optional logger instance
+
+    Returns:
+        List of (x, y) coordinate tuples at original image resolution.
+        Returns empty list if no negative scribble is found.
+    """
+    base_scene = _get_base_scene_name(scene_name)
+
+    neg_scribble_path = scribbles_dir / f"neg_0_{base_scene}.png"
+    if not neg_scribble_path.exists():
+        # Try without the _0 suffix
+        neg_scribble_path = scribbles_dir / f"neg_{base_scene}.png"
+
+    if not neg_scribble_path.exists():
+        if logger:
+            logger.warning(f"Negative scribble not found: {neg_scribble_path}")
+        return []
+
+    # Process scribble with SAGA-style skeletonization and sampling
+    # Use threshold 0.995 for negative (keeps ~0.5% of skeleton pixels)
+    scribble = _load_and_process_scribble(neg_scribble_path, sample_threshold=0.995, logger=logger)
+    if scribble is None:
+        return []
+
+    # Extract points (y, x) -> (x, y)
+    negative_pixels = np.where(scribble > 0)
+    if len(negative_pixels[0]) == 0:
+        if logger:
+            logger.warning(f"No negative pixels after processing: {neg_scribble_path}")
+        return []
+
+    # Convert to (x, y) format and scale up by 4x
+    points = []
+    for y_pixel, x_pixel in zip(negative_pixels[0], negative_pixels[1]):
+        x_click = int(x_pixel) * 4
+        y_click = int(y_pixel) * 4
+        points.append((x_click, y_click))
+
+    # Limit to max_points if we got too many
+    if len(points) > max_points:
+        # Randomly sample to max_points
+        indices = np.random.choice(len(points), max_points, replace=False)
+        points = [points[i] for i in indices]
+
+    if logger:
+        logger.info(f"Loaded {len(points)} negative scribble points (SAGA-style) from {neg_scribble_path}")
+
+    return points
 
 
 def get_input_points_from_file(
@@ -197,7 +435,8 @@ def get_input_points_from_file(
             )
 
     # Convert to list of tuples
-    result = [(int(p[0]), int(p[1])) for p in points]
+    scale = all_points.get("_scale", 1)
+    result = [(int(p[0] * scale), int(p[1] * scale)) for p in points]
     logger.info(f"Loaded {len(result)} input points for scene '{scene_name}': {result}")
     return result
 
@@ -303,6 +542,33 @@ def find_camera_for_image_by_id(
     return None
 
 
+def load_scene_image_by_id(
+    sfm_scene: SfmScene,
+    image_id: int,
+    scene_path: pathlib.Path,
+    logger: logging.Logger,
+) -> tuple[np.ndarray | None, pathlib.Path | None]:
+    """
+    Load an image from the transformed scene by image_id.
+
+    This uses the image_path stored in the SfmScene, which remains valid even if
+    images were renamed (e.g., image_0000). Falls back to None if not found.
+    """
+    for img_meta in sfm_scene.images:
+        if img_meta.image_id == image_id:
+            image_path = pathlib.Path(img_meta.image_path)
+            if not image_path.is_absolute():
+                image_path = scene_path / image_path
+            img_bgr = cv2.imread(str(image_path))
+            if img_bgr is None:
+                logger.warning(f"Failed to read image: {image_path}")
+                return None, image_path
+            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), image_path
+
+    logger.warning(f"Image with id {image_id} not found in scene for visualization")
+    return None, None
+
+
 @dataclass
 class EvaluationConfig:
     """Configuration for NVOS evaluation."""
@@ -320,6 +586,23 @@ class EvaluationConfig:
     input_points_file: pathlib.Path = field(
         default_factory=lambda: pathlib.Path(__file__).parent / "saga_v2_input_points.json"
     )
+
+    # Rendering resolution
+    eval_downsample: int = 1  # Downsample factor for evaluation rendering (e.g., 4 for SAGA-style)
+
+    # Negative scribble configuration
+    use_negative_scribbles: bool = False  # Whether to use negative scribbles to suppress false positives
+    negative_weight: float = 1.0  # Weight/margin for negative affinity comparison
+    max_negative_points: int = 10  # Maximum number of negative points to sample from scribble
+    negative_mode: Literal["dominate", "subtract", "veto"] = "dominate"
+    # Negative modes:
+    # - "dominate": mask where pos >= threshold AND pos > neg * weight (default, most robust)
+    # - "subtract": mask where (pos - weight * neg) >= threshold (original, aggressive)
+    # - "veto": mask where pos >= threshold AND neg < veto_threshold (neg_weight as veto threshold)
+
+    # SAGA-style scribble processing
+    saga_style_scribbles: bool = False  # Use SAGA-style multi-point sampling from scribbles
+    max_positive_points: int = 20  # Maximum positive points when using SAGA-style scribbles
 
 
 def run_nvos_evaluation(
@@ -383,13 +666,21 @@ def run_nvos_evaluation(
     model.eval()
 
     # Get click points (this is on the reference image)
-    # Can come from scribbles (single point) or input points file (multiple points)
+    # Can come from scribbles (single/multi point) or input points file (multiple points)
     click_points: list[Tuple[int, int]] = []
     try:
         if config.input_mode == "scribbles":
-            click_x, click_y = get_scribble_click_point(scribbles_dir, mask_dir_name)
-            click_points = [(click_x, click_y)]
-            logger.info(f"Click point from scribble (on reference image): ({click_x}, {click_y})")
+            if config.saga_style_scribbles:
+                # SAGA-style: multiple points from skeletonized + sampled scribble
+                click_points = get_positive_scribble_points(
+                    scribbles_dir, mask_dir_name, config.max_positive_points, logger
+                )
+                logger.info(f"SAGA-style: {len(click_points)} points from positive scribble")
+            else:
+                # Default: single point from positive scribble
+                click_x, click_y = get_scribble_click_point(scribbles_dir, mask_dir_name)
+                click_points = [(click_x, click_y)]
+                logger.info(f"Click point from scribble (on reference image): ({click_x}, {click_y})")
         else:
             # Load from input points file (SAGA v2 style)
             click_points = get_input_points_from_file(config.input_points_file, scene_name, logger)
@@ -401,6 +692,15 @@ def run_nvos_evaluation(
     if not click_points:
         logger.error("No click points available for evaluation")
         return None
+
+    # Optionally load negative scribble points (to suppress false positives)
+    negative_points: list[Tuple[int, int]] = []
+    if config.use_negative_scribbles:
+        negative_points = get_negative_scribble_points(scribbles_dir, mask_dir_name, config.max_negative_points, logger)
+        if negative_points:
+            logger.info(f"Using {len(negative_points)} negative scribble points with weight {config.negative_weight}")
+        else:
+            logger.warning("Negative scribbles enabled but no negative points found")
 
     # Load ground truth mask (on test/novel view image)
     gt_mask_path = None
@@ -457,6 +757,32 @@ def run_nvos_evaluation(
     logger.debug(f"Test camera c2w position: {test_c2w[:3, 3].tolist()}")
     logger.debug(f"Test camera K:\n{test_K}")
 
+    # Apply evaluation downsampling if requested
+    if config.eval_downsample > 1:
+        ds = config.eval_downsample
+        logger.info(f"Applying {ds}x downsampling for evaluation (SAGA-style)")
+
+        # Downsample image dimensions
+        ref_img_w = ref_img_w // ds
+        ref_img_h = ref_img_h // ds
+        test_img_w = test_img_w // ds
+        test_img_h = test_img_h // ds
+
+        # Scale intrinsics (fx, fy, cx, cy all scale with image size)
+        ref_K = ref_K.clone()
+        ref_K[0, 0] /= ds  # fx
+        ref_K[1, 1] /= ds  # fy
+        ref_K[0, 2] /= ds  # cx
+        ref_K[1, 2] /= ds  # cy
+
+        test_K = test_K.clone()
+        test_K[0, 0] /= ds  # fx
+        test_K[1, 1] /= ds  # fy
+        test_K[0, 2] /= ds  # cx
+        test_K[1, 2] /= ds  # cy
+
+        logger.info(f"Downsampled reference: {ref_img_w}x{ref_img_h}, test: {test_img_w}x{test_img_h}")
+
     # Adjust click point for reference image dimensions
     # Scribbles are at 4x downsampled resolution relative to original images
     # But the SfmScene might have different dimensions due to training downsampling
@@ -494,6 +820,18 @@ def run_nvos_evaluation(
 
     logger.info(f"All click points scaled ({scale_x:.4f}x{scale_y:.4f}): {click_points_scaled}")
 
+    # Scale negative points if using negative scribbles
+    negative_points_scaled: list[Tuple[int, int]] = []
+    if negative_points:
+        for neg_x, neg_y in negative_points:
+            neg_x_scaled = int(neg_x * scale_x)
+            neg_y_scaled = int(neg_y * scale_y)
+            # Clamp to valid range
+            neg_x_scaled = max(0, min(neg_x_scaled, ref_img_w - 1))
+            neg_y_scaled = max(0, min(neg_y_scaled, ref_img_h - 1))
+            negative_points_scaled.append((neg_x_scaled, neg_y_scaled))
+        logger.info(f"Negative points scaled: {len(negative_points_scaled)} points")
+
     # Prepare model inputs for BOTH reference and test views
     ref_c2w = ref_c2w.unsqueeze(0).to(device)
     ref_K = ref_K.unsqueeze(0).to(device)
@@ -527,114 +865,237 @@ def run_nvos_evaluation(
     best_acc = 0.0
     best_scale = 0.0
     best_mask = None
+    best_per_point_scales: list[float] = []
 
     scale_range = np.arange(scale_increment, max_scale.item() + scale_increment, scale_increment)
+    num_scales = len(scale_range)
+    num_points = len(click_points_scaled)
 
-    logger.info(f"Mining {len(scale_range)} scales from {scale_increment:.4f} to {max_scale.item():.4f}")
+    logger.info(f"Mining {num_scales} scales from {scale_increment:.4f} to {max_scale.item():.4f}")
 
-    first_iteration = True
-    for curr_scale in tqdm.tqdm(scale_range, desc=f"Mining scales for {scene_name}", leave=False):
+    # Memory-efficient approach: store masks on CPU as packed bits
+    # Only move to GPU in small batches for IoU computation
+    # Structure: all_masks[point_idx][scale_idx] = numpy bool array
+    all_masks: list[list[np.ndarray]] = [[] for _ in range(num_points)]
+    best_affinity_scales: list[int] = [0] * num_points
+
+    for scale_idx, curr_scale in enumerate(
+        tqdm.tqdm(scale_range, desc=f"Computing masks for {scene_name}", leave=False)
+    ):
         with torch.no_grad():
             # Get features from REFERENCE view (to extract query features at click points)
             ref_feats, _ = model.get_mask_output(ref_model_input, scale=float(curr_scale))
             ref_feats = ref_feats[0]  # Remove batch dimension [H, W, F]
 
-            if first_iteration:
-                logger.info(f"Reference features shape: {ref_feats.shape} (expected: {ref_img_h}x{ref_img_w})")
-                logger.info(f"Reference features stats: min={ref_feats.min():.4f}, max={ref_feats.max():.4f}")
-                # Check feature norms to see if already normalized
-                ref_norms = ref_feats.norm(dim=-1)
-                logger.info(
-                    f"Reference feature norms: min={ref_norms.min():.4f}, max={ref_norms.max():.4f}, mean={ref_norms.mean():.4f}"
-                )
-                # Check if all features are the same (would explain affinity=1 everywhere)
-                ref_feats_flat = ref_feats.reshape(-1, ref_feats.shape[-1])
-                feat_var = ref_feats_flat.var(dim=0).mean().item()
-                logger.info(f"Reference feature variance across pixels: {feat_var:.6f}")
-
-            # Features from get_mask_output are already normalized in the model
-            # Get query features at ALL click points on reference image
-            click_feats = []
-            for i, (cx, cy) in enumerate(click_points_scaled):
-                click_feat = ref_feats[cy, cx, :]
-                click_feats.append(click_feat)
-                if first_iteration:
-                    logger.info(f"Click feature {i} at ({cx}, {cy}): norm={click_feat.norm().item():.4f}")
-
-            if first_iteration and len(click_feats) > 0:
-                logger.info(f"Total click features: {len(click_feats)}")
-
             # Get features from TEST view (novel view where GT mask is)
             test_feats, _ = model.get_mask_output(test_model_input, scale=float(curr_scale))
             test_feats = test_feats[0]  # Remove batch dimension [H, W, F]
 
-            if first_iteration:
-                logger.info(f"Test features shape: {test_feats.shape} (expected: {test_img_h}x{test_img_w})")
-                logger.info(f"Test features stats: min={test_feats.min():.4f}, max={test_feats.max():.4f}")
-                test_norms = test_feats.norm(dim=-1)
-                logger.info(
-                    f"Test feature norms: min={test_norms.min():.4f}, max={test_norms.max():.4f}, mean={test_norms.mean():.4f}"
-                )
-                # Check if all features are the same
-                test_feats_flat = test_feats.reshape(-1, test_feats.shape[-1])
-                feat_var = test_feats_flat.var(dim=0).mean().item()
-                logger.info(f"Test feature variance across pixels: {feat_var:.6f}")
-                # Sample a few feature values from different pixels
-                logger.info(f"Test feat at (0,0) first 5: {test_feats[0, 0, :5].tolist()}")
-                mid_h, mid_w = test_feats.shape[0] // 2, test_feats.shape[1] // 2
-                logger.info(f"Test feat at ({mid_h},{mid_w}) first 5: {test_feats[mid_h, mid_w, :5].tolist()}")
-                first_iteration = False
+            # Pre-compute max negative affinity if using negative scribbles
+            max_neg_affinity = None
+            if negative_points_scaled:
+                neg_affinities = []
+                for neg_x, neg_y in negative_points_scaled:
+                    neg_feat = ref_feats[neg_y, neg_x, :]
+                    neg_aff = torch.einsum("hwf,f->hw", test_feats, neg_feat)
+                    neg_affinities.append(neg_aff)
+                # Stack and take max across all negative points
+                max_neg_affinity = torch.stack(neg_affinities, dim=0).max(dim=0)[0]  # [H, W]
 
-        # Calculate affinity (dot product) between each click feature and all test view pixels
-        # Features are already normalized in the model, so this is cosine similarity
-        # For multiple click points, take the MAX affinity (union of all matching regions)
-        affinities = []
-        for click_feat in click_feats:
-            aff = torch.einsum("hwf,f->hw", test_feats, click_feat)
-            affinities.append(aff)
+            # Compute mask for each click point independently at this scale
+            for point_idx, (cx, cy) in enumerate(click_points_scaled):
+                click_feat = ref_feats[cy, cx, :]
+                affinity = torch.einsum("hwf,f->hw", test_feats, click_feat)
 
-        # Union: take max across all click features
-        if len(affinities) == 1:
-            affinity = affinities[0]
-        else:
-            affinity = torch.stack(affinities, dim=0).max(dim=0)[0]
+                # Apply negative affinity suppression if available
+                if max_neg_affinity is not None:
+                    pos_mask = affinity >= config.affinity_threshold
 
-        # Threshold to get mask
-        mask = (affinity >= config.affinity_threshold).cpu().numpy().astype(np.uint8)
+                    if config.negative_mode == "dominate":
+                        # Keep pixels where positive affinity exceeds negative * weight
+                        # This requires pos to "dominate" neg by a factor of weight
+                        neg_mask = affinity > (max_neg_affinity * config.negative_weight)
+                        mask = (pos_mask & neg_mask).cpu().numpy()
+                    elif config.negative_mode == "subtract":
+                        # Original subtraction approach (aggressive)
+                        adjusted_affinity = affinity - config.negative_weight * max_neg_affinity
+                        mask = (adjusted_affinity >= config.affinity_threshold).cpu().numpy()
+                    elif config.negative_mode == "veto":
+                        # Veto mode: reject pixels where negative affinity exceeds threshold
+                        neg_mask = max_neg_affinity < config.negative_weight
+                        mask = (pos_mask & neg_mask).cpu().numpy()
+                    else:
+                        mask = pos_mask.cpu().numpy()
+                else:
+                    mask = (affinity >= config.affinity_threshold).cpu().numpy()
 
-        # Resize mask to match GT dimensions if needed
-        if mask.shape != gt_mask.shape:
-            mask = cv2.resize(mask, (gt_width, gt_height), interpolation=cv2.INTER_NEAREST)
+                # Resize mask to match GT dimensions if needed
+                if mask.shape != gt_mask.shape:
+                    mask = cv2.resize(mask.astype(np.uint8), (gt_width, gt_height), interpolation=cv2.INTER_NEAREST)
 
-        # Calculate IoU
-        iou = calculate_iou(mask, gt_mask)
+                all_masks[point_idx].append(mask.astype(bool))
 
+        # Clear GPU memory after each scale
+        del ref_feats, test_feats
+        if max_neg_affinity is not None:
+            del max_neg_affinity
+        torch.cuda.empty_cache()
+
+    logger.info(f"Pre-computed {num_points} x {num_scales} masks on CPU")
+
+    # Helper functions for IoU calculation
+    def calc_iou_np(pred: np.ndarray, gt: np.ndarray) -> float:
+        intersection = np.sum(pred & gt)
+        union = np.sum(pred | gt)
+        return float(intersection / union) if union > 0 else 0.0
+
+    def calc_accuracy_np(pred: np.ndarray, gt: np.ndarray) -> float:
+        return float(np.sum(pred == gt) / pred.size)
+
+    gt_mask_bool = gt_mask.astype(bool)
+
+    # Strategy 1: Single scale for all points
+    logger.info("Strategy 1: Finding best single scale for all points...")
+    for scale_idx in range(num_scales):
+        # Union all point masks at this scale
+        combined_mask = np.zeros_like(gt_mask, dtype=bool)
+        for point_idx in range(num_points):
+            combined_mask |= all_masks[point_idx][scale_idx]
+
+        iou = calc_iou_np(combined_mask, gt_mask_bool)
         if iou > best_iou:
             best_iou = iou
-            best_acc = calculate_accuracy(mask, gt_mask)
-            best_scale = curr_scale
-            best_mask = mask
+            best_acc = calc_accuracy_np(combined_mask, gt_mask_bool)
+            best_scale = float(scale_range[scale_idx])
+            best_mask = combined_mask.astype(np.uint8)
+            best_per_point_scales = [best_scale] * num_points
+            best_affinity_scales = [scale_idx] * num_points
 
-    logger.info(f"Scene {scene_name}: Best IoU = {best_iou:.4f}, Acc = {best_acc:.4f} at scale {best_scale:.4f}")
+    logger.info(f"  Single-scale best: IoU = {best_iou:.4f} at scale {best_scale:.4f}")
 
-    # Save best affinity map for debugging
+    # Strategy 2: Per-point optimal scales (greedy)
+    if num_points > 1:
+        logger.info("Strategy 2: Finding per-point optimal scales...")
+
+        # Find best individual scale for each point
+        point_best_scales: list[int] = []
+        for point_idx in range(num_points):
+            best_point_iou = 0.0
+            best_scale_idx = 0
+            for scale_idx in range(num_scales):
+                iou = calc_iou_np(all_masks[point_idx][scale_idx], gt_mask_bool)
+                if iou > best_point_iou:
+                    best_point_iou = iou
+                    best_scale_idx = scale_idx
+            point_best_scales.append(best_scale_idx)
+            logger.info(
+                f"  Point {point_idx}: best individual scale = {scale_range[best_scale_idx]:.4f} "
+                f"(IoU={best_point_iou:.4f})"
+            )
+
+        # Compute combined mask with per-point best scales
+        def get_combined_mask_np(scale_indices: list[int]) -> np.ndarray:
+            combined = np.zeros_like(gt_mask, dtype=bool)
+            for p_idx, s_idx in enumerate(scale_indices):
+                combined |= all_masks[p_idx][s_idx]
+            return combined
+
+        combined_mask = get_combined_mask_np(point_best_scales)
+        multi_scale_iou = calc_iou_np(combined_mask, gt_mask_bool)
+        multi_scale_acc = calc_accuracy_np(combined_mask, gt_mask_bool)
+        logger.info(f"  Per-point scales combined: IoU = {multi_scale_iou:.4f}")
+
+        # Greedy refinement - optimized by pre-computing "other masks" union
+        improved = True
+        iteration = 0
+        while improved and iteration < 10:
+            improved = False
+            iteration += 1
+
+            for point_idx in range(num_points):
+                current_scale_idx = point_best_scales[point_idx]
+                best_new_iou = multi_scale_iou
+                best_new_scale_idx = current_scale_idx
+
+                # Pre-compute the "other points" combined mask (excluding current point)
+                other_combined = np.zeros_like(gt_mask, dtype=bool)
+                for p_idx in range(num_points):
+                    if p_idx != point_idx:
+                        other_combined |= all_masks[p_idx][point_best_scales[p_idx]]
+
+                # Try each scale for this point
+                for test_scale_idx in range(num_scales):
+                    test_combined = other_combined | all_masks[point_idx][test_scale_idx]
+                    test_iou = calc_iou_np(test_combined, gt_mask_bool)
+                    if test_iou > best_new_iou + 1e-6:
+                        best_new_iou = test_iou
+                        best_new_scale_idx = test_scale_idx
+
+                if best_new_scale_idx != current_scale_idx:
+                    point_best_scales[point_idx] = best_new_scale_idx
+                    multi_scale_iou = best_new_iou
+                    improved = True
+
+            if improved:
+                combined_mask = get_combined_mask_np(point_best_scales)
+                multi_scale_acc = calc_accuracy_np(combined_mask, gt_mask_bool)
+
+        logger.info(f"  After refinement (iter={iteration}): IoU = {multi_scale_iou:.4f}")
+
+        # Use multi-scale result if better than single scale
+        if multi_scale_iou > best_iou:
+            best_iou = multi_scale_iou
+            best_acc = multi_scale_acc
+            best_mask = combined_mask.astype(np.uint8)
+            best_per_point_scales = [float(scale_range[idx]) for idx in point_best_scales]
+            best_affinity_scales = point_best_scales
+            best_scale = -1.0  # Indicate multi-scale was used
+            logger.info(f"  Using per-point scales: {[f'{s:.4f}' for s in best_per_point_scales]}")
+
+    logger.info(f"Scene {scene_name}: Best IoU = {best_iou:.4f}, Acc = {best_acc:.4f}")
+    if best_scale > 0:
+        logger.info(f"  Using single scale: {best_scale:.4f}")
+    else:
+        logger.info(f"  Using per-point scales: {[f'{s:.4f}' for s in best_per_point_scales]}")
+
+    # Recompute best affinities for visualization (only the needed scales)
+    logger.info("Computing affinity maps for visualization...")
+    best_affinities: list[tuple[int, np.ndarray]] = []
+    unique_scales = sorted(set(best_affinity_scales))
+
     with torch.no_grad():
-        ref_feats, _ = model.get_mask_output(ref_model_input, scale=float(best_scale))
-        ref_feats = ref_feats[0]
-        test_feats, _ = model.get_mask_output(test_model_input, scale=float(best_scale))
-        test_feats = test_feats[0]
+        for scale_idx in unique_scales:
+            curr_scale = scale_range[scale_idx]
+            ref_feats, _ = model.get_mask_output(ref_model_input, scale=float(curr_scale))
+            ref_feats = ref_feats[0]
+            test_feats, _ = model.get_mask_output(test_model_input, scale=float(curr_scale))
+            test_feats = test_feats[0]
 
-        # Compute union affinity from all click points
-        affinities = []
-        for (cx, cy) in click_points_scaled:
-            click_feat = ref_feats[cy, cx, :]
-            aff = torch.einsum("hwf,f->hw", test_feats, click_feat)
-            affinities.append(aff)
+            for point_idx, (cx, cy) in enumerate(click_points_scaled):
+                if best_affinity_scales[point_idx] == scale_idx:
+                    click_feat = ref_feats[cy, cx, :]
+                    affinity = torch.einsum("hwf,f->hw", test_feats, click_feat)
+                    # Resize if needed
+                    if affinity.shape[0] != gt_height or affinity.shape[1] != gt_width:
+                        affinity = torch.nn.functional.interpolate(
+                            affinity.unsqueeze(0).unsqueeze(0),
+                            size=(gt_height, gt_width),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze()
+                    best_affinities.append((point_idx, affinity.cpu().numpy()))
 
-        if len(affinities) == 1:
-            best_affinity = affinities[0].cpu().numpy()
-        else:
-            best_affinity = torch.stack(affinities, dim=0).max(dim=0)[0].cpu().numpy()
+            del ref_feats, test_feats
+            torch.cuda.empty_cache()
+
+    # Sort by point index and extract affinities
+    best_affinities.sort(key=lambda x: x[0])
+    affinities_list = [aff for _, aff in best_affinities]
+
+    if len(affinities_list) == 1:
+        best_affinity = affinities_list[0]
+    else:
+        best_affinity = np.maximum.reduce(affinities_list)
 
     logger.info(
         f"Best affinity stats: min={best_affinity.min():.4f}, max={best_affinity.max():.4f}, mean={best_affinity.mean():.4f}"
@@ -645,32 +1106,41 @@ def run_nvos_evaluation(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load the reference image for visualization (where click point is)
-    ref_img = np.zeros((ref_orig_height, ref_orig_width, 3), dtype=np.uint8)
+    # Prefer the full-resolution labels reference image, then fall back to scene images.
+    ref_img = None
+    ref_img_loaded_from = None
     if ref_img_path is not None:
+        logger.info(f"Loading reference image from labels directory: {ref_img_path}")
         ref_img_bgr = cv2.imread(str(ref_img_path))
         if ref_img_bgr is not None:
             ref_img = cv2.cvtColor(ref_img_bgr, cv2.COLOR_BGR2RGB)
+            ref_img_loaded_from = ref_img_path
+            logger.info(f"Loaded reference image from labels: {ref_img_path} shape={ref_img.shape}")
+        else:
+            logger.warning(f"Failed to read reference image from labels: {ref_img_path}")
+
+    if ref_img is None:
+        ref_img, ref_img_loaded_from = load_scene_image_by_id(sfm_scene, ref_image_id_num, scene_path, logger)
+        if ref_img is not None and ref_img_loaded_from is not None:
+            logger.info(f"Loaded reference image from scene: {ref_img_loaded_from} shape={ref_img.shape}")
+
+    # Final fallback to zeros
+    if ref_img is None:
+        logger.warning(
+            f"Reference image not found for {ref_image_id}, using placeholder size=({ref_orig_width}x{ref_orig_height})"
+        )
+        ref_img = np.zeros((ref_orig_height, ref_orig_width, 3), dtype=np.uint8)
+    else:
+        # Update dimensions from actual loaded image
+        ref_orig_height, ref_orig_width = ref_img.shape[:2]
+        logger.info(f"Reference image final size: {ref_orig_width}x{ref_orig_height}")
 
     # Load the test image for visualization (where GT mask is)
-    # The test image is in the scene's images directory, not the masks directory
-    scene_images_dir = scene_path / "images"
-    test_img_path = None
-    for ext in [".JPG", ".jpg", ".png", ".PNG"]:
-        candidate = scene_images_dir / f"{gt_image_id}{ext}"
-        if candidate.exists():
-            test_img_path = candidate
-            break
-
-    if test_img_path is not None:
-        test_img_bgr = cv2.imread(str(test_img_path))
-        if test_img_bgr is not None:
-            test_img = cv2.cvtColor(test_img_bgr, cv2.COLOR_BGR2RGB)
-            logger.debug(f"Loaded test image from {test_img_path}: {test_img.shape}")
-        else:
-            logger.warning(f"Failed to read test image: {test_img_path}")
-            test_img = np.zeros((gt_height, gt_width, 3), dtype=np.uint8)
+    test_img, test_img_path = load_scene_image_by_id(sfm_scene, test_image_id_num, scene_path, logger)
+    if test_img is not None and test_img_path is not None:
+        logger.debug(f"Loaded test image from {test_img_path}: {test_img.shape}")
     else:
-        logger.warning(f"Test image not found in {scene_images_dir}")
+        logger.warning("Test image not found in scene, using placeholder")
         test_img = np.zeros((gt_height, gt_width, 3), dtype=np.uint8)
 
     # Also render reference view at model resolution to show where click is sampled
@@ -687,36 +1157,169 @@ def run_nvos_evaluation(
         ref_render_np = ref_render[0].cpu().numpy()
         ref_render_np = np.clip(ref_render_np, 0, 1)
 
-    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+    # Compute accurate 3D reprojected click points for test view visualization
+    # 1. Find which Gaussian is visible at each click point in reference view
+    # 2. Look up that Gaussian's 3D world position
+    # 3. Project to test view using test camera parameters
+    click_points_test_3d: list[Tuple[int, int] | None] = []
+    with torch.no_grad():
+        # Create pixel coordinates for sparse rendering (only at click points)
+        # JaggedTensor expects one list per camera, so we create a single tensor with all pixels
+        # IMPORTANT: sparse_render expects (row, col) = (y, x) format, but click_points_scaled is (x, y)
+        all_pixels_yx = torch.tensor(
+            [(cy, cx) for (cx, cy) in click_points_scaled], device=device, dtype=torch.int64
+        )  # [N, 2] in (y, x) format
+        pixel_coords = fvdb.JaggedTensor([all_pixels_yx])  # Single camera, N pixels
+
+        # Get the top contributing Gaussian ID at each click point
+        ids, _ = model.gs_model.sparse_render_contributing_gaussian_ids(
+            pixels_to_render=pixel_coords,
+            top_k_contributors=1,
+            world_to_camera_matrices=torch.linalg.inv(ref_c2w).contiguous(),
+            projection_matrices=ref_K,
+            image_width=ref_img_w,
+            image_height=ref_img_h,
+            near=0.01,
+            far=1e10,
+        )
+
+        # Get world coordinates for test camera projection
+        test_w2c = torch.linalg.inv(test_c2w).squeeze(0)  # World to camera for test view [4, 4]
+        test_K_mat = test_K.squeeze(0)  # Remove batch dim [3, 3]
+
+        ids_data = ids.jdata
+
+        for i, (cx, cy) in enumerate(click_points_scaled):
+            # Get the Gaussian ID for this click point
+            # Handle both 1D [N*top_k] and 2D [N, top_k] shapes
+            if ids_data.ndim == 2:
+                g_id = int(ids_data[i, 0].item()) if ids_data.shape[1] > 0 else -1
+            else:
+                # 1D tensor: index directly (top_k=1, so each element is one pixel's result)
+                g_id = int(ids_data[i].item()) if i < len(ids_data) else -1
+
+            if g_id >= 0 and g_id < model.gs_model.means.shape[0]:
+                # Get the 3D world position of this Gaussian
+                world_pt = model.gs_model.means[g_id]  # [3]
+
+                # Transform to test camera space: p_cam = w2c @ [p_world, 1]
+                world_pt_h = torch.cat([world_pt, torch.ones(1, device=device)])  # [4]
+                cam_pt = test_w2c @ world_pt_h  # [4]
+
+                # Project to 2D: p_2d = K @ p_cam[:3] / p_cam[2]
+                if cam_pt[2] > 0:  # Only if point is in front of camera
+                    p_2d = test_K_mat @ cam_pt[:3]
+                    u = (p_2d[0] / p_2d[2]).item()
+                    v = (p_2d[1] / p_2d[2]).item()
+
+                    # Scale from model resolution to test image display resolution
+                    test_orig_height_tmp, test_orig_width_tmp = test_img.shape[:2]
+                    u_display = int(u * test_orig_width_tmp / test_img_w)
+                    v_display = int(v * test_orig_height_tmp / test_img_h)
+
+                    click_points_test_3d.append((u_display, v_display))
+                    logger.debug(f"Click point {i}: 3D pos {world_pt.tolist()} -> test view ({u_display}, {v_display})")
+                else:
+                    click_points_test_3d.append(None)
+                    logger.debug(f"Click point {i}: behind test camera")
+            else:
+                click_points_test_3d.append(None)
+                logger.debug(f"Click point {i}: no valid Gaussian ID (g_id={g_id})")
+
+    # Create figure with landscape subplots to match image aspect ratios (~4:3)
+    # With 5 columns at 6" wide and 2 rows at 4" tall, each subplot is ~6:4 = 3:2 (landscape)
+    fig = plt.figure(figsize=(30, 9))
+    gs = fig.add_gridspec(2, 5, width_ratios=[1, 1, 1, 1, 1], height_ratios=[1, 1], wspace=0.02, hspace=0.12)
+    axes = np.array([[fig.add_subplot(gs[i, j]) for j in range(5)] for i in range(2)])
+
+    # Define a common display size for consistent visualization (use GT mask dimensions)
+    display_width, display_height = gt_width, gt_height
 
     # Row 1: Reference and Test images
-    # Reference image with click points (original resolution)
-    axes[0, 0].imshow(ref_img)
-    # Plot all click points with different colors
-    colors = plt.cm.Set1(np.linspace(0, 1, max(len(click_points), 1)))
-    for i, (cx, cy) in enumerate(click_points):
-        axes[0, 0].scatter([cx], [cy], c=[colors[i]], s=150, marker="*", edgecolors="white", linewidths=1)
-        axes[0, 0].annotate(f"{i}", (cx, cy), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8)
+    cmap = plt.colormaps.get_cmap("Set1")
     num_pts = len(click_points)
-    pts_str = f"{num_pts} pts" if num_pts > 1 else f"({click_points[0][0]}, {click_points[0][1]})"
-    axes[0, 0].set_title(
-        f"Reference Image ({ref_image_id})\n{pts_str} @ {ref_orig_width}x{ref_orig_height}"
+    colors = cmap(np.linspace(0, 1, max(num_pts, 1)))
+
+    # Reference image with click points - resize to common display size
+    ref_scale_x = display_width / ref_orig_width
+    ref_scale_y = display_height / ref_orig_height
+    logger.info(
+        f"DEBUG: ref_img shape={ref_img.shape}, ref_orig=({ref_orig_width}x{ref_orig_height}), display=({display_width}x{display_height})"
     )
+    ref_img_display = cv2.resize(ref_img, (display_width, display_height))
+    logger.info(f"DEBUG: ref_img_display shape={ref_img_display.shape}")
+    axes[0, 0].imshow(
+        ref_img_display,
+        extent=[0, display_width, display_height, 0],
+        aspect="auto",
+    )
+    axes[0, 0].set_xlim(0, display_width)
+    axes[0, 0].set_ylim(display_height, 0)
+    for i, (cx, cy) in enumerate(click_points):
+        cx_disp = int(cx * ref_scale_x)
+        cy_disp = int(cy * ref_scale_y)
+        axes[0, 0].scatter([cx_disp], [cy_disp], c=[colors[i]], s=25, marker="*", edgecolors="white", linewidths=1)
+        axes[0, 0].annotate(
+            f"{i}", (cx_disp, cy_disp), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8
+        )
+    # Draw negative points as red X markers
+    if negative_points:
+        for j, (nx, ny) in enumerate(negative_points):
+            nx_disp = int(nx * ref_scale_x)
+            ny_disp = int(ny * ref_scale_y)
+            axes[0, 0].scatter([nx_disp], [ny_disp], c="red", s=20, marker="x", linewidths=1.5)
+    pts_str = f"{num_pts} pts" if num_pts > 1 else f"({click_points[0][0]}, {click_points[0][1]})"
+    neg_str = f", {len(negative_points)} neg" if negative_points else ""
+    axes[0, 0].set_title(f"Reference Image ({ref_image_id})\n{pts_str}{neg_str} @ {ref_orig_width}x{ref_orig_height}")
     axes[0, 0].axis("off")
 
-    # Rendered reference at model resolution with scaled click points
-    axes[0, 1].imshow(ref_render_np)
+    # Rendered reference at model resolution - resize to common display size
+    render_scale_x = display_width / ref_img_w
+    render_scale_y = display_height / ref_img_h
+    ref_render_display = cv2.resize(ref_render_np, (display_width, display_height))
+    axes[0, 1].imshow(ref_render_display)
     for i, (cx, cy) in enumerate(click_points_scaled):
-        axes[0, 1].scatter([cx], [cy], c=[colors[i]], s=150, marker="*", edgecolors="white", linewidths=1)
-        axes[0, 1].annotate(f"{i}", (cx, cy), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8)
-    axes[0, 1].set_title(
-        f"Rendered Ref (model res)\n{num_pts} pts @ {ref_img_w}x{ref_img_h}"
-    )
+        cx_disp = int(cx * render_scale_x)
+        cy_disp = int(cy * render_scale_y)
+        axes[0, 1].scatter([cx_disp], [cy_disp], c=[colors[i]], s=25, marker="*", edgecolors="white", linewidths=1)
+        axes[0, 1].annotate(
+            f"{i}", (cx_disp, cy_disp), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8
+        )
+    # Draw negative points as red X markers
+    if negative_points_scaled:
+        for j, (nx, ny) in enumerate(negative_points_scaled):
+            nx_disp = int(nx * render_scale_x)
+            ny_disp = int(ny * render_scale_y)
+            axes[0, 1].scatter([nx_disp], [ny_disp], c="red", s=20, marker="x", linewidths=1.5)
+    neg_str = f", {len(negative_points_scaled)} neg" if negative_points_scaled else ""
+    axes[0, 1].set_title(f"Rendered Ref (model res)\n{num_pts} pts{neg_str} @ {ref_img_w}x{ref_img_h}")
     axes[0, 1].axis("off")
 
-    # Test image (novel view)
-    axes[0, 2].imshow(test_img)
-    axes[0, 2].set_title(f"Test Image ({gt_image_id})")
+    # Test image (novel view) - resize to common display size
+    test_orig_h, test_orig_w = test_img.shape[:2]
+    test_scale_x = display_width / test_orig_w
+    test_scale_y = display_height / test_orig_h
+    test_img_display = cv2.resize(test_img, (display_width, display_height))
+    axes[0, 2].imshow(
+        test_img_display,
+        extent=[0, display_width, display_height, 0],
+        aspect="auto",
+    )
+    axes[0, 2].set_xlim(0, display_width)
+    axes[0, 2].set_ylim(display_height, 0)
+    valid_pts_count = 0
+    for i, pt in enumerate(click_points_test_3d):
+        if pt is not None:
+            cx_test, cy_test = pt
+            # Scale reprojected points to display resolution
+            cx_disp = int(cx_test * test_scale_x)
+            cy_disp = int(cy_test * test_scale_y)
+            axes[0, 2].scatter([cx_disp], [cy_disp], c=[colors[i]], s=25, marker="*", edgecolors="white", linewidths=1)
+            axes[0, 2].annotate(
+                f"{i}", (cx_disp, cy_disp), xytext=(5, 5), textcoords="offset points", color="white", fontsize=8
+            )
+            valid_pts_count += 1
+    axes[0, 2].set_title(f"Test Image ({gt_image_id})\n{valid_pts_count}/{num_pts} pts (3D reprojected)")
     axes[0, 2].axis("off")
 
     # Ground truth mask
@@ -727,7 +1330,15 @@ def run_nvos_evaluation(
     # Predicted mask
     if best_mask is not None:
         axes[0, 4].imshow(best_mask, cmap="gray")
-        axes[0, 4].set_title(f"Predicted Mask\n(scale={best_scale:.4f})")
+        if best_scale > 0:
+            axes[0, 4].set_title(f"Predicted Mask\n(single scale={best_scale:.4f})")
+        else:
+            # Show per-point scales (abbreviated if too many)
+            if len(best_per_point_scales) <= 3:
+                scales_str = ", ".join([f"{s:.3f}" for s in best_per_point_scales])
+            else:
+                scales_str = f"{len(best_per_point_scales)} scales"
+            axes[0, 4].set_title(f"Predicted Mask\n(multi-scale: {scales_str})")
     else:
         axes[0, 4].set_title("No mask found")
     axes[0, 4].axis("off")
@@ -777,7 +1388,6 @@ def run_nvos_evaluation(
     axes[1, 4].axis("off")
 
     fig.suptitle(f"NVOS Evaluation: {scene_name}")
-    fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -787,11 +1397,15 @@ def run_nvos_evaluation(
         "scene": scene_name,
         "best_iou": best_iou,
         "best_acc": best_acc,
-        "best_scale": best_scale,
+        "best_scale": best_scale if best_scale > 0 else None,
+        "per_point_scales": best_per_point_scales if best_scale <= 0 else None,
+        "multi_scale_used": best_scale <= 0,
         "gt_mask_path": str(gt_mask_path),
         "click_points": click_points,
         "input_mode": config.input_mode,
         "num_click_points": len(click_points),
+        "num_negative_points": len(negative_points) if negative_points else 0,
+        "used_negative_scribbles": config.use_negative_scribbles and len(negative_points) > 0,
     }
 
 
@@ -858,6 +1472,54 @@ def main():
         help="JSON file containing input points for each scene (only used with --input-mode points)",
     )
     parser.add_argument(
+        "--eval-downsample",
+        type=int,
+        default=1,
+        help="Downsample factor for evaluation rendering. Use 4 for SAGA-style evaluation "
+        "(reduces memory usage significantly). Default 1 = no downsampling.",
+    )
+    parser.add_argument(
+        "--use-negative-scribbles",
+        action="store_true",
+        help="Use negative scribbles from NVOS dataset to suppress false positives. "
+        "Works with both 'scribbles' and 'points' input modes.",
+    )
+    parser.add_argument(
+        "--negative-weight",
+        type=float,
+        default=1.0,
+        help="Weight for negative affinity subtraction: final = pos - weight * max_neg. "
+        "Higher values more aggressively suppress regions similar to negative scribbles.",
+    )
+    parser.add_argument(
+        "--max-negative-points",
+        type=int,
+        default=10,
+        help="Maximum number of negative points to sample from the negative scribble.",
+    )
+    parser.add_argument(
+        "--negative-mode",
+        type=str,
+        choices=["dominate", "subtract", "veto"],
+        default="dominate",
+        help="How to combine positive and negative affinities: "
+        "'dominate' (default) keeps pixels where pos > neg * weight; "
+        "'subtract' uses pos - weight * neg >= threshold (aggressive); "
+        "'veto' rejects pixels where neg >= weight threshold.",
+    )
+    parser.add_argument(
+        "--saga-style-scribbles",
+        action="store_true",
+        help="Use SAGA-style multi-point sampling from positive scribbles (skeletonization + random sampling). "
+        "Only applies when --input-mode is 'scribbles'. Produces multiple positive points instead of one.",
+    )
+    parser.add_argument(
+        "--max-positive-points",
+        type=int,
+        default=20,
+        help="Maximum number of positive points when using --saga-style-scribbles.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -885,11 +1547,27 @@ def main():
         verbose=args.verbose,
         input_mode=args.input_mode,
         input_points_file=args.input_points_file,
+        eval_downsample=args.eval_downsample,
+        use_negative_scribbles=args.use_negative_scribbles,
+        negative_weight=args.negative_weight,
+        max_negative_points=args.max_negative_points,
+        negative_mode=args.negative_mode,
+        saga_style_scribbles=args.saga_style_scribbles,
+        max_positive_points=args.max_positive_points,
     )
 
     logger.info(f"Input mode: {config.input_mode}")
+    if config.input_mode == "scribbles" and config.saga_style_scribbles:
+        logger.info(f"SAGA-style scribbles: max {config.max_positive_points} positive points")
     if config.input_mode == "points":
         logger.info(f"Input points file: {config.input_points_file}")
+    if config.eval_downsample > 1:
+        logger.info(f"Evaluation downsample: {config.eval_downsample}x (SAGA-style)")
+    if config.use_negative_scribbles:
+        logger.info(
+            f"Using negative scribbles: mode={config.negative_mode}, weight={config.negative_weight}, "
+            f"max_points={config.max_negative_points}"
+        )
 
     # Determine which scenes to evaluate
     if args.scenes:
@@ -936,11 +1614,15 @@ def main():
         mean_iou = np.mean(ious)
         mean_acc = np.mean(accs)
 
-        logger.info(f"{'Scene':<20} {'IoU':>10} {'Acc %':>10} {'Scale':>10}")
-        logger.info("-" * 52)
+        logger.info(f"{'Scene':<20} {'IoU':>10} {'Acc %':>10} {'Scale(s)':>15}")
+        logger.info("-" * 57)
         for r in results:
-            logger.info(f"{r['scene']:<20} {r['best_iou']:>10.4f} {r['best_acc']*100:>10.2f} {r['best_scale']:>10.4f}")
-        logger.info("-" * 52)
+            if r.get("multi_scale_used"):
+                scale_str = f"multi({r['num_click_points']})"
+            else:
+                scale_str = f"{r['best_scale']:.4f}" if r["best_scale"] else "N/A"
+            logger.info(f"{r['scene']:<20} {r['best_iou']:>10.4f} {r['best_acc']*100:>10.2f} {scale_str:>15}")
+        logger.info("-" * 57)
         logger.info(f"{'Mean':<20} {mean_iou:>10.4f} {mean_acc*100:>10.2f}")
 
         # Save results to JSON
@@ -959,6 +1641,11 @@ def main():
                         "affinity_threshold": config.affinity_threshold,
                         "input_mode": config.input_mode,
                         "input_points_file": str(config.input_points_file) if config.input_mode == "points" else None,
+                        "eval_downsample": config.eval_downsample,
+                        "use_negative_scribbles": config.use_negative_scribbles,
+                        "negative_mode": config.negative_mode if config.use_negative_scribbles else None,
+                        "negative_weight": config.negative_weight if config.use_negative_scribbles else None,
+                        "max_negative_points": config.max_negative_points if config.use_negative_scribbles else None,
                     },
                 },
                 f,
