@@ -12,7 +12,6 @@ from fvdb import GaussianSplat3d
 from garfvdb.config import GARfVDBModelConfig
 from garfvdb.training.dataset import GARfVDBInput
 from garfvdb.util import rgb_to_sh
-from sklearn.preprocessing import QuantileTransformer
 
 
 class SparseConvWithSkips(torch.nn.Module):
@@ -130,13 +129,13 @@ class GARfVDBModel(torch.nn.Module):
         # we need to register a post hook to add it to the state dict.
         self.register_state_dict_post_hook(self._state_dict_post_hook)
 
-        self.device = device
+        self.device = torch.device(device)
         self.model_config = model_config
         self.gs_model = gs_model
 
         # Build the quantile transformer
         self._max_scale = torch.max(scale_stats)
-        self._quantile_transformer = self._get_quantile_func(scale_stats)
+        self._quantile_transformer = self._get_quantile_func(scale_stats, device=self.device)
 
         # --- Encoded Features ---
         # When use_grid=True: Use GARField-style encoding with 3D feature grids at
@@ -296,45 +295,73 @@ class GARfVDBModel(torch.nn.Module):
         return model
 
     def _get_quantile_func(
-        self, scales: torch.Tensor, distribution: Literal["uniform", "normal"] = "normal"
+        self,
+        scales: torch.Tensor,
+        device: torch.device,
+        distribution: Literal["uniform", "normal"] = "normal",
+        n_quantiles: int = 1000,
     ) -> Callable[[torch.Tensor], torch.Tensor]:
         """Produces a quantile transformer used to normalize scales with 3D scale statistics.
 
+        This is a PyTorch implementation that stays entirely on GPU and provides
+        true gradients via linear interpolation (rather than identity gradients).
+
         Args:
-            scales: [N] Tensor of scales
-            distribution: Distribution to use for the quantile transformer
+            scales: [N] Tensor of scales (can be on any device, will be used for fitting only)
+            device: Target device for the precomputed quantile tensors (should match training device)
+            distribution: Distribution to use for the quantile transformer ("uniform" or "normal")
+            n_quantiles: Number of quantiles to compute for the empirical CDF
 
         Returns:
-            Callable: The quantile transformer
+            Callable: The quantile transformer function
         """
         scales = scales.flatten()
         scales = scales[(scales > 0) & (scales < self.max_grouping_scale.item())]
 
-        scales_np = scales.detach().cpu().numpy()
+        # Compute quantile levels and corresponding values, then move to target device
+        quantile_levels = torch.linspace(0, 1, n_quantiles, device=scales.device, dtype=scales.dtype)
+        quantile_values = torch.quantile(scales.detach(), quantile_levels).to(device)
 
-        # Calculate quantile transformer
-        quantile_transformer = QuantileTransformer(output_distribution=distribution)
-        quantile_transformer = quantile_transformer.fit(scales_np.reshape(-1, 1))
+        # Pre-compute output distribution targets on target device
+        quantile_levels = quantile_levels.to(device)
+        if distribution == "normal":
+            # Standard normal quantiles (clip to avoid inf at extremes)
+            clamped_levels = quantile_levels.clamp(1e-7, 1 - 1e-7)
+            output_quantiles = torch.erfinv(2 * clamped_levels - 1) * (2**0.5)  # inverse normal CDF
+        else:  # uniform
+            output_quantiles = quantile_levels
 
-        def quantile_transformer_func(scales: torch.Tensor) -> torch.Tensor:
-            # This function acts as a wrapper for QuantileTransformer.
-            # QuantileTransformer expects a numpy array.
-            # We need to preserve gradients, so we detach for the transform but then
-            # re-attach gradients by using the original tensor in the computation
-            scales_np = scales.detach().cpu().numpy()
-            transformed_np = quantile_transformer.transform(scales_np)
-            transformed = torch.from_numpy(transformed_np).to(scales.device, dtype=scales.dtype)
+        def quantile_transformer_func(x: torch.Tensor) -> torch.Tensor:
+            """Transform input values using the pre-computed quantile mapping.
 
-            # Create a differentiable path: use the transformed values but maintain gradient flow
-            # by making it a function of the original scales. We do this by treating the
-            # transform as approximately linear locally and using the identity gradient.
-            # This is an approximation but allows training to proceed.
-            if scales.requires_grad:
-                # Detach the transformed values and re-attach to the computation graph
-                # by adding a zero-gradient operation
-                transformed = transformed + (scales - scales.detach())
+            Uses linear interpolation for true gradients: the gradient is the slope
+            of the piecewise-linear CDF approximation, which correctly reflects that
+            changes in dense regions matter less than changes in sparse regions.
+            """
+            original_shape = x.shape
+            x_flat = x.reshape(-1)
 
-            return transformed
+            # Find indices where each value falls in the quantile distribution
+            # searchsorted returns the index where x would be inserted to maintain sorted order
+            indices = torch.searchsorted(quantile_values, x_flat).clamp(1, n_quantiles - 1)
+
+            # Get surrounding quantile values for interpolation
+            lower_q = quantile_values[indices - 1]
+            upper_q = quantile_values[indices]
+
+            # Compute interpolation weight
+            # weight = (x - lower_q) / (upper_q - lower_q)
+            denom = upper_q - lower_q
+            # Avoid division by zero for flat regions
+            denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+            weight = ((x_flat - lower_q) / denom).clamp(0, 1)
+
+            # Interpolate in output space
+            lower_out = output_quantiles[indices - 1]
+            upper_out = output_quantiles[indices]
+            transformed = lower_out + weight * (upper_out - lower_out)
+
+            return transformed.reshape(original_shape)
 
         return quantile_transformer_func
 
@@ -561,26 +588,32 @@ class GARfVDBModel(torch.nn.Module):
                 return enc_feats.jdata.reshape(len(enc_feats), img_h, img_w, -1, feature_size)
 
     @nvtx.range("GARfVDBModel.get_mlp_output")
-    def get_mlp_output(self, enc_feats: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    def get_mlp_output(self, enc_feats: torch.Tensor, scales: torch.Tensor | float) -> torch.Tensor:
         """Get the MLP output for the given encoder features and scales.
 
         Args:
             enc_feats: Encoder features [B, R, S, F] or [B, H, W, S, F]
-            scales: Scales [B, R] or [B, H, W]
+            scales: Either a scalar (float/int) for uniform scale across all pixels,
+                    or a tensor [B, R] or [B, H, W] for per-pixel scales
 
         Returns:
             MLP output [B, R, F] or [B, H, W, F]
         """
         epsilon = 1e-5
 
-        # Process scales
-        # Flatten for processing
-        scales_flat = scales.reshape(-1)
-        scales_flat = scales_flat.contiguous().view(-1, 1)
-        scales_quant = self.quantile_transformer(scales_flat).to(scales_flat.device)
-        scales_quant = scales_quant.reshape(enc_feats.shape[:-1]).unsqueeze(-1)
-
-        in_feats = torch.cat([enc_feats, scales_quant], dim=-1)
+        # Process scales through quantile transformer and concatenate with features
+        if isinstance(scales, (int, float)):
+            # transform once and use F.pad to append constant value
+            scale_tensor = torch.tensor([scales], device=enc_feats.device, dtype=enc_feats.dtype)
+            scale_value = self.quantile_transformer(scale_tensor).item()
+            # Pad last dimension with constant scale value: (left_pad, right_pad)
+            in_feats = torch.nn.functional.pad(enc_feats, (0, 1), value=scale_value)
+        else:
+            # transform per-pixel scales (used during training)
+            # scales: [B, R] or [B, H, W] -> scales_quant: [B, R, S, 1] or [B, H, W, S, 1]
+            scales_quant = self.quantile_transformer(scales)
+            scales_quant = scales_quant.unsqueeze(-1).expand(enc_feats.shape[:-1]).unsqueeze(-1)
+            in_feats = torch.cat([enc_feats, scales_quant], dim=-1)
 
         # Apply MLP
         gfeats = self.mlp(in_feats)
@@ -603,6 +636,7 @@ class GARfVDBModel(torch.nn.Module):
         Returns:
             Mask output [B, H, W, mlp_output_dim]
         """
+        torch.cuda.synchronize()
         img_w = input["image_w"][0]
         img_h = input["image_h"][0]
 
@@ -612,41 +646,54 @@ class GARfVDBModel(torch.nn.Module):
 
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
-            world_pts = fvdb.JaggedTensor([self.gs_model.means for _ in range(self.encoder_gridbatch.grid_count)])
+
+            # repeat the gaussian means for each grid
+            num_points = self.gs_model.means.shape[0]
+            grid_count = self.encoder_gridbatch.grid_count
+            repeated_data = self.gs_model.means.repeat(grid_count, 1)
+            # Create offsets: [0, N, 2N, 3N, ..., grid_count*N]
+            offsets = torch.arange(
+                0, (grid_count + 1) * num_points, num_points, device=self.gs_model.means.device, dtype=torch.long
+            )
+            world_pts = fvdb.JaggedTensor.from_data_and_offsets(repeated_data, offsets)
+
             if self.model_config.use_grid_conv:
                 conv_output = self.encoder_convnet(self.encoder_grids)
                 enc_feats = conv_output.sample_trilinear(world_pts)
             else:
-                enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
-            # NOTE: Cast is just to satisfy the type checker
-            enc_feats = torch.cat(cast(list[torch.Tensor], enc_feats.unbind()), dim=-1)  # [N, F]
+                with nvtx.range("encoder_gridbatch.sample_trilinear"):
+                    enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
+            # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
+            F = enc_feats.jdata.shape[-1]
+            enc_feats = enc_feats.jdata.view(grid_count, num_points, F).permute(1, 0, 2).reshape(num_points, -1)
 
             # Set them as the sh0 features
             enc_feats_state_dict = self.gs_model.state_dict()
             enc_feats_state_dict["sh0"] = rgb_to_sh(enc_feats).unsqueeze(1).contiguous()
-
-            gs3d_enc_feats = GaussianSplat3d.from_state_dict(enc_feats_state_dict)
+            with nvtx.range("GaussianSplat3d.from_state_dict"):
+                gs3d_enc_feats = GaussianSplat3d.from_state_dict(enc_feats_state_dict)
         else:
-            # Update sh0 with current gs_features and reuse the model
-            self._gs_model_for_render.sh0 = self.gs_features
-            gs3d_enc_feats = self._gs_model_for_render
+            with nvtx.range("update_gs_features"):
+                # Update sh0 with current gs_features and reuse the model
+                self._gs_model_for_render.sh0 = self.gs_features
+                gs3d_enc_feats = self._gs_model_for_render
 
         # Render the image
-        img_feats, alpha = gs3d_enc_feats.render_images(
-            image_width=img_w,
-            image_height=img_h,
-            world_to_camera_matrices=world_to_cam,
-            projection_matrices=intrinsics,
-            near=0.01,
-            far=1e10,
-            sh_degree_to_use=0,
-        )
+        with nvtx.range("gs3d_enc_feats.render_images"):
+            img_feats, alpha = gs3d_enc_feats.render_images(
+                image_width=img_w,
+                image_height=img_h,
+                world_to_camera_matrices=world_to_cam,
+                projection_matrices=intrinsics,
+                near=0.01,
+                far=1e10,
+                sh_degree_to_use=0,
+            )
 
         epsilon = 1e-6
         img_feats = img_feats / (torch.linalg.norm(img_feats, dim=-1, keepdim=True) + epsilon)
 
         # Apply MLP
-        scales = torch.full_like(img_feats[..., :1], scale)
-        gfeats = self.get_mlp_output(img_feats, scales)
+        gfeats = self.get_mlp_output(img_feats, scale)
 
         return gfeats, alpha
