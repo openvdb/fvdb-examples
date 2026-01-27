@@ -220,7 +220,11 @@ class GARfVDBModel(torch.nn.Module):
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(i_channels, n_neurons, bias=True),
             torch.nn.ReLU(),
-            *[torch.nn.Linear(n_neurons, n_neurons, bias=True), torch.nn.ReLU()] * hidden_layers,
+            *[
+                layer
+                for _ in range(hidden_layers)
+                for layer in (torch.nn.Linear(n_neurons, n_neurons, bias=True), torch.nn.ReLU())
+            ],
             torch.nn.Linear(n_neurons, o_channels, bias=False),
         ).to(device)
 
