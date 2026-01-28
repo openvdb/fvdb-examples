@@ -73,7 +73,7 @@ class ComputeCLIPFeatures(BaseTransform):
     is a per-image tensor of CLIP features and segmentation maps that map
     pixels to feature indices.
 
-    This transform must be run after ComputeMultiScaleSAMMasks.
+    This transform must be run after ComputeMultiScaleSAM2Masks.
     """
 
     version = "1.0.0"
