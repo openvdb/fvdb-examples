@@ -223,7 +223,7 @@ class ComputeCLIPFeatures(BaseTransform):
 
         input_cache: SfmCache = input_scene.cache
 
-        # Create cache folder (sanitize model names by replacing hyphens with underscores)
+        # Create cache folder
         model_type_safe = self._clip_model_type.replace("-", "_")
         pretrained_safe = self._clip_model_pretrained.replace("-", "_")
         cache_prefix = f"clip_features_{model_type_safe}_{pretrained_safe}"
@@ -246,7 +246,6 @@ class ComputeCLIPFeatures(BaseTransform):
             regenerate_cache = True
 
         if not regenerate_cache:
-            # Verify cache metadata
             cache_filename = f"features_{0:0{num_zeropad}}"
             if output_cache.has_file(cache_filename):
                 cache_meta = output_cache.get_file_metadata(cache_filename)
@@ -266,7 +265,6 @@ class ComputeCLIPFeatures(BaseTransform):
             pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Computing CLIP features")
 
             for image_meta in pbar:
-                # Load the image
                 image_path = image_meta.image_path
                 img = cv2.imread(image_path)
 
@@ -276,7 +274,7 @@ class ComputeCLIPFeatures(BaseTransform):
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w = img.shape[:2]
 
-                # Load masks from parent cache
+                # Load SAM2 masks from parent cache
                 mask_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
                 if not input_cache.has_file(mask_filename):
                     raise RuntimeError(
@@ -310,7 +308,7 @@ class ComputeCLIPFeatures(BaseTransform):
                 total_masks = sum(lengths)
                 assert features.shape[0] == total_masks, f"Feature count mismatch: {features.shape[0]} vs {total_masks}"
 
-                # Save to cache
+                # Save
                 cache_filename = f"features_{image_meta.image_id:0{num_zeropad}}"
                 output_cache.write_file(
                     name=cache_filename,

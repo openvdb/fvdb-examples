@@ -219,7 +219,6 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
     def _get_sam2_model(self) -> SAM2Model:
-        """Lazily load the SAM2 model."""
         if self._sam2_model is None:
             self._sam2_model = SAM2Model(
                 checkpoint=self._checkpoint,
