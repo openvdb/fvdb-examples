@@ -278,7 +278,7 @@ class ComputeCLIPFeatures(BaseTransform):
                 mask_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
                 if not input_cache.has_file(mask_filename):
                     raise RuntimeError(
-                        f"Mask file {mask_filename} not found in cache. " "Run ComputeMultiScaleSAMMasks first."
+                        f"Mask file {mask_filename} not found in cache. " "Run ComputeMultiScaleSAM2Masks first."
                     )
 
                 _, mask_data = input_cache.read_file(mask_filename)
