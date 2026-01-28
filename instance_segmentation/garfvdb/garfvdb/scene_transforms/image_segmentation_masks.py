@@ -237,6 +237,9 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                 image_path = image_meta.image_path
                 img = cv2.imread(image_path)
                 assert img is not None, f"Failed to load image {image_path}"
+                
+                # Undistort the image if the camera has distortion parameters
+                img = image_meta.camera_metadata.undistort_image(img)
 
                 scales, pixel_to_mask_id, mask_cdf = self._generate_segmentation_mask(
                     self._gs3d,
