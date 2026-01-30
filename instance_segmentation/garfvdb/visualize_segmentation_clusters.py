@@ -259,7 +259,6 @@ class ViewCheckpoint:
 
         fviz.show()
 
-        logger.info("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 
 
