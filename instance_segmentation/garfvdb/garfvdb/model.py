@@ -706,6 +706,19 @@ class GARfVDBModel(torch.nn.Module):
         return gfeats, alpha
 
     def get_gaussian_affinity_output(self, scale: float) -> torch.Tensor:
+        """Get per-Gaussian affinity features for the given scale.
+
+        This is a convenience function used during inference or evaluation to
+        compute per-Gaussian feature embeddings (affinities) by sampling
+        encoder grid features or using the current Gaussian features, normalizing
+        them, and passing them through the MLP at the specified scale.
+
+        Args:
+            scale: Chosen scale for the affinity MLP output.
+
+        Returns:
+            A tensor of per-Gaussian affinity features.
+        """
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
             enc_feats = self._sample_encoder_grids_at_gaussians()
