@@ -29,3 +29,6 @@ dependencies:
   - torchvision
   - msgpack-python
   - huggingface_hub
+  - rapidsai::cuml
+  - rapidsai::cupy
+  - matplotlib

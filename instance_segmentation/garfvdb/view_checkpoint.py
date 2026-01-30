@@ -15,8 +15,6 @@ import tyro
 from fvdb import GaussianSplat3d
 from fvdb.types import to_Mat33fBatch, to_Mat44fBatch, to_Vec2iBatch
 from fvdb_reality_capture.tools import filter_splats_above_scale
-from tyro.conf import arg
-
 from garfvdb.model import GARfVDBModel
 from garfvdb.training.dataset import GARfVDBInput
 from garfvdb.training.segmentation import GaussianSplatScaleConditionedSegmentation
@@ -25,6 +23,7 @@ from garfvdb.util import (
     load_splats_from_file,
     pca_projection_fast,
 )
+from tyro.conf import arg
 
 
 def load_segmentation_runner_from_checkpoint(
@@ -140,6 +139,7 @@ class SegmentationRenderer:
     def render_segmentation_image(
         self,
         camera_to_world: torch.Tensor,
+        world_to_camera: torch.Tensor,
         projection: torch.Tensor,
         img_w: int,
         img_h: int,
@@ -161,6 +161,7 @@ class SegmentationRenderer:
             {
                 "projection": projection.unsqueeze(0),
                 "camera_to_world": camera_to_world.unsqueeze(0),
+                "world_to_camera": world_to_camera.unsqueeze(0),
                 "image_w": [img_w],
                 "image_h": [img_h],
             }
@@ -490,10 +491,10 @@ class ViewCheckpoint:
                 c2w_opencv = c2w_opengl @ opengl_to_opencv
 
                 camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
-
+                world_to_camera = torch.linalg.inv(camera_to_world)
                 # Render at lower resolution for performance
                 rgba_image = renderer.render_segmentation_image(
-                    camera_to_world, reference_projection, render_w, render_h
+                    camera_to_world, world_to_camera, reference_projection, render_w, render_h
                 )
                 # Scale up to overlay resolution
                 if self.overlay_downsample > 1:

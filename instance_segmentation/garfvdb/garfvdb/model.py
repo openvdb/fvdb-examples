@@ -627,6 +627,28 @@ class GARfVDBModel(torch.nn.Module):
         # Reshape back to 3D
         return gfeats
 
+    def _sample_encoder_grids_at_gaussians(self) -> torch.Tensor:
+        # repeat the gaussian means for each grid
+        num_points = self.gs_model.means.shape[0]
+        grid_count = self.encoder_gridbatch.grid_count
+        repeated_data = self.gs_model.means.repeat(grid_count, 1)
+        # Create offsets: [0, N, 2N, 3N, ..., grid_count*N]
+        offsets = torch.arange(
+            0, (grid_count + 1) * num_points, num_points, device=self.gs_model.means.device, dtype=torch.long
+        )
+        world_pts = fvdb.JaggedTensor.from_data_and_offsets(repeated_data, offsets)
+
+        if self.model_config.use_grid_conv:
+            conv_output = self.encoder_convnet(self.encoder_grids)
+            enc_feats = conv_output.sample_trilinear(world_pts)
+        else:
+            with nvtx.range("encoder_gridbatch.sample_trilinear"):
+                enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
+        # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
+        num_features = enc_feats.jdata.shape[-1]
+        enc_feats = enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
+        return enc_feats
+
     @nvtx.range("GARfVDBModel.get_mask_output")
     def get_mask_output(self, input: GARfVDBInput, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
         """Get the mask output for the given input and scale
@@ -648,28 +670,7 @@ class GARfVDBModel(torch.nn.Module):
 
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
-
-            # repeat the gaussian means for each grid
-            num_points = self.gs_model.means.shape[0]
-            grid_count = self.encoder_gridbatch.grid_count
-            repeated_data = self.gs_model.means.repeat(grid_count, 1)
-            # Create offsets: [0, N, 2N, 3N, ..., grid_count*N]
-            offsets = torch.arange(
-                0, (grid_count + 1) * num_points, num_points, device=self.gs_model.means.device, dtype=torch.long
-            )
-            world_pts = fvdb.JaggedTensor.from_data_and_offsets(repeated_data, offsets)
-
-            if self.model_config.use_grid_conv:
-                conv_output = self.encoder_convnet(self.encoder_grids)
-                enc_feats = conv_output.sample_trilinear(world_pts)
-            else:
-                with nvtx.range("encoder_gridbatch.sample_trilinear"):
-                    enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
-            # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
-            num_features = enc_feats.jdata.shape[-1]
-            enc_feats = (
-                enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
-            )
+            enc_feats = self._sample_encoder_grids_at_gaussians()
 
             # Set them as the sh0 features
             enc_feats_state_dict = self.gs_model.state_dict()
@@ -701,3 +702,33 @@ class GARfVDBModel(torch.nn.Module):
         gfeats = self.get_mlp_output(img_feats, scale)
 
         return gfeats, alpha
+
+    def get_gaussian_affinity_output(self, scale: float) -> torch.Tensor:
+        """Get per-Gaussian affinity features for the given scale.
+
+        This is a convenience function used during inference or evaluation to
+        compute per-Gaussian feature embeddings (affinities) by sampling
+        encoder grid features or using the current Gaussian features, normalizing
+        them, and passing them through the MLP at the specified scale.
+
+        Args:
+            scale: Chosen scale for the affinity MLP output.
+
+        Returns:
+            A tensor of per-Gaussian affinity features.
+        """
+        if self.model_config.use_grid:
+            # Obtain per-gaussian features from the encoder grids
+            enc_feats = self._sample_encoder_grids_at_gaussians()
+            enc_feats = rgb_to_sh(enc_feats)
+        else:
+            enc_feats = self.gs_features
+            enc_feats = rgb_to_sh(enc_feats)
+
+        epsilon = 1e-6
+        enc_feats = enc_feats / (torch.linalg.norm(enc_feats, dim=-1, keepdim=True) + epsilon)
+
+        # Apply MLP
+        gfeats = self.get_mlp_output(enc_feats, scale)
+
+        return gfeats
