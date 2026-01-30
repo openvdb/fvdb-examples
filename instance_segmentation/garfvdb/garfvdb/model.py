@@ -646,9 +646,7 @@ class GARfVDBModel(torch.nn.Module):
                 enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
         # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
         num_features = enc_feats.jdata.shape[-1]
-        enc_feats = (
-            enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
-        )
+        enc_feats = enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
         return enc_feats
 
     @nvtx.range("GARfVDBModel.get_mask_output")
@@ -722,14 +720,10 @@ class GARfVDBModel(torch.nn.Module):
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
             enc_feats = self._sample_encoder_grids_at_gaussians()
-
             enc_feats = rgb_to_sh(enc_feats)
-
         else:
-            with nvtx.range("update_gs_features"):
-                # Update sh0 with current gs_features and reuse the model
-                self._gs_model_for_render.sh0 = self.gs_features
-                gs3d_enc_feats = self._gs_model_for_render
+            enc_feats = self.gs_features
+            enc_feats = rgb_to_sh(enc_feats)
 
         epsilon = 1e-6
         enc_feats = enc_feats / (torch.linalg.norm(enc_feats, dim=-1, keepdim=True) + epsilon)
