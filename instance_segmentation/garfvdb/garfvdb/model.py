@@ -627,7 +627,7 @@ class GARfVDBModel(torch.nn.Module):
         # Reshape back to 3D
         return gfeats
 
-    def _sample_encoder_grids_at_gaussians(self,) -> torch.Tensor:
+    def _sample_encoder_grids_at_gaussians(self) -> torch.Tensor:
         # repeat the gaussian means for each grid
         num_points = self.gs_model.means.shape[0]
         grid_count = self.encoder_gridbatch.grid_count
