@@ -69,7 +69,7 @@ class ViewCheckpoint:
     Example:
         View a trained segmentation model::
 
-            python view_checkpoint.py \\
+            python visualize_segmentation_clusters.py \\
                 --segmentation-path ./segmentation_checkpoint.pt \\
                 --reconstruction-path ./gsplat_checkpoint.ply
     """
