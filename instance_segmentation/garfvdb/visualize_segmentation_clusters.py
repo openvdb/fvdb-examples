@@ -172,10 +172,11 @@ class ViewCheckpoint:
 
             # Log variance statistics to help with threshold tuning
             variance_values = list(cluster_norm_variance.values())
-            logger.info(
-                f"Normalized variance stats: min={min(variance_values):.4f}, "
-                f"max={max(variance_values):.4f}, median={np.median(variance_values):.4f}"
-            )
+            if variance_values:
+                logger.info(
+                    f"Normalized variance stats: min={min(variance_values):.4f}, "
+                    f"max={max(variance_values):.4f}, median={np.median(variance_values):.4f}"
+                )
 
             removed_variance = [
                 label for label in cluster_splats.keys() if cluster_norm_variance[label] > self.variance_threshold

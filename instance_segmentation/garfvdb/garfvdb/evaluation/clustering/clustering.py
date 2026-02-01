@@ -39,6 +39,7 @@ def compute_cluster_labels(
         umap_n_neighbors: UMAP neighbor count (higher = more global structure).
         hdbscan_min_samples: Minimum samples for HDBSCAN core points.
         hdbscan_min_cluster_size: Minimum cluster size for HDBSCAN.
+        fitting_sample_size: Sample size for fitting UMAP and HDBSCAN.
         random_seed: Random seed for reproducibility.
         device: Device to perform clustering on.
     Returns:
@@ -52,8 +53,22 @@ def compute_cluster_labels(
     torch.manual_seed(random_seed)
     device = torch.device(device)
 
+    assert umap_n_neighbors < fitting_sample_size, "UMAP n_neighbors must be less than fitting_sample_size"
+
     # PCA pre-reduction
-    logger.info(f"PCA pre-reduction ({mask_features_output.shape[1]} -> {pca_n_components} dimensions)...")
+    n_samples, n_features = mask_features_output.shape[0], mask_features_output.shape[1]
+    max_pca_components = min(n_samples, n_features)
+    if pca_n_components > max_pca_components:
+        logger.warning(
+            "Requested pca_n_components=%d is greater than min(n_samples=%d, n_features=%d); " "clamping to %d.",
+            pca_n_components,
+            n_samples,
+            n_features,
+            max_pca_components,
+        )
+        pca_n_components = max_pca_components
+    logger.info(f"PCA pre-reduction ({n_features} -> {pca_n_components} dimensions)...")
+
     pca = cuml.PCA(n_components=pca_n_components)
     features_pca = pca.fit_transform(mask_features_output)
     logger.info(f"PCA reduced shape: {features_pca.shape}")
@@ -150,8 +165,8 @@ def split_gaussians_into_clusters(
 
     # Also store noise points
     noise_mask = cluster_labels == -1
+    noise_splats = gs_model[noise_mask]
     if noise_mask.any():
-        noise_splats = gs_model[noise_mask]
         logger.info(f"  Noise: {noise_splats.num_gaussians:,} gaussians")
 
     return cluster_splats, cluster_coherence, noise_splats
