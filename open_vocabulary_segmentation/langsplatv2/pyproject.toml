@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fvdb-langsplatv2"
+version = "0.0.1"
+description = "fVDB Implementation of LangSplatV2"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "numpy",
+    "torch",
+    "torchvision",
+    "opencv-python",
+    "tqdm",
+    "open-clip-torch",
+    "fvdb-reality-capture",
+]
+
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["langsplatv2*"]

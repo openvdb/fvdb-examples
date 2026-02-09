@@ -199,6 +199,10 @@ def unique_values_to_colors(tensor: torch.Tensor) -> torch.Tensor:
     return output
 
 
+_SH_SCALE = 1.0 / 0.28209479177387814  # ≈ 3.5449077018110318
+_SH_OFFSET = -0.5 * _SH_SCALE  # ≈ -1.7724538509055159
+
+
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     """Convert RGB values to spherical harmonics coefficients.
 
@@ -208,5 +212,4 @@ def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     Returns:
         [N, 3] Tensor of spherical harmonics coefficients
     """
-    C0 = 0.28209479177387814
-    return (rgb - 0.5) / C0
+    return rgb * _SH_SCALE + _SH_OFFSET
