@@ -30,5 +30,5 @@ dependencies:
   - msgpack-python
   - huggingface_hub
   - rapidsai::cuml
-  - rapidsai::cupy
+  - cupy
   - matplotlib
