@@ -333,7 +333,10 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             f"sam2_multi_scale_masks_{self._checkpoint}_"
             f"p{self._points_per_side}_"
             f"iou{int(self._pred_iou_thresh * 100)}_"
-            f"stab{int(self._stability_score_thresh * 100)}"
+            f"stab{int(self._stability_score_thresh * 100)}_"
+            f"nmsiou{int(self._nms_iou_thr * 100)}_"
+            f"nmsscore{int(self._nms_score_thr * 100)}_"
+            f"nmsinner{int(self._nms_inner_thr * 100)}"
         )
         output_cache = input_cache.make_folder(
             cache_prefix,
@@ -353,21 +356,35 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             output_cache.clear_current_folder()
             regenerate_cache = True
 
-        if not regenerate_cache:
-            # Verify cache metadata for first image
-            cache_filename = f"masks_{0:0{num_zeropad}}"
-            if output_cache.has_file(cache_filename):
-                cache_meta = output_cache.get_file_metadata(cache_filename)
-                value_meta = cache_meta.get("metadata", {})
-                if (
-                    value_meta.get("checkpoint") != self._checkpoint
-                    or value_meta.get("points_per_side") != self._points_per_side
-                ):
-                    self._logger.info("Cache parameters mismatch. Regenerating.")
-                    output_cache.clear_current_folder()
-                    regenerate_cache = True
-            else:
+        for image_id in range(input_scene.num_images):
+            if regenerate_cache:
+                break
+            cache_filename = f"masks_{image_id:0{num_zeropad}}"
+            if not output_cache.has_file(cache_filename):
+                self._logger.info(
+                    f"Masks {cache_filename} not found in the cache. " f"Clearing cache and regenerating."
+                )
+                output_cache.clear_current_folder()
                 regenerate_cache = True
+                break
+
+            cache_meta = output_cache.get_file_metadata(cache_filename)
+            value_meta = cache_meta.get("metadata", {})
+            if (
+                value_meta.get("checkpoint") != self._checkpoint
+                or value_meta.get("points_per_side") != self._points_per_side
+                or value_meta.get("pred_iou_thresh") != self._pred_iou_thresh
+                or value_meta.get("stability_score_thresh") != self._stability_score_thresh
+                or value_meta.get("nms_iou_thr") != self._nms_iou_thr
+                or value_meta.get("nms_score_thr") != self._nms_score_thr
+                or value_meta.get("nms_inner_thr") != self._nms_inner_thr
+            ):
+                self._logger.info(
+                    f"Cache metadata does not match expected parameters. " f"Clearing cache and regenerating."
+                )
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+                break
 
         if regenerate_cache:
             self._logger.info("Generating multi-scale SAM2 masks for all images.")
@@ -421,6 +438,9 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                         "points_per_side": self._points_per_side,
                         "pred_iou_thresh": self._pred_iou_thresh,
                         "stability_score_thresh": self._stability_score_thresh,
+                        "nms_iou_thr": self._nms_iou_thr,
+                        "nms_score_thr": self._nms_score_thr,
+                        "nms_inner_thr": self._nms_inner_thr,
                     },
                 )
 

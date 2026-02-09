@@ -134,7 +134,7 @@ class ComputeCLIPFeatures(BaseTransform):
             CLIP embeddings for each masked region, shape [N, clip_n_dims].
         """
         if len(masks) == 0:
-            return torch.zeros(0, self._clip_n_dims)
+            return torch.zeros(0, self._clip_n_dims, device="cpu", dtype=torch.float16)
 
         clip_model = self._get_clip_model()
         image_size = clip_model.image_size
@@ -226,7 +226,7 @@ class ComputeCLIPFeatures(BaseTransform):
         # Create cache folder
         model_type_safe = self._clip_model_type.replace("-", "_")
         pretrained_safe = self._clip_model_pretrained.replace("-", "_")
-        cache_prefix = f"clip_features_{model_type_safe}_{pretrained_safe}"
+        cache_prefix = f"clip_features_{model_type_safe}_{pretrained_safe}_{self._clip_n_dims}"
         output_cache = input_cache.make_folder(
             cache_prefix,
             description=f"CLIP features using {self._clip_model_type}",
@@ -245,20 +245,31 @@ class ComputeCLIPFeatures(BaseTransform):
             output_cache.clear_current_folder()
             regenerate_cache = True
 
-        if not regenerate_cache:
-            cache_filename = f"features_{0:0{num_zeropad}}"
-            if output_cache.has_file(cache_filename):
-                cache_meta = output_cache.get_file_metadata(cache_filename)
-                value_meta = cache_meta.get("metadata", {})
-                if (
-                    value_meta.get("clip_model_type") != self._clip_model_type
-                    or value_meta.get("clip_model_pretrained") != self._clip_model_pretrained
-                ):
-                    self._logger.info("Cache parameters mismatch. Regenerating.")
-                    output_cache.clear_current_folder()
-                    regenerate_cache = True
-            else:
+        for image_id in range(input_scene.num_images):
+            if regenerate_cache:
+                break
+            cache_filename = f"features_{image_id:0{num_zeropad}}"
+            if not output_cache.has_file(cache_filename):
+                self._logger.info(
+                    f"Features {cache_filename} not found in the cache. " f"Clearing cache and regenerating."
+                )
+                output_cache.clear_current_folder()
                 regenerate_cache = True
+                break
+
+            cache_meta = output_cache.get_file_metadata(cache_filename)
+            value_meta = cache_meta.get("metadata", {})
+            if (
+                value_meta.get("clip_model_type") != self._clip_model_type
+                or value_meta.get("clip_model_pretrained") != self._clip_model_pretrained
+                or value_meta.get("clip_n_dims") != self._clip_n_dims
+            ):
+                self._logger.info(
+                    f"Cache metadata does not match expected parameters. " f"Clearing cache and regenerating."
+                )
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+                break
 
         if regenerate_cache:
             self._logger.info("Computing CLIP features for all masked regions.")
@@ -267,6 +278,7 @@ class ComputeCLIPFeatures(BaseTransform):
             for image_meta in pbar:
                 image_path = image_meta.image_path
                 img = cv2.imread(image_path)
+                assert img is not None, f"Failed to load image {image_path}"
 
                 # Undistort the image if the camera has distortion parameters
                 img = image_meta.camera_metadata.undistort_image(img)

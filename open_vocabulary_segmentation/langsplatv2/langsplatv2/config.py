@@ -98,9 +98,6 @@ class LangSplatV2PreprocessConfig:
     rescale_jpeg_quality: int = 95
     """JPEG quality (0-100) when resaving downsampled images."""
 
-    max_image_resolution: int = 1080
-    """Maximum image height; larger images will be downsampled."""
-
     # Point cloud filtering
     points_percentile_filter: float = 0.0
     """Percentile of outlier points to filter based on distance from median."""
