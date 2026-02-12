@@ -1,11 +1,6 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Configuration classes for LangSplatV2 preprocessing pipeline.
-
-This module provides dataclass configurations for building the LangSplatV2
-preprocessing pipeline using scene transforms.
-"""
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -239,3 +234,65 @@ class LangSplatV2PreprocessConfig:
             clip_n_dims=self.clip.clip_n_dims,
             device=self.device,
         )
+
+
+@dataclass
+class LangSplatV2ModelConfig:
+    """Configuration for the LangSplatV2 language feature model."""
+
+    vq_layer_num: int = 1
+    """Number of residual vector quantization layers."""
+
+    codebook_size: int = 64
+    """Number of entries in each codebook."""
+
+    clip_n_dims: int = 512
+    """Dimensionality of CLIP embeddings."""
+
+    topk: int = 4
+    """Number of non-zero sparse coefficients per VQ layer."""
+
+
+@dataclass
+class LangSplatV2TrainingConfig:
+    """Configuration for LangSplatV2 language feature training."""
+
+    seed: int = 42
+    """Random seed for reproducibility."""
+
+    feature_level: int = 1
+    """Which SAM scale level to train on (1=small, 2=medium, 3=large).
+
+    Following the original LangSplatV2 paper, separate models are trained
+    for each scale level and combined at evaluation time.
+    """
+
+    max_steps: int = 10_000
+    """Maximum number of training iterations."""
+
+    learning_rate: float = 0.0025
+    """Learning rate for language feature parameters (logits + codebooks)."""
+
+    batch_size: int = 1
+    """Number of images per training batch."""
+
+    accumulate_grad_steps: int = 1
+    """Number of gradient accumulation steps before optimizer update."""
+
+    use_cosine_loss: bool = True
+    """Whether to use cosine similarity loss."""
+
+    use_l1_loss: bool = False
+    """Whether to use L1 loss."""
+
+    normalize_features: bool = False
+    """Whether to L2-normalize predicted features before computing loss."""
+
+    model: LangSplatV2ModelConfig = field(default_factory=LangSplatV2ModelConfig)
+    """Model architecture configuration."""
+
+    eval_at_percent: list[int] = field(default_factory=lambda: [25, 50, 75, 100])
+    """Percentages of total steps at which to run evaluation."""
+
+    save_at_percent: list[int] = field(default_factory=lambda: [50, 100])
+    """Percentages of total steps at which to save checkpoints."""

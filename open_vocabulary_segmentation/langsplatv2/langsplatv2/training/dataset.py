@@ -65,7 +65,9 @@ class LangSplatV2Dataset(SfmDataset):
             feature_level: Which SAM scale level to use (1=s, 2=m, 3=l).
             clip_n_dims: CLIP feature dimensionality.
             dataset_indices: Optional indices to subset the dataset.
-            cache_features: If True, cache CLIP features in memory.
+            cache_features: If True, cache compact feature data (feature
+                vectors + seg_maps) in memory. Feature maps are built
+                on-the-fly in ``__getitem__``.
             cache_images: If True, cache decoded images in memory.
         """
         super().__init__(sfm_scene, dataset_indices)
@@ -73,7 +75,7 @@ class LangSplatV2Dataset(SfmDataset):
         self.clip_n_dims = clip_n_dims
         self._cache_features = cache_features
         self._cache_images = cache_images
-        self._features_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._features_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._images_cache: dict[int, dict] = {}
 
     @property
@@ -81,7 +83,10 @@ class LangSplatV2Dataset(SfmDataset):
         return len(str(self._sfm_scene.num_images)) + 2
 
     def warmup_cache(self) -> None:
-        """Pre-load all feature and image data into cache.
+        """Pre-load feature data and images into cache.
+
+        Caches compact feature vectors and seg_maps. Feature maps
+        (dense ``[H,W,512]``) are built on-the-fly in ``__getitem__``.
 
         Call this BEFORE creating a DataLoader with ``num_workers > 0``.
         Workers forked after warmup inherit the populated cache.
@@ -92,7 +97,7 @@ class LangSplatV2Dataset(SfmDataset):
             for idx in tqdm.tqdm(range(len(self)), desc="Warming up feature cache"):
                 index = self._indices[idx]
                 if index not in self._features_cache:
-                    self._get_feature_data(index)
+                    self.get_feature_data(index)
 
         if self._cache_images:
             for idx in tqdm.tqdm(range(len(self)), desc="Warming up image cache"):
@@ -101,57 +106,79 @@ class LangSplatV2Dataset(SfmDataset):
                     sfm_item = super().__getitem__(idx)
                     self._images_cache[index] = sfm_item
 
-    def read_feature_data(self, index: int) -> dict[str, torch.Tensor]:
+    def _read_feature_data(self, index: int) -> dict[str, torch.Tensor]:
         """Read feature data from disk cache."""
         cache_filename = f"features_{index:0{self.num_zeropad}}"
         _, data = self.sfm_scene.cache.read_file(cache_filename)
         return data
 
-    def _get_feature_data(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Load CLIP features and build GT feature map for an image.
+    def get_feature_data(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load feature data for an image.
+
+        Returns the feature vectors and seg_map for the configured level.
+        Feature maps are built separately in ``_build_feature_map``.
 
         Args:
             index: Image index in the SfmScene.
 
         Returns:
-            Tuple of (gt_features, feature_mask) where:
-                - gt_features: ``[H, W, clip_n_dims]`` CLIP feature map
-                - feature_mask: ``[H, W]`` boolean mask of valid pixels
+            Tuple of (features, seg_map, lengths) where:
+                - features: ``[N_total, clip_n_dims]`` CLIP features
+                - seg_map: ``[H, W]`` int32 map of pixel->feature indices (-1 = none)
+                - lengths: ``[4]`` number of features at each scale level
         """
         if self._cache_features and index in self._features_cache:
             return self._features_cache[index]
 
-        data = self.read_feature_data(index)
+        data = self._read_feature_data(index)
 
         features = data["features"]  # [N_total, clip_n_dims]
         seg_maps = data["seg_maps"]  # [4, H, W]
+        lengths = data["lengths"]  # [4]
 
         if isinstance(features, np.ndarray):
             features = torch.from_numpy(features)
         if isinstance(seg_maps, np.ndarray):
             seg_maps = torch.from_numpy(seg_maps)
+        if isinstance(lengths, np.ndarray):
+            lengths = torch.from_numpy(lengths)
 
-        features = features.float()  # Ensure float32
+        features = features.float()
+        seg_map = seg_maps[self.feature_level]  # [H, W]
 
-        # Select the segmentation map for the configured scale level
-        seg_map = seg_maps[self.feature_level]  # [H, W] with indices or -1
-        H, W = seg_map.shape
-
-        # Build GT feature map by looking up features using seg_map indices
-        feature_mask = seg_map >= 0  # [H, W]
-
-        # Create the GT feature map
-        gt_features = torch.zeros(H, W, self.clip_n_dims, dtype=torch.float32)
-        if feature_mask.any():
-            valid_indices = seg_map[feature_mask].long()  # [N_valid]
-            gt_features[feature_mask] = features[valid_indices]
-
-        result = (gt_features, feature_mask)
+        result = (features, seg_map, lengths)
 
         if self._cache_features:
             self._features_cache[index] = result
 
         return result
+
+    def _build_feature_map(
+        self, features: torch.Tensor, seg_map: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build dense GT feature map from features and seg_map.
+
+        Called per-item in ``__getitem__`` and not cached, since
+        dense ``[H, W, 512]`` feature maps would consume too much memory in cache.
+
+        Args:
+            features: CLIP features ``[N_total, clip_n_dims]``.
+            seg_map: Segmentation map ``[H, W]`` with feature indices.
+
+        Returns:
+            Tuple of (gt_features, feature_mask) where:
+                - gt_features: ``[H, W, clip_n_dims]``
+                - feature_mask: ``[H, W]`` bool
+        """
+        H, W = seg_map.shape
+        feature_mask = seg_map >= 0  # [H, W]
+
+        gt_features = torch.zeros(H, W, self.clip_n_dims, dtype=torch.float32)
+        if feature_mask.any():
+            valid_indices = seg_map[feature_mask].long()
+            gt_features[feature_mask] = features[valid_indices]
+
+        return gt_features, feature_mask
 
     def _get_sfm_item(self, idx: int) -> dict:
         """Get SfmDataset item, using cache if enabled."""
@@ -166,12 +193,14 @@ class LangSplatV2Dataset(SfmDataset):
 
         return sfm_item
 
-    def __getitem__(self, idx: int) -> LangSplatV2DataItem:  # type: ignore[override]
+    def __getitem__(self, idx: int) -> LangSplatV2DataItem:
         with nvtx.range("LangSplatV2Dataset.__getitem__"):
             sfm_item = self._get_sfm_item(idx)
             index = self._indices[idx]
 
-            gt_features, feature_mask = self._get_feature_data(index)
+            # Get cached features, build feature map on-the-fly
+            features, seg_map, _ = self.get_feature_data(index)
+            gt_features, feature_mask = self._build_feature_map(features, seg_map)
 
             return LangSplatV2DataItem(
                 image=torch.from_numpy(sfm_item["image"]),

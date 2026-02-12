@@ -1,14 +1,18 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.cluster import MiniBatchKMeans
 
-from langsplatv2.training.dataset import LangSplatV2Dataset
+if TYPE_CHECKING:
+    from langsplatv2.training.dataset import LangSplatV2Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +32,17 @@ def softmax_to_topk_soft_code(logits: torch.Tensor, k: int) -> torch.Tensor:
     """
     y_soft = logits.softmax(dim=1)  # [N, codebook_size]
 
-    # Select top-k values and create sparse mask
-    _, indices = torch.topk(y_soft, k, dim=1)
-    mask = torch.zeros_like(y_soft, dtype=torch.bool)
-    mask.scatter_(1, indices, True)
+    # Work with compact [N, k] tensors instead of full [N, codebook_size]
+    topk_vals, topk_idx = torch.topk(y_soft, k, dim=1)  # [N, k], [N, k]
 
-    # Zero out non-top-k entries
-    y_soft_topk = torch.where(mask, y_soft, torch.zeros_like(y_soft))
+    # Normalize the top-k values directly (much cheaper than full-size ops)
+    topk_vals = topk_vals / (topk_vals.sum(dim=1, keepdim=True) + 1e-10)  # [N, k]
 
-    # Re-normalize so entries sum to 1
-    y_soft_topk = y_soft_topk / (y_soft_topk.sum(dim=1, keepdim=True) + 1e-10)
+    # Scatter normalized values into sparse output
+    result = torch.zeros_like(y_soft)  # [N, codebook_size]
+    result.scatter_(1, topk_idx, topk_vals)
 
-    return y_soft_topk
+    return result
 
 
 class ResidualVectorQuantizationWithClustering(nn.Module):
@@ -145,17 +148,10 @@ def load_clip_features_for_level(
     all_features = []
 
     for image_id in range(len(full_dataset)):
-        data = full_dataset.read_feature_data(image_id)
-        features = data["features"]  # [N_total, clip_n_dims]
-        lengths = data["lengths"]  # [4]
+        features, _, lengths = full_dataset.get_feature_data(image_id)
 
-        if isinstance(features, torch.Tensor):
-            features = features.to(device)
-        else:
-            features = torch.tensor(features, device=device)
-
-        if isinstance(lengths, torch.Tensor):
-            lengths = lengths.tolist()
+        features = features.to(device)
+        lengths = lengths.tolist()
 
         # Compute offset for the requested level
         offset = sum(lengths[:feature_level])

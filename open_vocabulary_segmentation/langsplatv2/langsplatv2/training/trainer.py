@@ -1,0 +1,692 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Training runner for LangSplatV2 language feature learning.
+
+Manages the complete training pipeline including dataset creation, codebook
+initialization, optimization loop, checkpointing, and evaluation.
+"""
+import logging
+import os
+import pathlib
+import random
+from typing import Any, Callable
+
+import numpy as np
+import torch
+import torch.cuda.nvtx as nvtx
+import tqdm
+from fvdb import GaussianSplat3d
+from fvdb_reality_capture.sfm_scene import SfmScene
+
+from ..config import LangSplatV2ModelConfig, LangSplatV2TrainingConfig
+from ..loss import calculate_langsplatv2_loss
+from ..model import LangSplatV2Model
+from ..vq_utils import (
+    ResidualVectorQuantizationWithClustering,
+    load_clip_features_for_level,
+)
+from .dataset import (
+    InfiniteSampler,
+    LangSplatV2CollateFn,
+    LangSplatV2Dataset,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class LangSplatV2Trainer:
+    """Trainer for LangSplatV2 language feature learning.
+
+    Manages the complete lifecycle: dataset preparation, codebook initialization
+    via K-means, training loop with rendering and loss computation,
+    checkpointing, and evaluation.
+
+    This class follows the same pattern as GARfVDB's
+    ``GaussianSplatScaleConditionedSegmentation`` for consistency.
+    """
+
+    version = "0.1.0"
+
+    __PRIVATE__ = object()
+
+    def __init__(
+        self,
+        model: LangSplatV2Model,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+        config: LangSplatV2TrainingConfig,
+        gs_model: GaussianSplat3d,
+        gs_model_path: pathlib.Path,
+        sfm_scene: SfmScene,
+        train_dataset: LangSplatV2Dataset,
+        val_dataset: LangSplatV2Dataset | None,
+        save_path: pathlib.Path | None,
+        start_step: int,
+        log_interval_steps: int,
+        viz_callback: Callable[["LangSplatV2Trainer", int], None] | None = None,
+        _private: object | None = None,
+    ) -> None:
+        """Initialize the training runner.
+
+        Note:
+            This constructor should only be called via ``new()`` or
+            ``from_state_dict()``.
+        """
+        if _private is not LangSplatV2Trainer.__PRIVATE__:
+            raise ValueError("LangSplatV2Trainer should only be initialized through `new` or `from_state_dict`.")
+
+        self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+
+        self._cfg = config
+        self._start_step = start_step
+        self._sfm_scene = sfm_scene
+        self._gs_model = gs_model
+        self._gs_model_path = gs_model_path
+
+        self._train_dataset = train_dataset
+        self._val_dataset = val_dataset
+
+        self._model = model
+        self._optimizer = optimizer
+        self._scheduler = scheduler
+
+        self._global_step: int = start_step
+
+        self._save_path = save_path
+        self._log_interval_steps = log_interval_steps
+        self._viz_callback = viz_callback
+
+        # Create save directories
+        if self._save_path is not None:
+            self._checkpoints_path = self._save_path / "checkpoints"
+            self._checkpoints_path.mkdir(parents=True, exist_ok=True)
+            self._metrics_path = self._save_path / "metrics_log.csv"
+            self._metrics_file = open(self._metrics_path, "a", buffering=8 * 1024 * 1024)
+        else:
+            self._checkpoints_path = None
+            self._metrics_file = None
+
+    @property
+    def model(self) -> LangSplatV2Model:
+        """Get the LangSplatV2 model."""
+        return self._model
+
+    @property
+    def gs_model(self) -> GaussianSplat3d:
+        """Get the underlying GaussianSplat3d model."""
+        return self._gs_model
+
+    @property
+    def config(self) -> LangSplatV2TrainingConfig:
+        """Get the training configuration."""
+        return self._cfg
+
+    @property
+    def device(self) -> torch.device:
+        """Get the device the model is on."""
+        return self._model.device
+
+    def _log_metric(self, step: int, name: str, value: float) -> None:
+        """Log a scalar metric to CSV file."""
+        if self._metrics_file is not None:
+            self._metrics_file.write(f"{step},{name},{value}\n")
+
+    def _save_checkpoint(self, step: int, checkpoint: dict[str, Any]) -> None:
+        """Save a training checkpoint."""
+        if self._checkpoints_path is not None:
+            ckpt_dir = self._checkpoints_path / f"{step:08d}"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = ckpt_dir / "langsplatv2_ckpt.pt"
+            torch.save(checkpoint, ckpt_path)
+            self._logger.info(f"Saved checkpoint to {ckpt_path}")
+
+    @classmethod
+    def new(
+        cls,
+        sfm_scene: SfmScene,
+        gs_model: GaussianSplat3d,
+        gs_model_path: pathlib.Path,
+        config: LangSplatV2TrainingConfig = LangSplatV2TrainingConfig(),
+        device: str | torch.device = "cuda",
+        use_every_n_as_val: int = -1,
+        save_path: pathlib.Path | None = None,
+        run_name: str | None = None,
+        log_interval_steps: int = 10,
+        viz_callback: Callable[["LangSplatV2Trainer", int], None] | None = None,
+        cache_dataset: bool = True,
+    ) -> "LangSplatV2Trainer":
+        """Create a new LangSplatV2 training run.
+
+        This method handles the full initialization:
+        1. Splits dataset into train/val
+        2. Loads CLIP features for the configured scale level
+        3. Initializes codebooks via K-means clustering
+        4. Creates the model and optimizer
+
+        Args:
+            sfm_scene: Preprocessed SfmScene with CLIP features in cache.
+            gs_model: Pre-trained GaussianSplat3d model.
+            gs_model_path: Path to the Gaussian splat checkpoint.
+            config: Training configuration.
+            device: Device for training.
+            use_every_n_as_val: Use every N-th image for validation.
+                -1 = no validation split.
+            save_path: Base directory for saving checkpoints and logs.
+            run_name: Name for this training run.
+            log_interval_steps: How often to log metrics.
+            viz_callback: Optional visualization callback.
+            cache_dataset: Whether to cache data in memory.
+
+        Returns:
+            Initialized LangSplatV2Training instance.
+        """
+        np.random.seed(config.seed)
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+
+        # Resolve save path
+        actual_save_path = None
+        if save_path is not None:
+            if run_name is None:
+                import time
+                run_name = f"langsplatv2_lvl{config.feature_level}_{time.strftime('%Y-%m-%d-%H-%M-%S')}"
+            actual_save_path = save_path / run_name
+            actual_save_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Saving results to {actual_save_path}")
+
+        # Split into train/val
+        indices = np.arange(sfm_scene.num_images)
+        if use_every_n_as_val > 0:
+            mask = np.ones(len(indices), dtype=bool)
+            mask[::use_every_n_as_val] = False
+            train_indices = indices[mask]
+            val_indices = indices[~mask]
+        else:
+            train_indices = indices
+            val_indices = np.array([], dtype=int)
+
+        # Create datasets
+        train_dataset = LangSplatV2Dataset(
+            sfm_scene=sfm_scene,
+            feature_level=config.feature_level,
+            clip_n_dims=config.model.clip_n_dims,
+            dataset_indices=train_indices,
+            cache_features=cache_dataset,
+            cache_images=cache_dataset,
+        )
+        val_dataset = None
+        if len(val_indices) > 0:
+            val_dataset = LangSplatV2Dataset(
+                sfm_scene=sfm_scene,
+                feature_level=config.feature_level,
+                clip_n_dims=config.model.clip_n_dims,
+                dataset_indices=val_indices,
+                cache_features=cache_dataset,
+                cache_images=cache_dataset,
+            )
+
+        logger.info(
+            f"Dataset: {len(train_dataset)} training images, "
+            f"{len(val_indices)} validation images, "
+            f"feature_level={config.feature_level}"
+        )
+
+        # Initialize codebooks via K-means on CLIP features
+        logger.info("Loading CLIP features for codebook initialization...")
+        all_dataset = LangSplatV2Dataset(
+            sfm_scene=sfm_scene,
+            feature_level=config.feature_level,
+            clip_n_dims=config.model.clip_n_dims,
+            cache_features=False,
+            cache_images=False,
+        )
+        clip_features = load_clip_features_for_level(
+            full_dataset=all_dataset,
+            feature_level=config.feature_level,
+            device=device,
+        )
+        logger.info(f"Loaded {clip_features.shape[0]:,} CLIP features of dimension {clip_features.shape[1]}")
+
+        # Run K-means to get initial codebooks
+        logger.info(
+            f"Initializing codebooks via K-means: "
+            f"{config.model.vq_layer_num} levels, "
+            f"{config.model.codebook_size} clusters, "
+            f"dim={config.model.clip_n_dims}"
+        )
+        rvq = ResidualVectorQuantizationWithClustering(
+            num_levels=config.model.vq_layer_num,
+            num_clusters=config.model.codebook_size,
+            feature_dim=config.model.clip_n_dims,
+            device=device,
+        )
+        rvq.fit_quantizers(clip_features)
+        initial_codebooks = torch.stack(rvq.quantizers, dim=0).to(device)
+        logger.info(f"Codebook initialization complete: {list(initial_codebooks.shape)}")
+
+        # Create model
+        model = LangSplatV2Model(
+            gs_model=gs_model,
+            vq_layer_num=config.model.vq_layer_num,
+            codebook_size=config.model.codebook_size,
+            clip_n_dims=config.model.clip_n_dims,
+            topk=config.model.topk,
+            device=device,
+        )
+
+        # Initialize codebooks from K-means
+        model.initialize_codebooks(initial_codebooks)
+
+        logger.info(f"Model initialized with {gs_model.num_gaussians:,} Gaussians")
+
+        # Create optimizer (only optimize language feature parameters)
+        optimizer = torch.optim.Adam(
+            params=[model.logits, model.codebooks],
+            lr=config.learning_rate,
+            eps=1e-15,
+        )
+
+        # No scheduler needed for constant LR (matching original LangSplatV2)
+        scheduler = None
+
+        return cls(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            gs_model=gs_model,
+            gs_model_path=gs_model_path,
+            sfm_scene=sfm_scene,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            save_path=actual_save_path,
+            start_step=0,
+            log_interval_steps=log_interval_steps,
+            viz_callback=viz_callback,
+            _private=cls.__PRIVATE__,
+        )
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state_dict: dict[str, Any],
+        gs_model: GaussianSplat3d,
+        gs_model_path: pathlib.Path,
+        sfm_scene: SfmScene | None = None,
+        device: str | torch.device = "cuda",
+        eval_only: bool = False,
+    ) -> "LangSplatV2Trainer":
+        """Load a training runner from a checkpoint.
+
+        Args:
+            state_dict: Checkpoint dictionary from ``state_dict()``.
+            gs_model: GaussianSplat3d model.
+            gs_model_path: Path to the GS model file.
+            sfm_scene: Optional SfmScene. If None, loaded from checkpoint.
+            device: Device for the model.
+            eval_only: If True, disable gradients for evaluation.
+
+        Returns:
+            Restored LangSplatV2Trainer instance.
+        """
+        raw_config = state_dict["config"]
+        # Handle nested model config (stored as dict in checkpoint)
+        model_cfg = raw_config.pop("model", {})
+        if isinstance(model_cfg, dict):
+            model_cfg = LangSplatV2ModelConfig(**model_cfg)
+        raw_config["model"] = model_cfg
+        config = LangSplatV2TrainingConfig(**raw_config)
+        global_step = state_dict["step"]
+
+        np.random.seed(config.seed)
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+
+        # Restore SfmScene
+        if sfm_scene is None:
+            sfm_scene = SfmScene.from_state_dict(state_dict["sfm_scene"])
+
+        # Restore model
+        model = LangSplatV2Model.from_state_dict_with_config(
+            state_dict["model"], gs_model, device
+        )
+
+        if eval_only:
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad_(False)
+
+        # Restore optimizer
+        optimizer = torch.optim.Adam(
+            params=[model.logits, model.codebooks],
+            lr=config.learning_rate,
+            eps=1e-15,
+        )
+        if not eval_only:
+            optimizer.load_state_dict(state_dict["optimizer"])
+
+        # Restore datasets
+        train_indices = np.array(state_dict.get("train_indices", []), dtype=int)
+        val_indices = np.array(state_dict.get("val_indices", []), dtype=int)
+
+        train_dataset = LangSplatV2Dataset(
+            sfm_scene=sfm_scene,
+            feature_level=config.feature_level,
+            clip_n_dims=config.model.clip_n_dims,
+            dataset_indices=train_indices if len(train_indices) > 0 else None,
+        )
+        val_dataset = None
+        if len(val_indices) > 0:
+            val_dataset = LangSplatV2Dataset(
+                sfm_scene=sfm_scene,
+                feature_level=config.feature_level,
+                clip_n_dims=config.model.clip_n_dims,
+                dataset_indices=val_indices,
+            )
+
+        logger.info(f"Restored from checkpoint at step {global_step}")
+
+        return cls(
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            config=config,
+            gs_model=gs_model,
+            gs_model_path=gs_model_path,
+            sfm_scene=sfm_scene,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            save_path=None,
+            start_step=global_step,
+            log_interval_steps=10,
+            _private=cls.__PRIVATE__,
+        )
+
+    def train(self, show_progress: bool = True) -> None:
+        """Run the training loop.
+
+        Trains the language feature model by rendering sparse coefficient
+        weight maps and comparing the decoded CLIP features against ground
+        truth features from the preprocessing pipeline.
+
+        Args:
+            show_progress: Whether to display a progress bar.
+        """
+        if self._optimizer is None:
+            raise ValueError("This runner was not created with an optimizer.")
+
+        self._logger.info(f"Starting training for {self._cfg.max_steps} steps")
+        self._logger.info(
+            f"  Feature level: {self._cfg.feature_level}, "
+            f"Batch size: {self._cfg.batch_size}, "
+            f"LR: {self._cfg.learning_rate}"
+        )
+        self._logger.info(
+            f"  Loss: cosine={self._cfg.use_cosine_loss}, "
+            f"l1={self._cfg.use_l1_loss}, "
+            f"normalize={self._cfg.normalize_features}"
+        )
+
+        # Warmup cache before creating DataLoader workers
+        with nvtx.range("dataset_warmup_cache"):
+            self._train_dataset.warmup_cache()
+
+        # Configure DataLoader
+        dataset_size = len(self._train_dataset)
+        if dataset_size <= self._cfg.batch_size * 2:
+            num_workers = 2
+        elif dataset_size <= 64:
+            num_workers = min(4, os.cpu_count() or 4)
+        else:
+            num_workers = min(8, os.cpu_count() or 4)
+
+        sampler = InfiniteSampler(self._train_dataset, shuffle=True, seed=self._cfg.seed)
+        prefetch = 2 if num_workers > 0 else None
+        if num_workers > 0 and dataset_size < self._cfg.batch_size * 4:
+            prefetch = 1
+
+        trainloader = torch.utils.data.DataLoader(
+            self._train_dataset,
+            batch_size=self._cfg.batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=True,
+            prefetch_factor=prefetch,
+            collate_fn=LangSplatV2CollateFn,
+        )
+
+        self._model.train()
+        self._optimizer.zero_grad()
+
+        pbar = tqdm.tqdm(
+            total=self._cfg.max_steps,
+            desc="Training LangSplatV2",
+            initial=self._start_step,
+            disable=not show_progress,
+        )
+
+        # Gradient accumulation
+        accum_steps = self._cfg.accumulate_grad_steps
+        accumulated_loss: float = 0.0
+
+        # Determine current VQ layer index based on training progress
+        # Following LangSplatV2: layer_idx = min(step / 10000 * layer_num, layer_num - 1)
+        layer_num = self._cfg.model.vq_layer_num
+
+        # Track save/eval checkpoints
+        save_steps = set(
+            int(pct * self._cfg.max_steps / 100)
+            for pct in self._cfg.save_at_percent
+        )
+        eval_steps = set(
+            int(pct * self._cfg.max_steps / 100)
+            for pct in self._cfg.eval_at_percent
+        )
+
+        trainloader_iter = iter(trainloader)
+        step = 0
+        while self._global_step < self._cfg.max_steps:
+            try:
+                minibatch = next(trainloader_iter)
+            except StopIteration:
+                break
+
+            # Move to device
+            with nvtx.range("data_to_device"):
+                minibatch = minibatch.to(self.device)
+
+            img_w = minibatch["image_w"][0]
+            img_h = minibatch["image_h"][0]
+
+            # Current VQ layer index
+            layer_idx = min(
+                int(self._global_step / 10000 * layer_num),
+                layer_num - 1,
+            )
+
+            # Forward pass
+            with nvtx.range("forward_pass"):
+                predicted_features, alpha = self._model(
+                    world_to_camera=minibatch["world_to_camera"],
+                    projection=minibatch["projection"],
+                    image_width=img_w,
+                    image_height=img_h,
+                    layer_idx=layer_idx,
+                )
+
+            # Compute loss
+            with nvtx.range("loss_computation"):
+                loss_dict = calculate_langsplatv2_loss(
+                    predicted_features=predicted_features,
+                    gt_features=minibatch["gt_features"],
+                    mask=minibatch["feature_mask"],
+                    use_cosine_loss=self._cfg.use_cosine_loss,
+                    use_l1_loss=self._cfg.use_l1_loss,
+                    normalize_features=self._cfg.normalize_features,
+                )
+                loss = loss_dict["total_loss"]
+
+            # Scale loss by accumulation steps
+            loss = loss / accum_steps
+            accumulated_loss += loss.item()
+
+            # Zero gradients at the beginning of accumulation cycle
+            if step % accum_steps == 0:
+                self._optimizer.zero_grad()
+
+            # Backward pass
+            with nvtx.range("backward_pass"):
+                loss.backward()
+
+            # Optimizer step after accumulating gradients
+            if (step + 1) % accum_steps == 0:
+                with nvtx.range("optimizer_step"):
+                    self._optimizer.step()
+                    if self._scheduler is not None:
+                        self._scheduler.step()
+                accumulated_loss = 0.0
+
+            self._global_step += 1
+
+            # Logging
+            if self._global_step % self._log_interval_steps == 0:
+                display_loss = loss.item() * accum_steps
+                pbar.set_postfix(
+                    loss=f"{display_loss:.4g}",
+                    level=self._cfg.feature_level,
+                    layer=layer_idx,
+                )
+
+                mem_gb = torch.cuda.memory_allocated(self.device) / (1024**3)
+                self._log_metric(self._global_step, "train/loss", display_loss)
+                self._log_metric(self._global_step, "train/mem_gb", mem_gb)
+
+                for key, val in loss_dict.items():
+                    if key != "total_loss":
+                        self._log_metric(self._global_step, f"train/{key}", val.item())
+
+            pbar.update(1)
+
+            # Save checkpoint
+            if self._global_step in save_steps:
+                self._logger.info(f"Saving checkpoint at step {self._global_step}")
+                self._save_checkpoint(self._global_step, self.state_dict())
+
+            # Evaluation
+            if self._global_step in eval_steps and self._val_dataset is not None:
+                self._logger.info(f"Running evaluation at step {self._global_step}")
+                self.eval()
+
+            # Visualization callback
+            if self._viz_callback is not None and self._global_step % 500 == 0:
+                try:
+                    self._viz_callback(self, self._global_step)
+                except Exception as e:
+                    self._logger.warning(f"Visualization callback failed: {e}")
+
+            step += 1
+
+        pbar.close()
+        self._logger.info("Training completed.")
+
+        # Final save
+        if self._global_step not in save_steps:
+            self._save_checkpoint(self._global_step, self.state_dict())
+
+    @torch.inference_mode()
+    def eval(self) -> float:
+        """Run evaluation on the validation set.
+
+        Returns:
+            Average loss on the validation set.
+        """
+        if self._val_dataset is None or len(self._val_dataset) == 0:
+            self._logger.warning("No validation dataset available.")
+            return 0.0
+
+        self._model.eval()
+
+        valloader = torch.utils.data.DataLoader(
+            self._val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            collate_fn=LangSplatV2CollateFn,
+        )
+
+        total_loss = 0.0
+        num_batches = 0
+
+        for val_batch in valloader:
+            val_batch = val_batch.to(self.device)
+
+            img_w = val_batch["image_w"][0]
+            img_h = val_batch["image_h"][0]
+
+            predicted_features, alpha = self._model(
+                world_to_camera=val_batch["world_to_camera"],
+                projection=val_batch["projection"],
+                image_width=img_w,
+                image_height=img_h,
+            )
+
+            loss_dict = calculate_langsplatv2_loss(
+                predicted_features=predicted_features,
+                gt_features=val_batch["gt_features"],
+                mask=val_batch["feature_mask"],
+                use_cosine_loss=self._cfg.use_cosine_loss,
+                use_l1_loss=self._cfg.use_l1_loss,
+                normalize_features=self._cfg.normalize_features,
+            )
+
+            total_loss += loss_dict["total_loss"].item()
+            num_batches += 1
+
+        avg_loss = total_loss / max(num_batches, 1)
+        self._logger.info(f"Evaluation loss: {avg_loss:.4f}")
+        self._log_metric(self._global_step, "eval/loss", avg_loss)
+
+        self._model.train()
+        return avg_loss
+
+    @torch.no_grad()
+    def state_dict(self) -> dict[str, Any]:
+        """Get the complete training state for checkpointing.
+
+        Returns:
+            Dictionary containing all state needed to resume training.
+        """
+        return {
+            "magic": "LangSplatV2Checkpoint",
+            "version": self.version,
+            "step": self._global_step,
+            "config": {
+                "seed": self._cfg.seed,
+                "feature_level": self._cfg.feature_level,
+                "max_steps": self._cfg.max_steps,
+                "learning_rate": self._cfg.learning_rate,
+                "batch_size": self._cfg.batch_size,
+                "accumulate_grad_steps": self._cfg.accumulate_grad_steps,
+                "use_cosine_loss": self._cfg.use_cosine_loss,
+                "use_l1_loss": self._cfg.use_l1_loss,
+                "normalize_features": self._cfg.normalize_features,
+                "model": {
+                    "vq_layer_num": self._cfg.model.vq_layer_num,
+                    "codebook_size": self._cfg.model.codebook_size,
+                    "clip_n_dims": self._cfg.model.clip_n_dims,
+                    "topk": self._cfg.model.topk,
+                },
+            },
+            "sfm_scene": self._sfm_scene.state_dict(),
+            "gs_model_path": str(self._gs_model_path),
+            "model": self._model.state_dict_with_config(),
+            "optimizer": self._optimizer.state_dict(),
+            "train_indices": self._train_dataset._indices.tolist()
+            if hasattr(self._train_dataset, "_indices")
+            else [],
+            "val_indices": self._val_dataset._indices.tolist()
+            if self._val_dataset is not None and hasattr(self._val_dataset, "_indices")
+            else [],
+        }

@@ -17,6 +17,8 @@ dependencies = [
     "tqdm",
     "open-clip-torch",
     "fvdb-reality-capture",
+    "scikit-learn",
+    "tyro",
 ]
 
 
