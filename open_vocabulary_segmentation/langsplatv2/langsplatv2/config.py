@@ -267,8 +267,11 @@ class LangSplatV2TrainingConfig:
     for each scale level and combined at evaluation time.
     """
 
-    max_steps: int = 10_000
-    """Maximum number of training iterations."""
+    max_steps: int | None = None
+    """Maximum number of training steps. If None, uses max_epochs."""
+
+    max_epochs: int = 100
+    """Maximum number of training epochs."""
 
     learning_rate: float = 0.0025
     """Learning rate for language feature parameters (logits + codebooks)."""
@@ -292,7 +295,7 @@ class LangSplatV2TrainingConfig:
     """Model architecture configuration."""
 
     eval_at_percent: list[int] = field(default_factory=lambda: [25, 50, 75, 100])
-    """Percentages of total steps at which to run evaluation."""
+    """Percentages of total epochs at which to run evaluation."""
 
     save_at_percent: list[int] = field(default_factory=lambda: [50, 100])
-    """Percentages of total steps at which to save checkpoints."""
+    """Percentages of total epochs at which to save checkpoints."""

@@ -128,6 +128,13 @@ class LangSplatV2Trainer:
         """Get the device the model is on."""
         return self._model.device
 
+    @property
+    def total_steps(self) -> int:
+        """Get the total number of steps for training."""
+        computed_total_steps: int = int(self._cfg.max_epochs * len(self._train_dataset))
+        total_steps: int = self._cfg.max_steps if self._cfg.max_steps is not None else computed_total_steps
+        return total_steps
+
     def _log_metric(self, step: int, name: str, value: float) -> None:
         """Log a scalar metric to CSV file."""
         if self._metrics_file is not None:
@@ -417,7 +424,12 @@ class LangSplatV2Trainer:
         if self._optimizer is None:
             raise ValueError("This runner was not created with an optimizer.")
 
-        self._logger.info(f"Starting training for {self._cfg.max_steps} steps")
+        self._logger.info(
+            f"Starting training for {self._cfg.max_epochs} epochs "
+            f"({self.total_steps} total steps)"
+        )
+        if self._cfg.max_steps is not None:
+            self._logger.info(f"  max_steps override: {self._cfg.max_steps}")
         self._logger.info(
             f"  Feature level: {self._cfg.feature_level}, "
             f"Batch size: {self._cfg.batch_size}, "
@@ -462,7 +474,7 @@ class LangSplatV2Trainer:
         self._optimizer.zero_grad()
 
         pbar = tqdm.tqdm(
-            total=self._cfg.max_steps,
+            total=self.total_steps,
             desc="Training LangSplatV2",
             initial=self._start_step,
             disable=not show_progress,
@@ -476,19 +488,13 @@ class LangSplatV2Trainer:
         # Following LangSplatV2: layer_idx = min(step / 10000 * layer_num, layer_num - 1)
         layer_num = self._cfg.model.vq_layer_num
 
-        # Track save/eval checkpoints
-        save_steps = set(
-            int(pct * self._cfg.max_steps / 100)
-            for pct in self._cfg.save_at_percent
-        )
-        eval_steps = set(
-            int(pct * self._cfg.max_steps / 100)
-            for pct in self._cfg.eval_at_percent
-        )
+        # Track epochs by samples processed, matching GARfVDB pattern
+        samples_per_epoch = len(self._train_dataset)
+        prev_epoch = -1
 
         trainloader_iter = iter(trainloader)
         step = 0
-        while self._global_step < self._cfg.max_steps:
+        while True:
             try:
                 minibatch = next(trainloader_iter)
             except StopIteration:
@@ -561,14 +567,13 @@ class LangSplatV2Trainer:
             self._global_step += 1
 
             # Logging
+            display_loss = loss.item() * accum_steps
+            pbar.set_postfix(
+                loss=f"{display_loss:.4g}",
+                level=self._cfg.feature_level,
+                layer=layer_idx,
+            )
             if self._global_step % self._log_interval_steps == 0:
-                display_loss = loss.item() * accum_steps
-                pbar.set_postfix(
-                    loss=f"{display_loss:.4g}",
-                    level=self._cfg.feature_level,
-                    layer=layer_idx,
-                )
-
                 mem_gb = torch.cuda.memory_allocated(self.device) / (1024**3)
                 self._log_metric(self._global_step, "train/loss", display_loss)
                 self._log_metric(self._global_step, "train/mem_gb", mem_gb)
@@ -579,31 +584,43 @@ class LangSplatV2Trainer:
 
             pbar.update(1)
 
-            # Save checkpoint
-            if self._global_step in save_steps:
-                self._logger.info(f"Saving checkpoint at step {self._global_step}")
-                self._save_checkpoint(self._global_step, self.state_dict())
+            # Calculate current epoch from samples processed
+            epoch = self._global_step // samples_per_epoch
 
-            # Evaluation
-            if self._global_step in eval_steps and self._val_dataset is not None:
-                self._logger.info(f"Running evaluation at step {self._global_step}")
-                self.eval()
+            # Check for epoch boundary - run save/eval only once per epoch transition
+            if epoch > prev_epoch:
+                prev_epoch = epoch
 
-            # Visualization callback
-            if self._viz_callback is not None and self._global_step % 500 == 0:
-                try:
-                    self._viz_callback(self, self._global_step)
-                except Exception as e:
-                    self._logger.warning(f"Visualization callback failed: {e}")
+                # Visualization callback at epoch boundaries
+                if self._viz_callback is not None:
+                    try:
+                        self._viz_callback(self, epoch)
+                    except Exception as e:
+                        self._logger.warning(f"Visualization callback failed: {e}")
+
+                # Save checkpoint at configured epoch percentages
+                if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.save_at_percent]:
+                    self._logger.info(f"Saving checkpoint at epoch {epoch} (step {self._global_step})")
+                    self._save_checkpoint(self._global_step, self.state_dict())
+
+                # Run evaluation at configured epoch percentages
+                if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.eval_at_percent]:
+                    if self._val_dataset is not None and len(self._val_dataset) > 0:
+                        self._logger.info(f"Running evaluation at epoch {epoch} (step {self._global_step})")
+                        self.eval()
+
+            # Check if we've reached max_steps or max_epochs
+            if self._cfg.max_steps is not None and self._global_step >= self._cfg.max_steps:
+                self._logger.info(f"Reached max steps: {self._cfg.max_steps}")
+                break
+            if epoch >= self._cfg.max_epochs:
+                self._logger.info(f"Reached max epochs: {self._cfg.max_epochs}")
+                break
 
             step += 1
 
         pbar.close()
         self._logger.info("Training completed.")
-
-        # Final save
-        if self._global_step not in save_steps:
-            self._save_checkpoint(self._global_step, self.state_dict())
 
     @torch.inference_mode()
     def eval(self) -> float:
@@ -682,12 +699,15 @@ class LangSplatV2Trainer:
                 "seed": self._cfg.seed,
                 "feature_level": self._cfg.feature_level,
                 "max_steps": self._cfg.max_steps,
+                "max_epochs": self._cfg.max_epochs,
                 "learning_rate": self._cfg.learning_rate,
                 "batch_size": self._cfg.batch_size,
                 "accumulate_grad_steps": self._cfg.accumulate_grad_steps,
                 "use_cosine_loss": self._cfg.use_cosine_loss,
                 "use_l1_loss": self._cfg.use_l1_loss,
                 "normalize_features": self._cfg.normalize_features,
+                "eval_at_percent": self._cfg.eval_at_percent,
+                "save_at_percent": self._cfg.save_at_percent,
                 "model": {
                     "vq_layer_num": self._cfg.model.vq_layer_num,
                     "codebook_size": self._cfg.model.codebook_size,
