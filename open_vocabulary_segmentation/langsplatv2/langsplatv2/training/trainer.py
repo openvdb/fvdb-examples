@@ -593,9 +593,10 @@ class LangSplatV2Trainer:
                 layer=layer_idx,
             )
             if self._global_step % self._log_interval_steps == 0:
-                mem_gb = torch.cuda.memory_allocated(self.device) / (1024**3)
                 self._log_metric(self._global_step, "train/loss", display_loss)
-                self._log_metric(self._global_step, "train/mem_gb", mem_gb)
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    mem_gb = torch.cuda.memory_allocated(self.device) / (1024**3)
+                    self._log_metric(self._global_step, "train/mem_gb", mem_gb)
 
                 for key, val in loss_dict.items():
                     if key != "total_loss":
