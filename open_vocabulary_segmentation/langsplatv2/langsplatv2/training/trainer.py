@@ -9,7 +9,6 @@ initialization, optimization loop, checkpointing, and evaluation.
 import logging
 import math
 import os
-import pathlib
 import random
 from typing import Any, Callable
 
@@ -23,6 +22,7 @@ from fvdb_reality_capture.sfm_scene import SfmScene
 from ..config import LangSplatV2ModelConfig, LangSplatV2TrainingConfig
 from ..loss import calculate_langsplatv2_loss
 from ..model import LangSplatV2Model
+from ..util import calculate_pca_projection, cosine_error_map, pca_projection_fast
 from ..vq_utils import (
     ResidualVectorQuantizationWithClustering,
     load_clip_features_for_level,
@@ -33,6 +33,7 @@ from .dataset import (
     LangSplatV2Dataset,
     build_feature_map,
 )
+from .langsplatv2_writer import LangSplatV2Writer, LangSplatV2WriterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,11 @@ class LangSplatV2Trainer:
         scheduler: torch.optim.lr_scheduler.LRScheduler | None,
         config: LangSplatV2TrainingConfig,
         gs_model: GaussianSplat3d,
-        gs_model_path: pathlib.Path,
+        gs_model_path: "os.PathLike[str]",
         sfm_scene: SfmScene,
         train_dataset: LangSplatV2Dataset,
         val_dataset: LangSplatV2Dataset | None,
-        save_path: pathlib.Path | None,
+        writer: LangSplatV2Writer,
         start_step: int,
         log_interval_steps: int,
         viz_callback: Callable[["LangSplatV2Trainer", int], None] | None = None,
@@ -95,31 +96,20 @@ class LangSplatV2Trainer:
 
         self._global_step: int = start_step
 
-        self._save_path = save_path
+        self._writer = writer
         self._log_interval_steps = log_interval_steps
         self._viz_callback = viz_callback
 
-        # Create save directories
-        if self._save_path is not None:
-            self._checkpoints_path = self._save_path / "checkpoints"
-            self._checkpoints_path.mkdir(parents=True, exist_ok=True)
-            self._metrics_path = self._save_path / "metrics_log.csv"
-            self._metrics_file = open(self._metrics_path, "a", buffering=8 * 1024 * 1024)
-        else:
-            self._checkpoints_path = None
-            self._metrics_file = None
-
     def close(self) -> None:
-        """Flush and close the metrics log file.
+        """Flush and close the writer.
 
         Safe to call multiple times; subsequent calls are no-ops.
         """
-        if self._metrics_file is not None and not self._metrics_file.closed:
-            self._metrics_file.flush()
-            self._metrics_file.close()
+        self._writer.close()
 
     def __del__(self) -> None:
-        self.close()
+        # Only flush -- the writer may be shared, so let the caller close it.
+        self._writer.flush()
 
     def __enter__(self) -> "LangSplatV2Trainer":
         return self
@@ -155,31 +145,16 @@ class LangSplatV2Trainer:
         total_steps: int = self._cfg.max_steps if self._cfg.max_steps is not None else computed_total_steps
         return total_steps
 
-    def _log_metric(self, step: int, name: str, value: float) -> None:
-        """Log a scalar metric to CSV file."""
-        if self._metrics_file is not None:
-            self._metrics_file.write(f"{step},{name},{value}\n")
-
-    def _save_checkpoint(self, step: int, checkpoint: dict[str, Any]) -> None:
-        """Save a training checkpoint."""
-        if self._checkpoints_path is not None:
-            ckpt_dir = self._checkpoints_path / f"{step:08d}"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = ckpt_dir / "langsplatv2_ckpt.pt"
-            torch.save(checkpoint, ckpt_path)
-            self._logger.info(f"Saved checkpoint to {ckpt_path}")
-
     @classmethod
     def new(
         cls,
         sfm_scene: SfmScene,
         gs_model: GaussianSplat3d,
-        gs_model_path: pathlib.Path,
+        gs_model_path: "os.PathLike[str]",
+        writer: LangSplatV2Writer,
         config: LangSplatV2TrainingConfig = LangSplatV2TrainingConfig(),
         device: str | torch.device = "cuda",
         use_every_n_as_val: int = -1,
-        save_path: pathlib.Path | None = None,
-        run_name: str | None = None,
         log_interval_steps: int = 10,
         viz_callback: Callable[["LangSplatV2Trainer", int], None] | None = None,
         cache_dataset: bool = True,
@@ -196,12 +171,12 @@ class LangSplatV2Trainer:
             sfm_scene: Preprocessed SfmScene with CLIP features in cache.
             gs_model: Pre-trained GaussianSplat3d model.
             gs_model_path: Path to the Gaussian splat checkpoint.
+            writer: Writer instance for logging metrics, images, and
+                checkpoints.
             config: Training configuration.
             device: Device for training.
             use_every_n_as_val: Use every N-th image for validation.
                 -1 = no validation split.
-            save_path: Base directory for saving checkpoints and logs.
-            run_name: Name for this training run.
             log_interval_steps: How often to log metrics.
             viz_callback: Optional visualization callback.
             cache_dataset: Whether to cache data in memory.
@@ -212,16 +187,6 @@ class LangSplatV2Trainer:
         np.random.seed(config.seed)
         random.seed(config.seed)
         torch.manual_seed(config.seed)
-
-        # Resolve save path
-        actual_save_path = None
-        if save_path is not None:
-            if run_name is None:
-                import time
-                run_name = f"langsplatv2_lvl{config.feature_level}_{time.strftime('%Y-%m-%d-%H-%M-%S')}"
-            actual_save_path = save_path / run_name
-            actual_save_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Saving results to {actual_save_path}")
 
         # Split into train/val
         indices = np.arange(sfm_scene.num_images)
@@ -271,7 +236,7 @@ class LangSplatV2Trainer:
         )
         clip_features = load_clip_features_for_level(
             full_dataset=all_dataset,
-            feature_level=config.feature_level
+            feature_level=config.feature_level,
         )
         logger.info(f"Loaded {clip_features.shape[0]:,} CLIP features of dimension {clip_features.shape[1]}")
 
@@ -328,7 +293,7 @@ class LangSplatV2Trainer:
             sfm_scene=sfm_scene,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
-            save_path=actual_save_path,
+            writer=writer,
             start_step=0,
             log_interval_steps=log_interval_steps,
             viz_callback=viz_callback,
@@ -340,8 +305,9 @@ class LangSplatV2Trainer:
         cls,
         state_dict: dict[str, Any],
         gs_model: GaussianSplat3d,
-        gs_model_path: pathlib.Path,
+        gs_model_path: "os.PathLike[str]",
         sfm_scene: SfmScene | None = None,
+        writer: LangSplatV2Writer | None = None,
         device: str | torch.device = "cuda",
         eval_only: bool = False,
     ) -> "LangSplatV2Trainer":
@@ -352,6 +318,8 @@ class LangSplatV2Trainer:
             gs_model: GaussianSplat3d model.
             gs_model_path: Path to the GS model file.
             sfm_scene: Optional SfmScene. If None, loaded from checkpoint.
+            writer: Optional writer for logging.  If None, a default writer
+                with no output is used.
             device: Device for the model.
             eval_only: If True, disable gradients for evaluation.
 
@@ -413,6 +381,10 @@ class LangSplatV2Trainer:
                 dataset_indices=val_indices,
             )
 
+        # Use a null writer if none provided
+        if writer is None:
+            writer = LangSplatV2Writer(run_name=None, save_path=None)
+
         logger.info(f"Restored from checkpoint at step {global_step}")
 
         return cls(
@@ -425,7 +397,7 @@ class LangSplatV2Trainer:
             sfm_scene=sfm_scene,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
-            save_path=None,
+            writer=writer,
             start_step=global_step,
             log_interval_steps=10,
             _private=cls.__PRIVATE__,
@@ -594,14 +566,22 @@ class LangSplatV2Trainer:
                 layer=layer_idx,
             )
             if self._global_step % self._log_interval_steps == 0:
-                self._log_metric(self._global_step, "train/loss", display_loss)
+                self._writer.log_metric(self._global_step, "train/loss", display_loss)
                 if self.device.type == "cuda" and torch.cuda.is_available():
                     mem_gb = torch.cuda.memory_allocated(self.device) / (1024**3)
-                    self._log_metric(self._global_step, "train/mem_gb", mem_gb)
+                    self._writer.log_metric(self._global_step, "train/mem_gb", mem_gb)
 
                 for key, val in loss_dict.items():
                     if key != "total_loss":
-                        self._log_metric(self._global_step, f"train/{key}", val.item())
+                        self._writer.log_metric(self._global_step, f"train/{key}", val.item())
+
+                # Log training images when enabled
+                if self._cfg.log_test_images:
+                    self._log_training_images(
+                        predicted_features.detach(),
+                        gt_features.detach(),
+                        feature_mask,
+                    )
 
             pbar.update(1)
 
@@ -622,7 +602,9 @@ class LangSplatV2Trainer:
                 # Save checkpoint at configured epoch percentages
                 if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.save_at_percent]:
                     self._logger.info(f"Saving checkpoint at epoch {epoch} (step {self._global_step})")
-                    self._save_checkpoint(self._global_step, self.state_dict())
+                    self._writer.save_checkpoint(
+                        self._global_step, "langsplatv2_ckpt.pt", self.state_dict()
+                    )
 
                 # Run evaluation at configured epoch percentages
                 if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.eval_at_percent]:
@@ -641,12 +623,52 @@ class LangSplatV2Trainer:
             step += 1
 
         pbar.close()
-        self.close()
+        self._writer.flush()
         self._logger.info("Training completed.")
+
+    @torch.no_grad()
+    def _log_training_images(
+        self,
+        predicted_features: torch.Tensor,
+        gt_features: torch.Tensor,
+        feature_mask: torch.Tensor,
+    ) -> None:
+        """Log PCA projections, feature coverage, and error heatmap during training.
+
+        Args:
+            predicted_features: Predicted CLIP features ``[B, H, W, C]``.
+            gt_features: Ground truth CLIP features ``[B, H, W, C]``.
+            feature_mask: Boolean validity mask ``[B, H, W]``.
+        """
+        try:
+            # Compute shared PCA basis from GT features
+            V = calculate_pca_projection(gt_features, n_components=3)
+
+            # PCA projections (first sample in batch)
+            pred_pca = pca_projection_fast(predicted_features, V=V, mask=feature_mask)
+            gt_pca = pca_projection_fast(gt_features, V=V, mask=feature_mask)
+
+            # Feature coverage mask as grayscale RGB
+            coverage = feature_mask[0].float().unsqueeze(-1).expand(-1, -1, 3)  # [H, W, 3]
+
+            # Cosine error heatmap
+            error = cosine_error_map(predicted_features, gt_features, mask=feature_mask)
+
+            self._writer.save_image(self._global_step, "train/predicted_features.jpg", pred_pca[0].cpu())
+            self._writer.save_image(self._global_step, "train/gt_features.jpg", gt_pca[0].cpu())
+            self._writer.save_image(self._global_step, "train/feature_coverage.jpg", coverage.cpu())
+            self._writer.save_image(self._global_step, "train/cosine_error.jpg", error[0].cpu())
+        except Exception as e:
+            self._logger.warning(f"Failed to log training images: {e}")
 
     @torch.inference_mode()
     def eval(self) -> float:
         """Run evaluation on the validation set.
+
+        Computes the average loss across all validation views, then renders
+        a full set of diagnostic images for the first validation view:
+        beauty render, PCA feature projections, cosine error heatmap,
+        alpha map, and a side-by-side comparison composite.
 
         Returns:
             Average loss on the validation set.
@@ -701,16 +723,81 @@ class LangSplatV2Trainer:
 
         avg_loss = total_loss / max(num_batches, 1)
         self._logger.info(f"Evaluation loss: {avg_loss:.4f}")
-        self._log_metric(self._global_step, "eval/loss", avg_loss)
+        self._writer.log_metric(self._global_step, "eval/loss", avg_loss)
 
-        # Flush metrics so eval results are not left in the write buffer.
-        # We intentionally flush (not close) because eval() is also called
-        # mid-training from train().
-        if self._metrics_file is not None and not self._metrics_file.closed:
-            self._metrics_file.flush()
+        # ---- Evaluation images for the first validation view ----
+        try:
+            self._log_evaluation_images(valloader)
+        except Exception as e:
+            self._logger.warning(f"Failed to log evaluation images: {e}")
 
+        self._writer.flush()
         self._model.train()
         return avg_loss
+
+    @torch.inference_mode()
+    def _log_evaluation_images(self, valloader: torch.utils.data.DataLoader) -> None:
+        """Render and save a full set of evaluation images for the first validation view.
+
+        Produces: beauty render, predicted feature PCA, GT feature PCA,
+        cosine error heatmap, alpha map, and a side-by-side comparison.
+
+        Args:
+            valloader: DataLoader over the validation set.
+        """
+        val_batch = next(iter(valloader)).to(self.device)
+
+        gt_features, feature_mask = build_feature_map(
+            features=val_batch["features"],
+            seg_map=val_batch["seg_map"],
+            clip_n_dims=self._cfg.model.clip_n_dims,
+        )
+
+        img_w = val_batch["image_w"][0]
+        img_h = val_batch["image_h"][0]
+
+        # Beauty render (RGB reference image)
+        beauty, _ = self._gs_model.render_images(
+            world_to_camera_matrices=val_batch["world_to_camera"],
+            projection_matrices=val_batch["projection"],
+            image_width=img_w,
+            image_height=img_h,
+            near=0.01,
+            far=1e10,
+        )
+        beauty = beauty.clamp(0.0, 1.0)  # [B, H, W, 3]
+
+        # Forward pass for predicted features
+        predicted_features, alpha = self._model(
+            world_to_camera=val_batch["world_to_camera"],
+            projection=val_batch["projection"],
+            image_width=img_w,
+            image_height=img_h,
+        )
+
+        # Compute shared PCA basis from GT features
+        V = calculate_pca_projection(gt_features, n_components=3)
+
+        # PCA projections
+        pred_pca = pca_projection_fast(predicted_features, V=V, mask=feature_mask)
+        gt_pca = pca_projection_fast(gt_features, V=V, mask=feature_mask)
+
+        # Cosine error heatmap
+        error = cosine_error_map(predicted_features, gt_features, mask=feature_mask)
+
+        # Alpha map as grayscale RGB
+        alpha_rgb = alpha.clamp(0.0, 1.0).expand(-1, -1, -1, 3)  # [B, H, W, 3]
+
+        # Side-by-side composite: GT PCA | Predicted PCA | Error
+        comparison = torch.cat([gt_pca, pred_pca, error], dim=2)  # [B, H, 3*W, 3]
+
+        # Save all images (first sample in batch)
+        self._writer.save_image(self._global_step, "eval/beauty_render.jpg", beauty[0].cpu())
+        self._writer.save_image(self._global_step, "eval/predicted_features.jpg", pred_pca[0].cpu())
+        self._writer.save_image(self._global_step, "eval/gt_features.jpg", gt_pca[0].cpu())
+        self._writer.save_image(self._global_step, "eval/cosine_error.jpg", error[0].cpu())
+        self._writer.save_image(self._global_step, "eval/alpha_map.jpg", alpha_rgb[0].cpu())
+        self._writer.save_image(self._global_step, "eval/comparison.jpg", comparison[0].cpu())
 
     @torch.no_grad()
     def state_dict(self) -> dict[str, Any]:
@@ -734,6 +821,7 @@ class LangSplatV2Trainer:
                 "use_cosine_loss": self._cfg.use_cosine_loss,
                 "use_l1_loss": self._cfg.use_l1_loss,
                 "normalize_features": self._cfg.normalize_features,
+                "log_test_images": self._cfg.log_test_images,
                 "eval_at_percent": self._cfg.eval_at_percent,
                 "save_at_percent": self._cfg.save_at_percent,
                 "model": {

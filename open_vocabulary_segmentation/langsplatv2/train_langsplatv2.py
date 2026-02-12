@@ -30,7 +30,7 @@ import torch
 import tyro
 
 from langsplatv2.config import LangSplatV2PreprocessConfig, LangSplatV2TrainingConfig
-from langsplatv2.training import LangSplatV2Trainer
+from langsplatv2.training import LangSplatV2Trainer, LangSplatV2Writer, LangSplatV2WriterConfig
 from langsplatv2.util import load_sfm_scene, load_splats_from_file
 
 
@@ -39,6 +39,7 @@ def main(
     reconstruction_path: pathlib.Path,
     config: LangSplatV2TrainingConfig = LangSplatV2TrainingConfig(),
     preprocess: LangSplatV2PreprocessConfig = LangSplatV2PreprocessConfig(),
+    io: LangSplatV2WriterConfig = LangSplatV2WriterConfig(),
     dataset_type: Literal["colmap", "simple_directory", "e57"] = "colmap",
     run_name: str | None = None,
     log_path: pathlib.Path | None = pathlib.Path("langsplatv2_logs"),
@@ -65,6 +66,8 @@ def main(
             loss settings, and optimization parameters.
         preprocess: Preprocessing pipeline configuration for scene transforms
             (image downsampling, SAM2 masks, CLIP features).
+        io: Writer configuration controlling what gets saved to disk
+            (images, checkpoints, metrics, TensorBoard).
         dataset_type: Type of input dataset.
         run_name: Name for this training run. If None, auto-generated from timestamp.
         log_path: Directory for saving checkpoints, metrics, and logs.
@@ -109,16 +112,24 @@ def main(
     preprocessed_scene = scene_transforms(sfm_scene)
     logger.info("Preprocessing complete.")
 
+    # Create writer for logging
+    writer = LangSplatV2Writer(
+        run_name=run_name,
+        save_path=log_path,
+        config=io,
+    )
+    if writer.log_path is not None:
+        logger.info(f"Writer log path: {writer.log_path}")
+
     # Create and run training
     runner = LangSplatV2Trainer.new(
         sfm_scene=preprocessed_scene,
         gs_model=gs_model,
         gs_model_path=reconstruction_path,
+        writer=writer,
         config=config,
         device=device,
         use_every_n_as_val=use_every_n_as_val,
-        save_path=log_path,
-        run_name=run_name,
         log_interval_steps=log_every,
         cache_dataset=cache_dataset,
     )
@@ -127,9 +138,11 @@ def main(
 
     logger.info("=" * 60)
     logger.info("Training complete!")
-    if log_path is not None:
-        logger.info(f"Results saved to {log_path}")
+    if writer.log_path is not None:
+        logger.info(f"Results saved to {writer.log_path}")
     logger.info("=" * 60)
+
+    writer.close()
 
 
 if __name__ == "__main__":

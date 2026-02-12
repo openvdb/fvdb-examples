@@ -294,6 +294,11 @@ class LangSplatV2TrainingConfig:
     model: LangSplatV2ModelConfig = field(default_factory=LangSplatV2ModelConfig)
     """Model architecture configuration."""
 
+    log_test_images: bool = False
+    """Whether to log visualization images (PCA features, error heatmaps)
+    during training steps.  Eval images are always logged when the writer
+    supports image output, regardless of this flag."""
+
     eval_at_percent: list[int] = field(default_factory=lambda: [25, 50, 75, 100])
     """Percentages of total epochs at which to run evaluation."""
 
