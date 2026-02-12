@@ -172,22 +172,21 @@ class LangSplatV2Dataset(SfmDataset):
         return sfm_item
 
     def __getitem__(self, idx: int) -> LangSplatV2DataItem:
-        with nvtx.range("LangSplatV2Dataset.__getitem__"):
-            sfm_item = self._get_sfm_item(idx)
-            index = self._indices[idx]
+        sfm_item = self._get_sfm_item(idx)
+        index = self._indices[idx]
 
-            features, seg_map, _ = self.get_feature_data(index)
+        features, seg_map, _ = self.get_feature_data(index)
 
-            return LangSplatV2DataItem(
-                image=torch.from_numpy(sfm_item["image"]),
-                projection=sfm_item["projection"],
-                camera_to_world=sfm_item["camera_to_world"],
-                world_to_camera=sfm_item["world_to_camera"],
-                features=features,
-                seg_map=seg_map,
-                image_h=sfm_item["image"].shape[0],
-                image_w=sfm_item["image"].shape[1],
-            )
+        return LangSplatV2DataItem(
+            image=torch.from_numpy(sfm_item["image"]),
+            projection=sfm_item["projection"],
+            camera_to_world=sfm_item["camera_to_world"],
+            world_to_camera=sfm_item["world_to_camera"],
+            features=features,
+            seg_map=seg_map,
+            image_h=sfm_item["image"].shape[0],
+            image_w=sfm_item["image"].shape[1],
+        )
 
 
 def build_feature_map(
@@ -275,14 +274,13 @@ def LangSplatV2CollateFn(batch: list[LangSplatV2DataItem]) -> LangSplatV2Input:
     Returns:
         Batched LangSplatV2Input dictionary.
     """
-    features_list = [cast(torch.Tensor, b["features"]) for b in batch]
 
     return LangSplatV2Input(
         image=torch.stack([cast(torch.Tensor, b["image"]) for b in batch]),
         projection=torch.stack([cast(torch.Tensor, b["projection"]) for b in batch]),
         camera_to_world=torch.stack([cast(torch.Tensor, b["camera_to_world"]) for b in batch]),
         world_to_camera=torch.stack([cast(torch.Tensor, b["world_to_camera"]) for b in batch]),
-        features=JaggedTensor.from_list_of_tensors(features_list),
+        features=JaggedTensor([cast(torch.Tensor, b["features"]) for b in batch]),
         seg_map=torch.stack([cast(torch.Tensor, b["seg_map"]) for b in batch]),
         image_h=[cast(int, b["image_h"]) for b in batch],
         image_w=[cast(int, b["image_w"]) for b in batch],
