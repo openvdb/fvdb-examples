@@ -230,6 +230,11 @@ def build_feature_map(
             if in_bounds.all():
                 gt_features[feature_mask] = features[valid_indices]
             else:
+                logger.warning(
+                    "Found %d pixels with seg_map indices >= %d, dropping them",
+                    (~in_bounds).sum().item(),
+                    num_feats,
+                )
                 positions = feature_mask.nonzero(as_tuple=False)  # [N_valid, 2]
                 positions = positions[in_bounds]
                 valid_indices = valid_indices[in_bounds]
@@ -261,6 +266,12 @@ def build_feature_map(
             if in_bounds.all():
                 gt_features[b][mask_b] = feat_b[valid_indices]
             else:
+                logger.warning(
+                    "Batch %d: found %d pixels with seg_map indices >= %d, dropping them",
+                    b,
+                    (~in_bounds).sum().item(),
+                    num_feats,
+                )
                 positions = mask_b.nonzero(as_tuple=False)  # [N_valid, 2]
                 positions = positions[in_bounds]
                 valid_indices = valid_indices[in_bounds]
