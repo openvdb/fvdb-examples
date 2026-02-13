@@ -1,55 +1,111 @@
-# LangSplatV2
+# LangSplatV2 (fVDB)
 
-This project implements LangSplatV2 (Li, et al. 2025) with fVDB for open-vocabulary 3D segmentation.
+LangSplatV2-style open-vocabulary 3D segmentation using [fVDB](https://github.com/openvdb/fvdb-core) and pre-trained Gaussian splat reconstructions. This implementation trains per-Gaussian sparse coefficient fields and shared CLIP-aligned codebooks on an existing reconstruction; it does not train the underlying Gaussians or colors.
 
-## Overview
+## What this implements
 
-The LangSplatV2 scene data transformation pipeline consists of two main steps:
+- **Preprocessing**: Multi-scale SAM2 masks and OpenCLIP feature encoding for each image (cached on disk).
+- **Training**: Residual VQ codebooks and per-splat sparse logits so that rendered language features match the CLIP embeddings from SAM masks. One feature level (scale) per run; train multiple levels separately and combine at inference.
+- **Compatibility**: Same feature pipeline and training setup (loss, LR, layer schedule) as the original LangSplatV2; uses fVDB for the 3D representation and rendering.
 
-1. **Multi-scale SAM2 Segmentation**: Uses SAM2 to generate segmentation masks at multiple scales (default, small, medium, large) for each image.
+## Prerequisites
 
-2. **CLIP Feature Encoding**: Encodes each segmented region using OpenCLIP to produce language-aligned features that can be used for open-vocabulary queries.
+- **SfM scene**: COLMAP, `simple_directory`, or E57 dataset (images + cameras + optional point cloud).
+- **Pre-trained Gaussian splat reconstruction**: A `.ply` or `.pt` / `.pth` checkpoint produced by e.g. [fvdb-reality-capture](https://github.com/openvdb/fvdb-reality-capture) or another fVDB-compatible pipeline. The script uses its normalization transform so the scene and Gaussians are aligned.
 
 ## Installation
 
-```bash
-# Install from the fvdb-examples repository
-pip install -e .
+From this directory (`open_vocabulary_segmentation/langsplatv2/`), with the `fvdb` conda environment active:
 
-# Or install dependencies manually
-pip install open-clip-torch fvdb-reality-capture
+```bash
+conda activate fvdb
+pip install -e .
+```
+
+Dependencies (see `pyproject.toml`) include `torch`, `open-clip-torch`, `fvdb-reality-capture`, `tyro`, and optional TensorBoard for logging.
+
+## How to run
+
+Training loads the SfM scene, applies preprocessing (SAM2 + CLIP) with caching, then runs the language-feature training loop.
+
+**Minimal (COLMAP scene + PLY reconstruction):**
+
+```bash
+python train_langsplatv2.py \
+    --sfm-dataset-path /path/to/colmap/scene \
+    --reconstruction-path /path/to/point_cloud.ply
+```
+
+**With explicit feature level and log directory:**
+
+```bash
+python train_langsplatv2.py \
+    --sfm-dataset-path /path/to/colmap/scene \
+    --reconstruction-path /path/to/point_cloud.ply \
+    --config.feature-level 1 \
+    --log-path langsplatv2_logs
+```
+
+**Train all three scale levels (as in the paper):**
+
+```bash
+for level in 1 2 3; do
+  python train_langsplatv2.py \
+    --sfm-dataset-path /path/to/scene \
+    --reconstruction-path /path/to/gaussians.ply \
+    --config.feature-level $level \
+    --log-path langsplatv2_logs
+done
 ```
 
 
-## Scene Transform Outputs
+**Useful flags:**
 
-### SAM2 Masks
+- `--config.feature-level` — 0=default, 1=small, 2=medium, 3=large (default: 1).
+- `--config.max-steps` — Training steps (default from max_epochs if not set).
+- `--preprocess.image-downsample-factor` — Downsample images before SAM2/CLIP (e.g. 2 for speed).
+- `--preprocess.sam2.checkpoint` — SAM2 size: `large`, `small`, `tiny`, `base_plus`.
+- `--log-path` — Directory for run subdirs (checkpoints, metrics). Use `None` to disable saving.
+- `--io.use-tensorboard` — Log scalars (and optionally images) to TensorBoard.
+- `--use-every-n-as-val` — Hold out every N-th image for validation (e.g. 5); -1 = no validation.
 
-For each image, the SAM2 transform produces:
+## Outputs
 
-- `{scale}_segmentations`: Binary masks, shape `[N, H, W]`
-- `{scale}_bboxes`: Bounding boxes in XYWH format, shape `[N, 4]`
-- `{scale}_areas`: Mask areas in pixels, shape `[N]`
-- `{scale}_predicted_ious`: SAM2's IoU predictions, shape `[N]`
-- `{scale}_stability_scores`: Mask stability scores, shape `[N]`
+With `--log-path` set (e.g. `langsplatv2_logs`), each run writes:
 
-where `{scale}` is one of: `default`, `s` (small), `m` (medium), `l` (large).
+- `log_path/run_<timestamp>/` (or `log_path/<run_name>/` if `--run-name` is set)
+  - `checkpoints/<step>/langsplatv2_ckpt.pt` — Model state and config (when `io.save_checkpoints` is True).
+  - `metrics_log.csv` — Step, loss, and optional validation metrics.
+  - `tensorboard/` — If `io.use_tensorboard` is True.
+  - `images/` — If `io.save_images` is True (e.g. feature visualizations at save steps).
 
-Masks are categorized by area ratio:
-- **Large (l)**: area >= 10% of image
-- **Medium (m)**: 1% <= area < 10%
-- **Small (s)**: area < 1%
-- **Default**: all masks
+Preprocessing caches (SAM2 masks, CLIP features) are stored under the scene’s cache directory and reused across runs.
 
-### CLIP Features
+## Preprocessing pipeline and cache format
 
-For each image, the CLIP transform produces:
+The pipeline (see `LangSplatV2PreprocessConfig` in `config.py`) runs in order: optional scene normalization, point filtering, image downsampling, filter images by visible points, **ComputeMultiScaleSAM2Masks**, **ComputeCLIPFeatures**, and optional cropping.
 
-- `features`: CLIP embeddings, shape `[N_total, 512]`
-- `seg_maps`: Segmentation maps, shape `[4, H, W]`
-- `lengths`: Number of masks per scale, shape `[4]`
+### SAM2 masks (per image)
 
-The `seg_maps` tensor maps each pixel to a feature index (or -1 for unmasked pixels).
+- `{scale}_segmentations`: `[N, H, W]` binary masks
+- `{scale}_bboxes`: `[N, 4]` XYWH
+- `{scale}_areas`, `{scale}_predicted_ious`, `{scale}_stability_scores`
+
+Scales: `default`, `s` (small, &lt;1% area), `m` (1–10%), `l` (≥10%).
+
+### CLIP features (per image)
+
+- `features`: `[N_total, 512]` L2-normalized OpenCLIP embeddings (one per mask, concatenated over scales).
+- `seg_maps`: `[4, H, W]` — pixel → feature index per scale (-1 = no mask).
+- `lengths`: `[4]` — number of masks per scale (default, s, m, l).
+
+Training uses a single `feature_level` (0–3) to choose which scale’s seg map and features to use.
+
+## Training details and comparison with original LangSplatV2
+
+- **Feature generation**: Same as original — crop mask region → pad to square → resize to 224 → OpenCLIP encode → L2-normalize. Scale order and seg-map indexing (default → s → m → l, cumulative) match.
+- **Optimization**: Same language-feature LR (0.0025), layer schedule (every 10k steps), and cosine loss over valid pixels with gradient scaling via mask fraction. Logged and displayed `train/loss` is the mean cosine loss over valid pixels only (`cosine_loss_valid`), which is stable when mask coverage varies.
+- **Data sampling**: One random permutation of all training views per “epoch” (InfiniteSampler with shuffle), one view per step when `batch_size=1`, matching the original’s viewpoint-stack behavior.
 
 ## References
 
