@@ -63,25 +63,14 @@ def calculate_langsplatv2_loss(
     """
     assert use_cosine_loss or use_l1_loss, "At least one loss type must be enabled"
 
-    # Apply mask: only compute loss on valid pixels
-    mask_expanded = mask.unsqueeze(-1).float()  # [B, H, W, 1]
-
     # Optionally normalize predicted features
     if normalize_features:
         predicted_features = predicted_features / (predicted_features.norm(dim=-1, keepdim=True) + 1e-10)
 
-    # Mask both prediction and target
-    pred_masked = predicted_features * mask_expanded
-    gt_masked = gt_features * mask_expanded
-
-    # Only compute on valid pixels to avoid diluting the loss
-    valid_pred = pred_masked[mask]  # [N_valid, clip_n_dims]
-    valid_gt = gt_masked[mask]  # [N_valid, clip_n_dims]
-
     loss_dict: dict[str, torch.Tensor] = {}
     total_loss = torch.tensor(0.0, device=predicted_features.device)
 
-    if valid_pred.shape[0] == 0:
+    if not mask.any():
         # No valid pixels - return zero loss
         loss_dict["total_loss"] = total_loss
         if use_cosine_loss:
@@ -90,13 +79,29 @@ def calculate_langsplatv2_loss(
             loss_dict["l1_loss"] = total_loss
         return loss_dict
 
+    # Gather only valid pixels (clean signal, no NaN risk from torch.empty).
+    valid_pred = predicted_features[mask]  # [N_valid, clip_n_dims]
+    valid_gt = gt_features[mask]  # [N_valid, clip_n_dims]
+
+    # The original LangSplatV2 computes .mean() over ALL H*W pixels, where
+    # masked-out pixels are zero-vectors that contribute ~0 to the sum but
+    # inflate the denominator.  This implicitly scales gradients down by
+    # (N_valid / N_total).  We replicate this by computing the loss on valid
+    # pixels only (clean, interpretable values) and multiplying by the mask
+    # coverage fraction so that gradient magnitudes match the original exactly:
+    #
+    #   grad_original = (1/N_total)  * sum_valid(dL_i)
+    #   grad_ours     = (ratio/N_valid) * sum_valid(dL_i)
+    #                 = (1/N_total)  * sum_valid(dL_i)   [identical]
+    mask_fraction = mask.sum().float() / mask.numel()
+
     if use_cosine_loss:
-        cos_loss = cosine_loss(valid_pred, valid_gt)
+        cos_loss = cosine_loss(valid_pred, valid_gt) * mask_fraction
         loss_dict["cosine_loss"] = cos_loss
         total_loss = total_loss + cos_loss
 
     if use_l1_loss:
-        l1 = l1_loss(valid_pred, valid_gt)
+        l1 = l1_loss(valid_pred, valid_gt) * mask_fraction
         loss_dict["l1_loss"] = l1
         total_loss = total_loss + l1
 

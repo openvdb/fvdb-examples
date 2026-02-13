@@ -30,11 +30,28 @@ class SAM2Config:
     points_per_side: int = 32
     """Grid density for point prompts."""
 
+    points_per_batch: int = 64
+    """Points processed simultaneously by SAM2."""
+
     pred_iou_thresh: float = 0.7
     """Predicted IoU threshold for mask filtering."""
 
     stability_score_thresh: float = 0.85
     """Stability score threshold for mask filtering."""
+
+    crop_n_layers: int = 1
+    """Number of crop layers. 1 = also run SAM on image crops (matching
+    the original LangSplatV2 which uses ``crop_n_layers=1``)."""
+
+    crop_n_points_downscale_factor: int = 1
+    """Point grid downscale factor per crop layer."""
+
+    min_mask_region_area: int = 100
+    """Minimum mask region area for post-processing (matching the original
+    LangSplatV2 which uses ``min_mask_region_area=100``)."""
+
+    box_nms_thresh: float = 0.7
+    """Box NMS IoU threshold within each crop."""
 
     nms_iou_thr: float = 0.8
     """IoU threshold for mask NMS post-processing."""
@@ -172,8 +189,13 @@ class LangSplatV2PreprocessConfig:
                 ComputeMultiScaleSAM2Masks(
                     checkpoint=self.sam2.checkpoint,
                     points_per_side=self.sam2.points_per_side,
+                    points_per_batch=self.sam2.points_per_batch,
                     pred_iou_thresh=self.sam2.pred_iou_thresh,
                     stability_score_thresh=self.sam2.stability_score_thresh,
+                    crop_n_layers=self.sam2.crop_n_layers,
+                    crop_n_points_downscale_factor=self.sam2.crop_n_points_downscale_factor,
+                    min_mask_region_area=self.sam2.min_mask_region_area,
+                    box_nms_thresh=self.sam2.box_nms_thresh,
                     nms_iou_thr=self.sam2.nms_iou_thr,
                     nms_score_thr=self.sam2.nms_score_thr,
                     nms_inner_thr=self.sam2.nms_inner_thr,
@@ -213,8 +235,13 @@ class LangSplatV2PreprocessConfig:
         return ComputeMultiScaleSAM2Masks(
             checkpoint=self.sam2.checkpoint,
             points_per_side=self.sam2.points_per_side,
+            points_per_batch=self.sam2.points_per_batch,
             pred_iou_thresh=self.sam2.pred_iou_thresh,
             stability_score_thresh=self.sam2.stability_score_thresh,
+            crop_n_layers=self.sam2.crop_n_layers,
+            crop_n_points_downscale_factor=self.sam2.crop_n_points_downscale_factor,
+            min_mask_region_area=self.sam2.min_mask_region_area,
+            box_nms_thresh=self.sam2.box_nms_thresh,
             nms_iou_thr=self.sam2.nms_iou_thr,
             nms_score_thr=self.sam2.nms_score_thr,
             nms_inner_thr=self.sam2.nms_inner_thr,
@@ -299,7 +326,7 @@ class LangSplatV2TrainingConfig:
     during training steps.  Eval images are always logged when the writer
     supports image output, regardless of this flag."""
 
-    eval_at_percent: list[int] = field(default_factory=lambda: [25, 50, 75, 100])
+    eval_at_percent: list[int] = field(default_factory=lambda: [5, 10, 20, 30, 40, 50, 75, 100])
     """Percentages of total epochs at which to run evaluation."""
 
     save_at_percent: list[int] = field(default_factory=lambda: [50, 100])

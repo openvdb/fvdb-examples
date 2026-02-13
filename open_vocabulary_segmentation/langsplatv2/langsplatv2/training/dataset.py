@@ -217,13 +217,25 @@ def build_feature_map(
         # Unbatched path: plain tensor [N_masks, clip_n_dims]
         H, W = seg_map.shape
         feature_mask = seg_map >= 0
-        # Use empty -- invalid pixels are masked out in the loss and never read
+        # Use empty -- invalid pixels are never read (the loss gathers only
+        # valid pixels via the mask).
         gt_features = torch.empty(
             H, W, clip_n_dims, dtype=features.dtype, device=features.device
         )
         if feature_mask.any():
             valid_indices = seg_map[feature_mask].long()
-            gt_features[feature_mask] = features[valid_indices]
+            # Guard: exclude pixels whose seg_map index exceeds the feature count
+            num_feats = features.shape[0]
+            in_bounds = valid_indices < num_feats
+            if in_bounds.all():
+                gt_features[feature_mask] = features[valid_indices]
+            else:
+                positions = feature_mask.nonzero(as_tuple=False)  # [N_valid, 2]
+                positions = positions[in_bounds]
+                valid_indices = valid_indices[in_bounds]
+                gt_features[positions[:, 0], positions[:, 1]] = features[valid_indices]
+                feature_mask.fill_(False)
+                feature_mask[positions[:, 0], positions[:, 1]] = True
         return gt_features, feature_mask
 
     # Batched path: JaggedTensor with B elements
@@ -233,7 +245,8 @@ def build_feature_map(
     dtype = features.jdata.dtype
 
     feature_mask = seg_map >= 0  # [B, H, W]
-    # Use empty -- invalid pixels are masked out in the loss and never read
+    # Use empty -- invalid pixels are never read (the loss gathers only
+    # valid pixels via the mask).
     gt_features = torch.empty(
         B, H, W, clip_n_dims, dtype=dtype, device=device
     )
@@ -242,7 +255,18 @@ def build_feature_map(
         if mask_b.any():
             feat_b = features[b].jdata
             valid_indices = seg_map[b][mask_b].long()
-            gt_features[b][mask_b] = feat_b[valid_indices]
+            # Guard: exclude pixels whose seg_map index exceeds the feature count
+            num_feats = feat_b.shape[0]
+            in_bounds = valid_indices < num_feats
+            if in_bounds.all():
+                gt_features[b][mask_b] = feat_b[valid_indices]
+            else:
+                positions = mask_b.nonzero(as_tuple=False)  # [N_valid, 2]
+                positions = positions[in_bounds]
+                valid_indices = valid_indices[in_bounds]
+                gt_features[b, positions[:, 0], positions[:, 1]] = feat_b[valid_indices]
+                feature_mask[b].fill_(False)
+                feature_mask[b, positions[:, 0], positions[:, 1]] = True
 
     return gt_features, feature_mask
 
