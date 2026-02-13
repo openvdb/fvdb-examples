@@ -96,8 +96,11 @@ def calculate_langsplatv2_loss(
     mask_fraction = mask.sum().float() / mask.numel()
 
     if use_cosine_loss:
-        cos_loss = cosine_loss(valid_pred, valid_gt) * mask_fraction
+        cos_loss_raw = cosine_loss(valid_pred, valid_gt)
+        cos_loss = cos_loss_raw * mask_fraction
         loss_dict["cosine_loss"] = cos_loss
+        # Mean over valid pixels only (no mask_fraction); stable for logging when coverage varies
+        loss_dict["cosine_loss_valid"] = cos_loss_raw
         total_loss = total_loss + cos_loss
 
     if use_l1_loss:
