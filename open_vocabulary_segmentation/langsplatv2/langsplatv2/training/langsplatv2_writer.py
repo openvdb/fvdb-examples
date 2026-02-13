@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any, TextIO
 
 import cv2
-import numpy as np
 import torch
 
 
