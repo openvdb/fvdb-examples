@@ -104,7 +104,7 @@ Training uses a single `feature_level` (0–3) to choose which scale’s seg map
 ## Training details and comparison with original LangSplatV2
 
 - **Feature generation**: Same as original — crop mask region → pad to square → resize to 224 → OpenCLIP encode → L2-normalize. Scale order and seg-map indexing (default → s → m → l, cumulative) match.
-- **Optimization**: Same language-feature LR (0.0025), layer schedule (every 10k steps), and cosine loss over valid pixels with gradient scaling via mask fraction. Logged and displayed `train/loss` is the mean cosine loss over valid pixels only (`cosine_loss_valid`), which is stable when mask coverage varies.
+- **Optimization**: Same language-feature LR (0.0025), layer schedule (every 10k steps), and cosine loss over valid pixels with gradient scaling via mask fraction. The scalar `train/loss` is the (mask-fraction-scaled) total loss used for backprop. For a smoother, more interpretable curve when mask coverage varies across images, use `train/cosine_loss_valid`, which is the mean cosine loss over valid pixels only (no mask-fraction scaling), we use this for logging.
 - **Data sampling**: One random permutation of all training views per “epoch” (InfiniteSampler with shuffle), one view per step when `batch_size=1`, matching the original’s viewpoint-stack behavior.
 
 ## References
