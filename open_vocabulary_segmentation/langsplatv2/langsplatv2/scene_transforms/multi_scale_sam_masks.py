@@ -18,13 +18,9 @@ import tqdm
 from torchvision.ops.boxes import batched_nms
 import sam2.utils.amg as _sam2_amg
 
-
 from fvdb_reality_capture.foundation_models import SAM2Model
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmScene
 from fvdb_reality_capture.transforms import BaseTransform, transform
-
-
-
 def mask_nms(
     masks: torch.Tensor,
     scores: torch.Tensor,
