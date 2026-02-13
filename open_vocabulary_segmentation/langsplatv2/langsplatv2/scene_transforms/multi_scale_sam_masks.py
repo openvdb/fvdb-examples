@@ -441,6 +441,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 _root.setLevel(logging.WARNING)
                 _sam2.setLevel(logging.WARNING)
             except Exception:
+                # Silently ignore errors setting logging levels
                 pass
 
             pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Generating SAM2 masks")
@@ -507,6 +508,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 _root.setLevel(_prev_root)
                 _sam2.setLevel(_prev_sam2)
             except Exception:
+                # Silently ignore errors restoring logging levels
                 pass
             self._logger.info(f"Generated masks for {input_scene.num_images} images.")
         else:
