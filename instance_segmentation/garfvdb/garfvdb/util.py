@@ -136,7 +136,7 @@ def pca_projection_fast(
         V = calculate_pca_projection(features_centered, n_components, center=False)
 
     # Project data onto principal components
-    projected = torch.mm(features_flat, V.to(features.device))
+    projected = torch.mm(features_centered, V.to(features.device))
 
     # Normalize to [0, 1] range
     mins = projected.min(dim=0, keepdim=True)[0]
