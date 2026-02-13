@@ -33,7 +33,7 @@ from .dataset import (
     LangSplatV2Dataset,
     build_feature_map,
 )
-from .langsplatv2_writer import LangSplatV2Writer, LangSplatV2WriterConfig
+from .langsplatv2_writer import LangSplatV2Writer
 
 logger = logging.getLogger(__name__)
 
