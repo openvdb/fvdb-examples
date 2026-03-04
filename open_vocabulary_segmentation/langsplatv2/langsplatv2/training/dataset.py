@@ -98,11 +98,23 @@ class LangSplatV2Dataset(SfmDataset):
         """
         import tqdm
 
+        n_empty = 0
         if self._cache_features:
             for idx in tqdm.tqdm(range(len(self)), desc="Warming up feature cache"):
                 index = self._indices[idx]
                 if index not in self._features_cache:
                     self.get_feature_data(index)
+                _, seg_map, _ = self._features_cache.get(index, self.get_feature_data(index))
+                if not (seg_map >= 0).any():
+                    n_empty += 1
+
+            if n_empty > 0:
+                logger.warning(
+                    "%d / %d training images (%.1f%%) have NO valid masks at level %d "
+                    "-- these contribute zero gradient during training",
+                    n_empty, len(self), 100 * n_empty / len(self),
+                    self.feature_level,
+                )
 
         if self._cache_images:
             for idx in tqdm.tqdm(range(len(self)), desc="Warming up image cache"):
@@ -217,9 +229,7 @@ def build_feature_map(
         # Unbatched path: plain tensor [N_masks, clip_n_dims]
         H, W = seg_map.shape
         feature_mask = seg_map >= 0
-        # Use empty -- invalid pixels are never read (the loss gathers only
-        # valid pixels via the mask).
-        gt_features = torch.empty(
+        gt_features = torch.zeros(
             H, W, clip_n_dims, dtype=features.dtype, device=features.device
         )
         if feature_mask.any():
@@ -250,9 +260,7 @@ def build_feature_map(
     dtype = features.jdata.dtype
 
     feature_mask = seg_map >= 0  # [B, H, W]
-    # Use empty -- invalid pixels are never read (the loss gathers only
-    # valid pixels via the mask).
-    gt_features = torch.empty(
+    gt_features = torch.zeros(
         B, H, W, clip_n_dims, dtype=dtype, device=device
     )
     for b in range(B):

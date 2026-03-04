@@ -5,6 +5,9 @@
 
 This transform computes CLIP features for masked image regions generated
 by the multi-scale SAM transform, following the LangSplatV2 approach.
+
+Crop extraction, masking, padding, and resize are performed on the GPU in
+float32 to avoid uint8 quantisation artefacts that occur with ``cv2.resize`` on small masks.
 """
 import logging
 from typing import Any
@@ -12,55 +15,10 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmScene
 from fvdb_reality_capture.transforms import BaseTransform, transform
-
-
-def get_seg_img(mask: np.ndarray, image: np.ndarray, bbox: np.ndarray) -> np.ndarray:
-    """
-    Extract and crop the segmented region from an image.
-
-    Args:
-        mask: Binary segmentation mask, shape [H, W].
-        image: Source image, shape [H, W, 3].
-        bbox: Bounding box in XYWH format.
-
-    Returns:
-        Cropped and masked image region.
-    """
-    x, y, w, h = map(int, bbox)
-
-    # Crop first (view, no copy), then copy only the small region
-    cropped_img = image[y : y + h, x : x + w].copy()
-    cropped_mask = mask[y : y + h, x : x + w]
-
-    # Apply mask only to the cropped region
-    cropped_img[cropped_mask == 0] = 0
-
-    return cropped_img
-
-
-def pad_img(img: np.ndarray) -> np.ndarray:
-    """
-    Pad an image to make it square.
-
-    Args:
-        img: Input image, shape [H, W, 3].
-
-    Returns:
-        Square padded image.
-    """
-    h, w = img.shape[:2]
-    l = max(w, h)
-    pad = np.zeros((l, l, 3), dtype=np.uint8)
-
-    if h > w:
-        pad[:, (h - w) // 2 : (h - w) // 2 + w, :] = img
-    else:
-        pad[(w - h) // 2 : (w - h) // 2 + h, :, :] = img
-
-    return pad
 
 
 @transform
@@ -76,7 +34,7 @@ class ComputeCLIPFeatures(BaseTransform):
     This transform must be run after ComputeMultiScaleSAM2Masks.
     """
 
-    version = "1.0.0"
+    version = "1.1.0"
 
     def __init__(
         self,
@@ -118,16 +76,21 @@ class ComputeCLIPFeatures(BaseTransform):
 
     def _encode_masked_regions(
         self,
-        image: np.ndarray,
+        image_gpu: torch.Tensor,
         masks: np.ndarray,
         bboxes: np.ndarray,
     ) -> torch.Tensor:
         """
         Encode masked image regions using CLIP.
 
+        Performs crop-mask-pad-resize entirely on GPU in float32 (matching
+        the original LangSplatV2 ``mask2segmap`` + ``_embed_clip_sam_tiles``),
+        then normalises and encodes through CLIP in one batch.
+
         Args:
-            image: Source image in RGB format, shape [H, W, 3].
-            masks: Binary masks, shape [N, H, W].
+            image_gpu: Source image on CUDA as float32, shape [H, W, 3],
+                values in [0, 255].
+            masks: Binary masks, shape [N, H, W] (uint8 0/1).
             bboxes: Bounding boxes in XYWH format, shape [N, 4].
 
         Returns:
@@ -138,24 +101,40 @@ class ComputeCLIPFeatures(BaseTransform):
 
         clip_model = self._get_clip_model()
         image_size = clip_model.image_size
+        n = len(masks)
+        device = image_gpu.device
 
-        # Extract each masked region, pad to square, and resize to model's expected size
-        seg_imgs = []
-        for mask, bbox in zip(masks, bboxes):
-            seg_img = get_seg_img(mask, image, bbox)
-            pad_seg_img = pad_img(seg_img)
-            resized_img = cv2.resize(pad_seg_img, (image_size, image_size))
-            seg_imgs.append(resized_img)
+        all_segs = torch.from_numpy(masks).to(device)
+        seg_imgs = torch.empty(n, 3, image_size, image_size, device=device)
 
-        # Stack and convert to tensor with values in [0, 1]
-        seg_imgs_np = np.stack(seg_imgs, axis=0)  # [N, image_size, image_size, 3]
-        seg_imgs_tensor = (
-            torch.from_numpy(seg_imgs_np.astype("float32")).permute(0, 3, 1, 2) / 255.0
-        )  # [N, 3, image_size, image_size]
+        for i in range(n):
+            x, y, w, h = int(bboxes[i][0]), int(bboxes[i][1]), int(bboxes[i][2]), int(bboxes[i][3])
+            w = max(w, 1)
+            h = max(h, 1)
 
-        # Apply model's tensor preprocessing (handles normalization) and encode
+            crop = image_gpu[y : y + h, x : x + w].clone()
+            crop[~all_segs[i, y : y + h, x : x + w].bool()] = 0
+            crop = crop.permute(2, 0, 1)  # HWC -> CHW
+
+            side = max(h, w)
+            padded = torch.zeros(3, side, side, device=device)
+            if h > w:
+                offset = (h - w) // 2
+                padded[:, :, offset : offset + w] = crop
+            else:
+                offset = (w - h) // 2
+                padded[:, offset : offset + h, :] = crop
+
+            seg_imgs[i] = F.interpolate(
+                padded.unsqueeze(0), size=(image_size, image_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+
+        seg_imgs /= 255.0
+
+        # Normalise and encode
         with torch.no_grad():
-            seg_imgs_preprocessed = clip_model.preprocess_tensor(seg_imgs_tensor)
+            seg_imgs_preprocessed = clip_model.preprocess_tensor(seg_imgs)
             clip_embeds = clip_model.encode_image(seg_imgs_preprocessed)
             clip_embeds = clip_embeds / clip_embeds.norm(dim=-1, keepdim=True)
 
@@ -226,7 +205,8 @@ class ComputeCLIPFeatures(BaseTransform):
         # Create cache folder
         model_type_safe = self._clip_model_type.replace("-", "_")
         pretrained_safe = self._clip_model_pretrained.replace("-", "_")
-        cache_prefix = f"clip_features_{model_type_safe}_{pretrained_safe}_{self._clip_n_dims}"
+        version_safe = self.version.replace(".", "_")
+        cache_prefix = f"clip_features_{model_type_safe}_{pretrained_safe}_{self._clip_n_dims}_v{version_safe}"
         output_cache = input_cache.make_folder(
             cache_prefix,
             description=f"CLIP features using {self._clip_model_type}",
@@ -286,16 +266,17 @@ class ComputeCLIPFeatures(BaseTransform):
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w = img.shape[:2]
 
-                # Load SAM2 masks from parent cache
+                img_gpu = torch.from_numpy(img_rgb).to("cuda", dtype=torch.float32)
+
                 mask_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
                 if not input_cache.has_file(mask_filename):
                     raise RuntimeError(
-                        f"Mask file {mask_filename} not found in cache. " "Run ComputeMultiScaleSAM2Masks first."
+                        f"Mask file {mask_filename} not found in cache. "
+                        "Run ComputeMultiScaleSAM2Masks or ComputeMultiScaleSAM1Masks first."
                     )
 
                 _, mask_data = input_cache.read_file(mask_filename)
 
-                # Encode all masked regions across scales
                 all_features = []
                 scale_names = ["default", "s", "m", "l"]
 
@@ -304,7 +285,7 @@ class ComputeCLIPFeatures(BaseTransform):
                     bboxes = mask_data.get(f"{scale_name}_bboxes", np.zeros((0, 4)))
 
                     if len(masks) > 0:
-                        scale_features = self._encode_masked_regions(img_rgb, masks, bboxes)
+                        scale_features = self._encode_masked_regions(img_gpu, masks, bboxes)
                         all_features.append(scale_features)
 
                 # Concatenate features from all scales
@@ -319,6 +300,20 @@ class ComputeCLIPFeatures(BaseTransform):
                 # Verify consistency
                 total_masks = sum(lengths)
                 assert features.shape[0] == total_masks, f"Feature count mismatch: {features.shape[0]} vs {total_masks}"
+
+                if features.shape[0] > 0 and torch.isnan(features).any():
+                    self._logger.warning(
+                        f"Image {image_meta.image_id}: CLIP features contain NaN "
+                        f"({torch.isnan(features).sum().item()} / {features.numel()} values)"
+                    )
+
+                # Report per-scale mask coverage for the first few images
+                if image_meta.image_id < 3:
+                    coverage = {sn: int((seg_maps[i] >= 0).sum()) for i, sn in enumerate(scale_names)}
+                    self._logger.info(
+                        f"Image {image_meta.image_id}: {total_masks} masks, "
+                        f"lengths={lengths}, pixel coverage={coverage}"
+                    )
 
                 # Save
                 cache_filename = f"features_{image_meta.image_id:0{num_zeropad}}"

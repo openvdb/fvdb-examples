@@ -312,6 +312,26 @@ class LangSplatV2Writer:
             torch.save(checkpoint, ckpt_path)
             self._logger.info(f"Saved checkpoint to {ckpt_path}")
 
+    @torch.no_grad()
+    def save_final_checkpoint(self, checkpoint: dict[str, Any]) -> pathlib.Path | None:
+        """Save a ``final_checkpoint.pt`` at the run's top-level directory.
+
+        This makes it easy for evaluation scripts to find the finished
+        checkpoint without globbing through step-numbered subdirectories.
+
+        Args:
+            checkpoint: Checkpoint dictionary (from ``Trainer.state_dict()``).
+
+        Returns:
+            Path to the saved file, or *None* if saving is disabled.
+        """
+        if self._save_path is None:
+            return None
+        final_path = self._save_path / "final_checkpoint.pt"
+        torch.save(checkpoint, final_path)
+        self._logger.info(f"Saved final checkpoint to {final_path}")
+        return final_path
+
     # ------------------------------------------------------------------
     # Helpers (matching GARfVDB writer helpers)
     # ------------------------------------------------------------------

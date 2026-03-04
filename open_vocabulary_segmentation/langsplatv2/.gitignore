@@ -1,2 +1,4 @@
 *.nsys-rep
 langsplatv2_logs/
+frgs_logs/
+*_results*/

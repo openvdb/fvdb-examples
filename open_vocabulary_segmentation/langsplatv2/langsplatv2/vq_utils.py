@@ -166,3 +166,32 @@ def load_clip_features_for_level(
         raise RuntimeError(f"No features found for level {feature_level}")
 
     return torch.cat(all_features, dim=0).float()
+
+
+def load_all_clip_features(
+    full_dataset: LangSplatV2Dataset,
+) -> torch.Tensor:
+    """Load CLIP features from ALL scale levels across all images.
+
+    This matches the original LangSplatV2 codebook initialization which
+    concatenates every ``*_f.npy`` file (each containing features from all
+    4 scales) into a single tensor for k-means.
+
+    Args:
+        full_dataset: The full dataset containing all features.
+
+    Returns:
+        Feature tensor of shape ``[N_all, clip_n_dims]`` containing
+        features from all scale levels and all images.
+    """
+    all_features = []
+
+    for image_id in range(len(full_dataset)):
+        features, _, _ = full_dataset.get_feature_data(image_id)
+        if features.shape[0] > 0:
+            all_features.append(features)
+
+    if len(all_features) == 0:
+        raise RuntimeError("No features found across any images")
+
+    return torch.cat(all_features, dim=0).float()
