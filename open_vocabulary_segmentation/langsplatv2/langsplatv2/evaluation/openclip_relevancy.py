@@ -58,11 +58,14 @@ class OpenCLIPRelevancy:
         self.clip_model_type = clip_model_type
         self.clip_model_pretrained = clip_model_pretrained
 
+        # Select precision based on device: use fp16 only on CUDA, fp32 otherwise
+        precision = "fp16" if self.device.type == "cuda" else "fp32"
+
         # Load OpenCLIP model
         model, _, _ = open_clip.create_model_and_transforms(
             clip_model_type,
             pretrained=clip_model_pretrained,
-            precision="fp16",
+            precision=precision,
         )
         model.eval()
         self.model = model.to(self.device)
