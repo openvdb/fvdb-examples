@@ -89,7 +89,8 @@ def main() -> None:
 
     failed_levels: list[int] = []
 
-    for level in args.levels:
+    total_levels = len(args.levels)
+    for idx, level in enumerate(args.levels, 1):
         run_name = f"{name}_level_{level}"
         cmd = [
             sys.executable,
@@ -103,7 +104,7 @@ def main() -> None:
         ]
 
         print(f"\n{'=' * 60}")
-        print(f"  Training level {level}/{ args.levels[-1]}: {run_name}")
+        print(f"  Training level {level} ({idx}/{total_levels}): {run_name}")
         print(f"{'=' * 60}\n")
 
         result = subprocess.run(cmd)

@@ -325,7 +325,7 @@ class LangSplatV2Writer:
         Returns:
             Path to the saved file, or *None* if saving is disabled.
         """
-        if self._save_path is None:
+        if not self._config.save_checkpoints or self._save_path is None:
             return None
         final_path = self._save_path / "final_checkpoint.pt"
         torch.save(checkpoint, final_path)
