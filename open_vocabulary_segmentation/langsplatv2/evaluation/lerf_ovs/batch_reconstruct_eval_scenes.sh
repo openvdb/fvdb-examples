@@ -1,7 +1,7 @@
 #! /bin/bash
 export PYTHONUNBUFFERED=1
 
-for scene in  teatime waldo_kitchen; do
+for scene in ramen figurines teatime waldo_kitchen; do
   frgs reconstruct \
     --run-name ${scene} \
     --tx.image-downsample-factor 1 \

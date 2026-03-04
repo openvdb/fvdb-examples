@@ -7,7 +7,7 @@ name = "fvdb-langsplatv2"
 version = "0.0.1"
 description = "fVDB Implementation of LangSplatV2"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 
 dependencies = [
     "gdown",

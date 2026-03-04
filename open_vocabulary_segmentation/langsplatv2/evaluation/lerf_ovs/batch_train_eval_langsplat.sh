@@ -2,7 +2,7 @@
 set -ex
 for scene in ramen figurines teatime waldo_kitchen; do
   for level in 1 2 3; do
-    python train_langsplatv2.py \
+    python ../../scripts/train_langsplatv2.py \
       --sfm-dataset-path data/lerf_ovs/${scene} \
       --reconstruction-path reconstructions/${scene}.ply \
       --config.feature-level $level \
