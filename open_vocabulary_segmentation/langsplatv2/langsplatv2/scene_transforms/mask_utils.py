@@ -214,13 +214,13 @@ def mask_nms(
 
     if keep_conf.sum() == 0:
         index = scores.topk(min(3, len(scores))).indices
-        keep_conf[index, 0] = True
+        keep_conf[index] = True
     if keep_inner_u.sum() == 0:
         index = scores.topk(min(3, len(scores))).indices
-        keep_inner_u[index, 0] = True
+        keep_inner_u[index] = True
     if keep_inner_l.sum() == 0:
         index = scores.topk(min(3, len(scores))).indices
-        keep_inner_l[index, 0] = True
+        keep_inner_l[index] = True
     keep *= keep_conf
     keep *= keep_inner_u
     keep *= keep_inner_l
