@@ -191,6 +191,12 @@ def mask_nms(
     iou_max, _ = iou_matrix.max(dim=0)
     inner_iou_matrix_u = torch.triu(inner_iou_matrix, diagonal=1)
     inner_iou_max_u, _ = inner_iou_matrix_u.max(dim=0)
+    # NOTE: this includes the diagonal and the first super-diagonal, which
+    # doesn't match the intended “lower triangle excluding diagonal”
+    # logic used for the containment check.
+    # this should use the lower triangle below the diagonal (-1)
+    # but this won't really effect results and we want to keep the original logic
+    # to match the original LangSplatV2 implementation
     inner_iou_matrix_l = torch.tril(inner_iou_matrix, diagonal=1)
     inner_iou_max_l, _ = inner_iou_matrix_l.max(dim=0)
 
@@ -281,6 +287,18 @@ def masks_update(
             if len(masks_lvl) == 0:
                 masks_new.append([])
                 continue
+
+        before_empty = len(masks_lvl)
+        masks_lvl = [m for m in masks_lvl if m["segmentation"].sum() > 0]
+        n_empty = before_empty - len(masks_lvl)
+        if n_empty > 0:
+            _masks_update_logger.info(
+                "[masks_update] dropped %d zero-area masks (%d remain)",
+                n_empty, len(masks_lvl),
+            )
+        if len(masks_lvl) == 0:
+            masks_new.append([])
+            continue
 
         seg_pred = torch.from_numpy(np.stack([m["segmentation"] for m in masks_lvl], axis=0))
         iou_pred = torch.from_numpy(np.stack([m["predicted_iou"] for m in masks_lvl], axis=0))
