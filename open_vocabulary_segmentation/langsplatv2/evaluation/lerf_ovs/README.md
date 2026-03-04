@@ -54,7 +54,7 @@ frgs reconstruct \
 bash batch_train_eval_langsplat.sh
 ```
 
-For each scene, this trains three models (one per SAM scale level: 1=small, 2=medium, 3=large) for 10k steps using SAM2. The final checkpoints are collected into:
+For each scene, this trains three models (one per SAM scale level: 1=small, 2=medium, 3=large) for 10k steps using SAM1. The final checkpoints are collected into:
 
 ```
 langsplatv2_results/<scene>_level_1.pt
@@ -72,7 +72,7 @@ python ../../scripts/train_langsplatv2.py \
     --run-name teatime_level_1 \
     --log-path langsplatv2_logs \
     --config.max-steps 10000 \
-    --preprocess.sam-model sam2
+    --preprocess.sam-model sam1
 ```
 
 Then copy the final checkpoint:
