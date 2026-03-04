@@ -10,15 +10,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
+    "fvdb-reality-capture",
     "gdown",
+    "matplotlib",
     "numpy",
+    "opencv-python",
+    "open-clip-torch",
+    "sam2",
+    "scikit-learn",
     "torch",
     "torchvision",
-    "opencv-python",
     "tqdm",
-    "open-clip-torch",
-    "fvdb-reality-capture",
-    "scikit-learn",
     "tyro",
 ]
 
