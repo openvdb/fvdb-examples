@@ -102,9 +102,10 @@ class LangSplatV2Dataset(SfmDataset):
         if self._cache_features:
             for idx in tqdm.tqdm(range(len(self)), desc="Warming up feature cache"):
                 index = self._indices[idx]
-                if index not in self._features_cache:
-                    self.get_feature_data(index)
-                _, seg_map, _ = self._features_cache.get(index, self.get_feature_data(index))
+                feature_data = self._features_cache.get(index)
+                if feature_data is None:
+                    feature_data = self.get_feature_data(index)
+                _, seg_map, _ = feature_data
                 if not (seg_map >= 0).any():
                     n_empty += 1
 
