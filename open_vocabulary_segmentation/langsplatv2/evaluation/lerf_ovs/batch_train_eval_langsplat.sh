@@ -9,7 +9,7 @@ for scene in ramen figurines teatime waldo_kitchen; do
       --run-name ${scene}_level_${level} \
       --log-path langsplatv2_logs \
       --config.max-steps 10000 \
-      --preprocess.sam-model sam2
+      --preprocess.sam-model sam1
   done
 
   # Collect checkpoints (final_checkpoint.pt is saved at the run's top level)

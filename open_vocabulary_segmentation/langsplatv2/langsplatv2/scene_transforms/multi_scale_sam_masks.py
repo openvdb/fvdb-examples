@@ -307,69 +307,75 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             _sam2_model_logger.setLevel(logging.DEBUG)
             _root.setLevel(logging.WARNING)
 
-            pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Generating SAM2 masks")
+            try:
+                pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Generating SAM2 masks")
 
-            for image_meta in pbar:
-                image_path = image_meta.image_path
-                img = cv2.imread(image_path)
-                assert img is not None, f"Failed to load image {image_path}"
+                for image_meta in pbar:
+                    image_path = image_meta.image_path
+                    img = cv2.imread(image_path)
+                    assert img is not None, f"Failed to load image {image_path}"
 
-                # Undistort the image if the camera has distortion parameters
-                img = image_meta.camera_metadata.undistort_image(img)
+                    # Undistort the image if the camera has distortion parameters
+                    img = image_meta.camera_metadata.undistort_image(img)
 
-                # Generate multi-scale masks
-                masks_dict = self._generate_multi_scale_masks(img)
+                    # Generate multi-scale masks
+                    masks_dict = self._generate_multi_scale_masks(img)
 
-                # Convert masks to storable format
-                mask_data = {}
-                for scale_name, masks in masks_dict.items():
-                    if len(masks) > 0:
-                        # Store segmentation masks and metadata
-                        mask_data[f"{scale_name}_segmentations"] = np.stack(
-                            [m["segmentation"].astype(np.uint8) for m in masks], axis=0
-                        )
-                        mask_data[f"{scale_name}_bboxes"] = np.array([m["bbox"] for m in masks], dtype=np.float32)
-                        mask_data[f"{scale_name}_areas"] = np.array([m["area"] for m in masks], dtype=np.int32)
-                        mask_data[f"{scale_name}_predicted_ious"] = np.array(
-                            [m["predicted_iou"] for m in masks], dtype=np.float32
-                        )
-                        mask_data[f"{scale_name}_stability_scores"] = np.array(
-                            [m["stability_score"] for m in masks], dtype=np.float32
-                        )
-                    else:
-                        # Empty arrays for scales with no masks
-                        mask_data[f"{scale_name}_segmentations"] = np.zeros(
-                            (0, img.shape[0], img.shape[1]), dtype=np.uint8
-                        )
-                        mask_data[f"{scale_name}_bboxes"] = np.zeros((0, 4), dtype=np.float32)
-                        mask_data[f"{scale_name}_areas"] = np.zeros(0, dtype=np.int32)
-                        mask_data[f"{scale_name}_predicted_ious"] = np.zeros(0, dtype=np.float32)
-                        mask_data[f"{scale_name}_stability_scores"] = np.zeros(0, dtype=np.float32)
+                    # Convert masks to storable format
+                    mask_data = {}
+                    for scale_name, masks in masks_dict.items():
+                        if len(masks) > 0:
+                            # Store segmentation masks and metadata
+                            mask_data[f"{scale_name}_segmentations"] = np.stack(
+                                [m["segmentation"].astype(np.uint8) for m in masks], axis=0
+                            )
+                            mask_data[f"{scale_name}_bboxes"] = np.array(
+                                [m["bbox"] for m in masks], dtype=np.float32
+                            )
+                            mask_data[f"{scale_name}_areas"] = np.array(
+                                [m["area"] for m in masks], dtype=np.int32
+                            )
+                            mask_data[f"{scale_name}_predicted_ious"] = np.array(
+                                [m["predicted_iou"] for m in masks], dtype=np.float32
+                            )
+                            mask_data[f"{scale_name}_stability_scores"] = np.array(
+                                [m["stability_score"] for m in masks], dtype=np.float32
+                            )
+                        else:
+                            # Empty arrays for scales with no masks
+                            mask_data[f"{scale_name}_segmentations"] = np.zeros(
+                                (0, img.shape[0], img.shape[1]), dtype=np.uint8
+                            )
+                            mask_data[f"{scale_name}_bboxes"] = np.zeros((0, 4), dtype=np.float32)
+                            mask_data[f"{scale_name}_areas"] = np.zeros(0, dtype=np.int32)
+                            mask_data[f"{scale_name}_predicted_ious"] = np.zeros(0, dtype=np.float32)
+                            mask_data[f"{scale_name}_stability_scores"] = np.zeros(0, dtype=np.float32)
 
-                # Save to cache
-                cache_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
-                output_cache.write_file(
-                    name=cache_filename,
-                    data=mask_data,
-                    data_type="pt",
-                    metadata={
-                        "checkpoint": self._checkpoint,
-                        "points_per_side": self._points_per_side,
-                        "pred_iou_thresh": self._pred_iou_thresh,
-                        "stability_score_thresh": self._stability_score_thresh,
-                        "crop_n_layers": self._crop_n_layers,
-                        "min_mask_region_area": self._min_mask_region_area,
-                        "nms_iou_thr": self._nms_iou_thr,
-                        "nms_score_thr": self._nms_score_thr,
-                        "nms_inner_thr": self._nms_inner_thr,
-                    },
-                )
+                    # Save to cache
+                    cache_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
+                    output_cache.write_file(
+                        name=cache_filename,
+                        data=mask_data,
+                        data_type="pt",
+                        metadata={
+                            "checkpoint": self._checkpoint,
+                            "points_per_side": self._points_per_side,
+                            "pred_iou_thresh": self._pred_iou_thresh,
+                            "stability_score_thresh": self._stability_score_thresh,
+                            "crop_n_layers": self._crop_n_layers,
+                            "min_mask_region_area": self._min_mask_region_area,
+                            "nms_iou_thr": self._nms_iou_thr,
+                            "nms_score_thr": self._nms_score_thr,
+                            "nms_inner_thr": self._nms_inner_thr,
+                        },
+                    )
 
-            pbar.close()
-            _root.setLevel(_prev_root)
-            self._logger.setLevel(_prev_self)
-            _sam2_model_logger.setLevel(_prev_sam2_model)
-            self._logger.info(f"Generated masks for {input_scene.num_images} images.")
+                pbar.close()
+                self._logger.info(f"Generated masks for {input_scene.num_images} images.")
+            finally:
+                _root.setLevel(_prev_root)
+                self._logger.setLevel(_prev_self)
+                _sam2_model_logger.setLevel(_prev_sam2_model)
         else:
             self._logger.info("Loading masks from cache.")
 
