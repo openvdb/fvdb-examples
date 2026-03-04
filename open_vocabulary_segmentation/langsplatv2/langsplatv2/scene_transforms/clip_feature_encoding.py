@@ -266,7 +266,7 @@ class ComputeCLIPFeatures(BaseTransform):
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w = img.shape[:2]
 
-                img_gpu = torch.from_numpy(img_rgb).to("cuda", dtype=torch.float32)
+                img_gpu = torch.from_numpy(img_rgb).to(self._device, dtype=torch.float32)
 
                 mask_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
                 if not input_cache.has_file(mask_filename):
