@@ -25,6 +25,7 @@ from ..model import LangSplatV2Model
 from ..util import calculate_pca_projection, cosine_error_map, pca_projection_fast
 from ..vq_utils import (
     ResidualVectorQuantizationWithClustering,
+    load_all_clip_features,
     load_clip_features_for_level,
 )
 from .dataset import (
@@ -226,7 +227,6 @@ class LangSplatV2Trainer:
         )
 
         # Initialize codebooks via K-means on CLIP features
-        logger.info("Loading CLIP features for codebook initialization...")
         all_dataset = LangSplatV2Dataset(
             sfm_scene=sfm_scene,
             feature_level=config.feature_level,
@@ -234,10 +234,15 @@ class LangSplatV2Trainer:
             cache_features=False,
             cache_images=False,
         )
-        clip_features = load_clip_features_for_level(
-            full_dataset=all_dataset,
-            feature_level=config.feature_level,
-        )
+        if config.init_codebooks_all_levels:
+            logger.info("Loading CLIP features from ALL scale levels for codebook initialization...")
+            clip_features = load_all_clip_features(full_dataset=all_dataset)
+        else:
+            logger.info(f"Loading CLIP features for level {config.feature_level} for codebook initialization...")
+            clip_features = load_clip_features_for_level(
+                full_dataset=all_dataset,
+                feature_level=config.feature_level,
+            )
         logger.info(f"Loaded {clip_features.shape[0]:,} CLIP features of dimension {clip_features.shape[1]}")
 
         # Run K-means to get initial codebooks

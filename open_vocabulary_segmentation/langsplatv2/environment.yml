@@ -1,0 +1,19 @@
+name: fvdb_langsplatv2
+channels:
+  - conda-forge
+dependencies:
+  - python >=3.10
+  - numpy
+  - pytorch
+  - torchvision
+  - opencv
+  - tqdm
+  - scikit-learn
+  - matplotlib
+  - gdown
+  - open-clip-torch
+  - tyro
+  - sam2
+  - segment-anything
+  - fvdb-core
+  - fvdb-reality-capture

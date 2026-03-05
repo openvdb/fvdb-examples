@@ -43,13 +43,22 @@ def calculate_langsplatv2_loss(
 ) -> dict[str, torch.Tensor]:
     """Compute the LangSplatV2 language feature loss.
 
-    Compares predicted CLIP features with ground truth features, masked to only
-    include valid pixels (those covered by a SAM mask).
+    Both predicted and ground-truth features are zeroed for unmapped pixels
+    (mask == False), matching the original's
+    ``language_feature * language_feature_mask`` approach.  Per-pixel loss
+    is then zeroed for unmapped pixels and averaged over **all** pixels.
+    This means:
+
+    - Unmapped pixels contribute 0 to the reported loss.
+    - The mean over all pixels implicitly down-scales gradients from valid
+      pixels by ``N_valid / N_total``, matching the original's gradient
+      magnitudes exactly.
 
     Args:
-        predicted_features: Predicted feature map of shape ``[B, H, W, clip_n_dims]``.
-        gt_features: Ground truth feature map of shape ``[B, H, W, clip_n_dims]``.
-        mask: Boolean mask of shape ``[B, H, W]`` indicating valid pixels.
+        predicted_features: Predicted feature map, shape ``[B, H, W, C]``
+            or ``[H, W, C]``.
+        gt_features: Ground truth feature map, same shape.
+        mask: Boolean mask, shape ``[B, H, W]`` or ``[H, W]``.
         use_cosine_loss: Whether to include cosine similarity loss.
         use_l1_loss: Whether to include L1 loss.
         normalize_features: Whether to L2-normalize predicted features
@@ -59,52 +68,38 @@ def calculate_langsplatv2_loss(
         Dictionary with loss components:
             - ``"total_loss"``: Combined loss value.
             - ``"cosine_loss"``: Cosine loss component (if enabled).
+            - ``"cosine_loss_valid"``: Cosine loss on valid pixels only (for logging).
             - ``"l1_loss"``: L1 loss component (if enabled).
     """
     assert use_cosine_loss or use_l1_loss, "At least one loss type must be enabled"
 
-    # Optionally normalize predicted features
     if normalize_features:
         predicted_features = predicted_features / (predicted_features.norm(dim=-1, keepdim=True) + 1e-10)
 
     loss_dict: dict[str, torch.Tensor] = {}
     total_loss = torch.tensor(0.0, device=predicted_features.device)
 
-    if not mask.any():
-        # No valid pixels - return zero loss
-        loss_dict["total_loss"] = total_loss
-        if use_cosine_loss:
-            loss_dict["cosine_loss"] = total_loss
-        if use_l1_loss:
-            loss_dict["l1_loss"] = total_loss
-        return loss_dict
-
-    # Gather only valid pixels (clean signal, no NaN risk from torch.empty).
-    valid_pred = predicted_features[mask]  # [N_valid, clip_n_dims]
-    valid_gt = gt_features[mask]  # [N_valid, clip_n_dims]
-
-    # The original LangSplatV2 computes .mean() over ALL H*W pixels, where
-    # masked-out pixels are zero-vectors that contribute ~0 to the sum but
-    # inflate the denominator.  This implicitly scales gradients down by
-    # (N_valid / N_total).  We replicate this by computing the loss on valid
-    # pixels only (clean, interpretable values) and multiplying by the mask
-    # coverage fraction so that gradient magnitudes match the original exactly:
-    #
-    #   grad_original = (1/N_total)  * sum_valid(dL_i)
-    #   grad_ours     = (ratio/N_valid) * sum_valid(dL_i)
-    #                 = (1/N_total)  * sum_valid(dL_i)   [identical]
-    mask_fraction = mask.sum().float() / mask.numel()
+    mask_expanded = mask.unsqueeze(-1)  # [..., 1]
+    masked_pred = predicted_features * mask_expanded
+    masked_gt = gt_features * mask_expanded
 
     if use_cosine_loss:
-        cos_loss_raw = cosine_loss(valid_pred, valid_gt)
-        cos_loss = cos_loss_raw * mask_fraction
-        loss_dict["cosine_loss"] = cos_loss
-        # Mean over valid pixels only (no mask_fraction); stable for logging when coverage varies
-        loss_dict["cosine_loss_valid"] = cos_loss_raw
-        total_loss = total_loss + cos_loss
+        per_pixel_cos = F.cosine_similarity(masked_pred, masked_gt, dim=-1)
+        per_pixel_loss = (1.0 - per_pixel_cos) * mask.float()
+        cos_loss_all = per_pixel_loss.sum() / mask.numel()
+        loss_dict["cosine_loss"] = cos_loss_all
+        total_loss = total_loss + cos_loss_all
+
+        if mask.any():
+            valid_pred = predicted_features[mask]
+            valid_gt = gt_features[mask]
+            loss_dict["cosine_loss_valid"] = cosine_loss(valid_pred, valid_gt)
+        else:
+            loss_dict["cosine_loss_valid"] = cos_loss_all
 
     if use_l1_loss:
-        l1 = l1_loss(valid_pred, valid_gt) * mask_fraction
+        per_pixel_l1 = torch.abs(masked_pred - masked_gt) * mask_expanded
+        l1 = per_pixel_l1.sum() / mask.numel()
         loss_dict["l1_loss"] = l1
         total_loss = total_loss + l1
 

@@ -1,12 +1,12 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Multi-scale SAM2 segmentation transform.
+"""Multi-scale SAM1 segmentation transform.
 
-Uses :class:`fvdb_reality_capture.foundation_models.SAM2Model` with
-``output_mode="multi_scale"`` for a generic "one image/crop + points -> 4 scale
-lists" API. This module implements the LangSplatV2-specific business logic:
-multi-crop generation, point grids per layer, cross-crop NMS, and mask NMS.
+Uses :class:`fvdb_reality_capture.foundation_models.SAM1Model` with
+``output_mode="multi_scale"`` to match the original LangSplatV2's SAM ViT-H
+mask generation pipeline.  Crop management, point grid generation, cross-crop
+NMS, and mask NMS mirror the SAM2 transform.
 """
 import logging
 from typing import Any, Dict, List, Literal
@@ -15,33 +15,46 @@ import cv2
 import numpy as np
 import torch
 import tqdm
-import sam2.utils.amg as _sam2_amg
 
-from fvdb_reality_capture.foundation_models import SAM2Model
+from fvdb_reality_capture.foundation_models import SAM1Model
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmScene
 from fvdb_reality_capture.transforms import BaseTransform, transform
 
 from .mask_utils import cross_crop_nms, masks_update, postprocess_small_regions
 
 
-@transform
-class ComputeMultiScaleSAM2Masks(BaseTransform):
-    """Generate multi-scale segmentation masks using SAM2.
+def _sam1_amg():
+    """Lazy accessor for ``segment_anything.utils.amg``."""
+    try:
+        import segment_anything.utils.amg as _amg
+    except ImportError:
+        raise ImportError(
+            "SAM1 transform requires the segment-anything package. Install with:\n"
+            "  conda install -c conda-forge segment-anything\n"
+            "Or update your environment:\n"
+            "  conda env update -f open_vocabulary_segmentation/langsplatv2/environment.yml"
+        ) from None
+    return _amg
 
-    Uses :class:`fvdb_reality_capture.foundation_models.SAM2Model` with
+
+@transform
+class ComputeMultiScaleSAM1Masks(BaseTransform):
+    """Generate multi-scale segmentation masks using SAM1 (ViT-H/L/B).
+
+    Uses :class:`fvdb_reality_capture.foundation_models.SAM1Model` with
     ``output_mode="multi_scale"`` to split the 3 multimask outputs per point
-    by index (small/medium/large). After generation, mask NMS is applied
-    to each scale level independently.
+    by index (small/medium/large).  Default parameters match the original
+    LangSplatV2 ``preprocess.py`` exactly.
     """
 
-    version = "1.2.0"
+    version = "1.5.0"
 
     def __init__(
         self,
-        checkpoint: Literal["large", "small", "tiny", "base_plus"] = "large",
+        checkpoint: Literal["vit_h", "vit_l", "vit_b"] = "vit_h",
         points_per_side: int = 32,
-        points_per_batch: int = 64,
-        pred_iou_thresh: float = 0.5,
+        points_per_batch: int = 256,
+        pred_iou_thresh: float = 0.7,
         stability_score_thresh: float = 0.85,
         crop_n_layers: int = 1,
         crop_n_points_downscale_factor: int = 1,
@@ -53,10 +66,10 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         device: torch.device | str = "cuda",
     ):
         """
-        Create a multi-scale SAM2 mask generation transform.
+        Create a multi-scale SAM1 mask generation transform.
 
         Args:
-            checkpoint: SAM2 checkpoint size to use.
+            checkpoint: SAM1 model variant (vit_h, vit_l, vit_b).
             points_per_side: Grid density for point prompts.
             points_per_batch: Points processed simultaneously.
             pred_iou_thresh: Predicted IoU threshold.
@@ -69,7 +82,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             nms_iou_thr: IoU threshold for mask NMS post-processing.
             nms_score_thr: Score threshold for mask NMS.
             nms_inner_thr: Inner overlap threshold for mask NMS.
-            device: Device to run SAM2 on.
+            device: Device to run SAM1 on.
         """
         self._checkpoint = checkpoint
         self._points_per_side = points_per_side
@@ -85,12 +98,12 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         self._nms_inner_thr = nms_inner_thr
         self._device = device
 
-        self._sam2_model: SAM2Model | None = None
+        self._sam1_model: SAM1Model | None = None
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
-    def _get_sam2_model(self) -> SAM2Model:
-        if self._sam2_model is None:
-            self._sam2_model = SAM2Model(
+    def _get_sam1_model(self) -> SAM1Model:
+        if self._sam1_model is None:
+            self._sam1_model = SAM1Model(
                 checkpoint=self._checkpoint,
                 points_per_side=self._points_per_side,
                 points_per_batch=self._points_per_batch,
@@ -101,7 +114,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 output_mode="multi_scale",
                 device=self._device,
             )
-        return self._sam2_model
+        return self._sam1_model
 
     def _generate_multi_scale_masks(self, image: np.ndarray) -> dict:
         """Generate masks at multiple scales.
@@ -115,15 +128,15 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             Dictionary with mask lists keyed by ``"default"``, ``"s"``,
             ``"m"``, ``"l"``.
         """
+        amg = _sam1_amg()
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_size = image_rgb.shape[:2]
-        sam2 = self._get_sam2_model()
+        sam1 = self._get_sam1_model()
 
-        # crop boxes and point grids for each layer
-        crop_boxes, layer_idxs = _sam2_amg.generate_crop_boxes(
+        crop_boxes, layer_idxs = amg.generate_crop_boxes(
             orig_size, self._crop_n_layers, 512 / 1500
         )
-        point_grids = _sam2_amg.build_all_layer_point_grids(
+        point_grids = amg.build_all_layer_point_grids(
             self._points_per_side,
             self._crop_n_layers,
             self._crop_n_points_downscale_factor,
@@ -141,7 +154,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             points_scale = np.array([cropped_w, cropped_h], dtype=np.float64)
             point_coords = point_grids[layer_idx] * points_scale
 
-            md, ms, mm, ml = sam2.predict_masks_multi_scale(
+            md, ms, mm, ml = sam1.predict_masks_multi_scale(
                 cropped_im,
                 point_coords=point_coords,
                 crop_box=crop_box,
@@ -152,7 +165,9 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             all_m.extend(mm)
             all_l.extend(ml)
 
-        log_diag = not hasattr(self, '_diag_count') or self._diag_count < 2
+        log_diag = image_rgb.shape is not None  # always log first few images
+        if log_diag and hasattr(self, '_diag_count'):
+            log_diag = self._diag_count < 2
         if log_diag:
             if not hasattr(self, '_diag_count'):
                 self._diag_count = 0
@@ -162,7 +177,6 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
 
-        # Cross-crop NMS (prefer smaller crops)
         if len(crop_boxes) > 1:
             all_default = cross_crop_nms(all_default, iou_threshold=self._box_nms_thresh)
             all_s = cross_crop_nms(all_s, iou_threshold=self._box_nms_thresh)
@@ -175,8 +189,6 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
 
-        # Remove small disconnected regions and holes (matches original SAM's
-        # postprocess_small_regions step in generate_curr_anns)
         if self._min_mask_region_area > 0:
             nms_thresh = self._box_nms_thresh
             all_default = postprocess_small_regions(all_default, self._min_mask_region_area, nms_thresh)
@@ -190,7 +202,6 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
 
-        # Mask NMS per scale
         masks_default, masks_s, masks_m, masks_l = masks_update(
             all_default,
             all_s,
@@ -215,7 +226,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         }
 
     def __call__(self, input_scene: SfmScene) -> SfmScene:
-        """Generate multi-scale SAM2 masks for all images in the scene.
+        """Generate multi-scale SAM1 masks for all images in the scene.
 
         Args:
             input_scene: Input scene containing images.
@@ -229,10 +240,9 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
 
         input_cache: SfmCache = input_scene.cache
 
-        # Create cache folder
         version_safe = self.version.replace(".", "_")
         cache_prefix = (
-            f"sam2_multi_scale_masks_{self._checkpoint}_"
+            f"sam1_multi_scale_masks_{self._checkpoint}_"
             f"p{self._points_per_side}_"
             f"iou{int(self._pred_iou_thresh * 100)}_"
             f"stab{int(self._stability_score_thresh * 100)}_"
@@ -244,13 +254,12 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         )
         output_cache = input_cache.make_folder(
             cache_prefix,
-            description=f"Multi-scale SAM2 masks with {self._checkpoint} checkpoint",
+            description=f"Multi-scale SAM1 masks with {self._checkpoint} checkpoint",
         )
 
         num_zeropad = len(str(len(input_scene.images))) + 2
         regenerate_cache = False
 
-        # Check if cache is valid
         if output_cache.num_files != input_scene.num_images:
             if output_cache.num_files != 0:
                 self._logger.info(
@@ -293,89 +302,62 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
                 break
 
         if regenerate_cache:
-            self._logger.info("Generating multi-scale SAM2 masks for all images.")
-            # Suppress SAM2's per-image INFO (e.g. "Computing image embeddings...")
-            # SAM2 logs through root, so we must suppress root. Setting our own
-            # logger level explicitly ensures propagated messages still reach
-            # root's handlers (propagation skips the parent's level check).
-            _root = logging.getLogger()
-            _prev_root = _root.level
-            _prev_self = self._logger.level
-            _sam2_model_logger = logging.getLogger("fvdb_reality_capture.foundation_models.sam2.SAM2Model")
-            _prev_sam2_model = _sam2_model_logger.level
-            self._logger.setLevel(logging.INFO)
-            _sam2_model_logger.setLevel(logging.INFO)
-            _root.setLevel(logging.WARNING)
+            self._logger.info("Generating multi-scale SAM1 masks for all images.")
 
-            try:
-                pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Generating SAM2 masks")
+            pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Generating SAM1 masks")
 
-                for image_meta in pbar:
-                    image_path = image_meta.image_path
-                    img = cv2.imread(image_path)
-                    assert img is not None, f"Failed to load image {image_path}"
+            for image_meta in pbar:
+                image_path = image_meta.image_path
+                img = cv2.imread(image_path)
+                assert img is not None, f"Failed to load image {image_path}"
 
-                    # Undistort the image if the camera has distortion parameters
-                    img = image_meta.camera_metadata.undistort_image(img)
+                img = image_meta.camera_metadata.undistort_image(img)
 
-                    # Generate multi-scale masks
-                    masks_dict = self._generate_multi_scale_masks(img)
+                masks_dict = self._generate_multi_scale_masks(img)
 
-                    # Convert masks to storable format
-                    mask_data = {}
-                    for scale_name, masks in masks_dict.items():
-                        if len(masks) > 0:
-                            # Store segmentation masks and metadata
-                            mask_data[f"{scale_name}_segmentations"] = np.stack(
-                                [m["segmentation"].astype(np.uint8) for m in masks], axis=0
-                            )
-                            mask_data[f"{scale_name}_bboxes"] = np.array(
-                                [m["bbox"] for m in masks], dtype=np.float32
-                            )
-                            mask_data[f"{scale_name}_areas"] = np.array(
-                                [m["area"] for m in masks], dtype=np.int32
-                            )
-                            mask_data[f"{scale_name}_predicted_ious"] = np.array(
-                                [m["predicted_iou"] for m in masks], dtype=np.float32
-                            )
-                            mask_data[f"{scale_name}_stability_scores"] = np.array(
-                                [m["stability_score"] for m in masks], dtype=np.float32
-                            )
-                        else:
-                            # Empty arrays for scales with no masks
-                            mask_data[f"{scale_name}_segmentations"] = np.zeros(
-                                (0, img.shape[0], img.shape[1]), dtype=np.uint8
-                            )
-                            mask_data[f"{scale_name}_bboxes"] = np.zeros((0, 4), dtype=np.float32)
-                            mask_data[f"{scale_name}_areas"] = np.zeros(0, dtype=np.int32)
-                            mask_data[f"{scale_name}_predicted_ious"] = np.zeros(0, dtype=np.float32)
-                            mask_data[f"{scale_name}_stability_scores"] = np.zeros(0, dtype=np.float32)
+                mask_data = {}
+                for scale_name, masks in masks_dict.items():
+                    if len(masks) > 0:
+                        mask_data[f"{scale_name}_segmentations"] = np.stack(
+                            [m["segmentation"].astype(np.uint8) for m in masks], axis=0
+                        )
+                        mask_data[f"{scale_name}_bboxes"] = np.array([m["bbox"] for m in masks], dtype=np.float32)
+                        mask_data[f"{scale_name}_areas"] = np.array([m["area"] for m in masks], dtype=np.int32)
+                        mask_data[f"{scale_name}_predicted_ious"] = np.array(
+                            [m["predicted_iou"] for m in masks], dtype=np.float32
+                        )
+                        mask_data[f"{scale_name}_stability_scores"] = np.array(
+                            [m["stability_score"] for m in masks], dtype=np.float32
+                        )
+                    else:
+                        mask_data[f"{scale_name}_segmentations"] = np.zeros(
+                            (0, img.shape[0], img.shape[1]), dtype=np.uint8
+                        )
+                        mask_data[f"{scale_name}_bboxes"] = np.zeros((0, 4), dtype=np.float32)
+                        mask_data[f"{scale_name}_areas"] = np.zeros(0, dtype=np.int32)
+                        mask_data[f"{scale_name}_predicted_ious"] = np.zeros(0, dtype=np.float32)
+                        mask_data[f"{scale_name}_stability_scores"] = np.zeros(0, dtype=np.float32)
 
-                    # Save to cache
-                    cache_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
-                    output_cache.write_file(
-                        name=cache_filename,
-                        data=mask_data,
-                        data_type="pt",
-                        metadata={
-                            "checkpoint": self._checkpoint,
-                            "points_per_side": self._points_per_side,
-                            "pred_iou_thresh": self._pred_iou_thresh,
-                            "stability_score_thresh": self._stability_score_thresh,
-                            "crop_n_layers": self._crop_n_layers,
-                            "min_mask_region_area": self._min_mask_region_area,
-                            "nms_iou_thr": self._nms_iou_thr,
-                            "nms_score_thr": self._nms_score_thr,
-                            "nms_inner_thr": self._nms_inner_thr,
-                        },
-                    )
+                cache_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
+                output_cache.write_file(
+                    name=cache_filename,
+                    data=mask_data,
+                    data_type="pt",
+                    metadata={
+                        "checkpoint": self._checkpoint,
+                        "points_per_side": self._points_per_side,
+                        "pred_iou_thresh": self._pred_iou_thresh,
+                        "stability_score_thresh": self._stability_score_thresh,
+                        "crop_n_layers": self._crop_n_layers,
+                        "min_mask_region_area": self._min_mask_region_area,
+                        "nms_iou_thr": self._nms_iou_thr,
+                        "nms_score_thr": self._nms_score_thr,
+                        "nms_inner_thr": self._nms_inner_thr,
+                    },
+                )
 
-                pbar.close()
-                self._logger.info(f"Generated masks for {input_scene.num_images} images.")
-            finally:
-                _root.setLevel(_prev_root)
-                self._logger.setLevel(_prev_self)
-                _sam2_model_logger.setLevel(_prev_sam2_model)
+            pbar.close()
+            self._logger.info(f"Generated masks for {input_scene.num_images} images.")
         else:
             self._logger.info("Loading masks from cache.")
 
@@ -394,7 +376,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
 
     @staticmethod
     def name() -> str:
-        return "ComputeMultiScaleSAM2Masks"
+        return "ComputeMultiScaleSAM1Masks"
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -416,17 +398,17 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         }
 
     @staticmethod
-    def from_state_dict(state_dict: dict[str, Any]) -> "ComputeMultiScaleSAM2Masks":
-        if state_dict["name"] != "ComputeMultiScaleSAM2Masks":
+    def from_state_dict(state_dict: dict[str, Any]) -> "ComputeMultiScaleSAM1Masks":
+        if state_dict["name"] != "ComputeMultiScaleSAM1Masks":
             raise ValueError(
-                f"Expected state_dict with name 'ComputeMultiScaleSAM2Masks', "
+                f"Expected state_dict with name 'ComputeMultiScaleSAM1Masks', "
                 f"got {state_dict['name']} instead."
             )
 
-        return ComputeMultiScaleSAM2Masks(
+        return ComputeMultiScaleSAM1Masks(
             checkpoint=state_dict["checkpoint"],
             points_per_side=state_dict["points_per_side"],
-            points_per_batch=state_dict.get("points_per_batch", 64),
+            points_per_batch=state_dict.get("points_per_batch", 256),
             pred_iou_thresh=state_dict["pred_iou_thresh"],
             stability_score_thresh=state_dict["stability_score_thresh"],
             crop_n_layers=state_dict.get("crop_n_layers", 1),

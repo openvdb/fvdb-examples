@@ -136,10 +136,16 @@ def main(
 
     runner.train()
 
+    # Save a final_checkpoint.pt at the top level of the run directory
+    # so evaluation scripts can find it without globbing step subdirectories
+    final_path = writer.save_final_checkpoint(runner.state_dict())
+
     logger.info("=" * 60)
     logger.info("Training complete!")
     if writer.log_path is not None:
         logger.info(f"Results saved to {writer.log_path}")
+    if final_path is not None:
+        logger.info(f"Final checkpoint: {final_path}")
     logger.info("=" * 60)
 
     writer.close()

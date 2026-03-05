@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -17,7 +18,12 @@ from fvdb_reality_capture.transforms import (
     TransformScene,
 )
 
-from .scene_transforms import ComputeCLIPFeatures, ComputeMultiScaleSAM2Masks
+from .scene_transforms import (
+    ComputeCLIPFeatures,
+    ComputeMultiScaleSAM1Masks,
+    ComputeMultiScaleSAM2Masks,
+    ImportOriginalLangSplatV2Features,
+)
 
 
 @dataclass
@@ -25,13 +31,77 @@ class SAM2Config:
     """Configuration for SAM2 multi-scale mask generation."""
 
     checkpoint: Literal["large", "small", "tiny", "base_plus"] = "large"
-    """SAM2 checkpoint size to use."""
+    """SAM2 checkpoint size to use.  Larger models produce higher-quality masks
+    but run a heavier image encoder.  "base_plus" or "small" can noticeably
+    reduce per-image encoding time at some cost to mask quality."""
+
+    points_per_side: int = 32
+    """Grid density for point prompts.  Total points = points_per_side**2
+    (e.g. 32 -> 1024, 16 -> 256).  Reducing this value is the single
+    largest lever for speeding up mask generation because each point
+    requires a decoder forward pass."""
+
+    points_per_batch: int = 256
+    """Points processed simultaneously by SAM2.  Larger values reduce the
+    number of decoder forward passes (fewer kernel launches) at the cost
+    of higher peak GPU memory.  256 is safe on 24 GB+ GPUs."""
+
+    pred_iou_thresh: float = 0.5
+    """Predicted IoU threshold for mask filtering.  SAM2 predicts
+    substantially lower IoU scores than SAM1 (e.g. small-mask means
+    of 0.3-0.6 vs 0.8-0.9), so the threshold is set lower to achieve
+    comparable mask survival rates."""
+
+    stability_score_thresh: float = 0.85
+    """Stability score threshold for mask filtering."""
+
+    crop_n_layers: int = 1
+    """Number of crop layers.  With ``crop_n_layers=1`` (the LangSplatV2
+    default), 5 crops are generated per image (1 full + 4 overlapping
+    sub-crops), each running a full encoder + decoder pass.  Setting
+    this to 0 reduces to a single full-image crop (~5x fewer passes)
+    at the cost of losing detail from sub-crop masks."""
+
+    crop_n_points_downscale_factor: int = 2
+    """Point grid downscale factor per crop layer.  Sub-crop layers use
+    (points_per_side / 2)**2 points instead of points_per_side**2,
+    reducing decoder cost on sub-crops by ~4x while keeping the
+    full-image crop at full density.  The original LangSplatV2 uses 1
+    with SAM ViT-H; 2 is a reasonable default with SAM2."""
+
+    min_mask_region_area: int = 100
+    """Minimum mask region area for post-processing (matching the original
+    LangSplatV2 which uses ``min_mask_region_area=100``)."""
+
+    box_nms_thresh: float = 0.7
+    """Box NMS IoU threshold within each crop."""
+
+    nms_iou_thr: float = 0.8
+    """IoU threshold for mask NMS post-processing."""
+
+    nms_score_thr: float = 0.7
+    """Score threshold for mask NMS."""
+
+    nms_inner_thr: float = 0.5
+    """Inner overlap threshold for mask NMS."""
+
+
+@dataclass
+class SAM1Config:
+    """Configuration for SAM1 multi-scale mask generation.
+
+    Default values match the original LangSplatV2 ``preprocess.py`` exactly
+    (SAM ViT-H with ``crop_n_layers=1``, ``crop_n_points_downscale_factor=1``).
+    """
+
+    checkpoint: Literal["vit_h", "vit_l", "vit_b"] = "vit_h"
+    """SAM1 model variant.  The original LangSplatV2 uses ViT-H."""
 
     points_per_side: int = 32
     """Grid density for point prompts."""
 
-    points_per_batch: int = 64
-    """Points processed simultaneously by SAM2."""
+    points_per_batch: int = 256
+    """Points processed simultaneously by SAM1."""
 
     pred_iou_thresh: float = 0.7
     """Predicted IoU threshold for mask filtering."""
@@ -40,15 +110,14 @@ class SAM2Config:
     """Stability score threshold for mask filtering."""
 
     crop_n_layers: int = 1
-    """Number of crop layers. 1 = also run SAM on image crops (matching
-    the original LangSplatV2 which uses ``crop_n_layers=1``)."""
+    """Number of crop layers (1 = also run on crops, matching original)."""
 
     crop_n_points_downscale_factor: int = 1
-    """Point grid downscale factor per crop layer."""
+    """Point grid downscale factor per crop layer.  The original LangSplatV2
+    uses 1 (no downscaling on sub-crops)."""
 
     min_mask_region_area: int = 100
-    """Minimum mask region area for post-processing (matching the original
-    LangSplatV2 which uses ``min_mask_region_area=100``)."""
+    """Minimum mask region area for post-processing."""
 
     box_nms_thresh: float = 0.7
     """Box NMS IoU threshold within each crop."""
@@ -124,12 +193,20 @@ class LangSplatV2PreprocessConfig:
     crop_to_points: bool = False
     """If True, crop scene bounds to the point cloud extent."""
 
-    # SAM2 configuration
+    # SAM configuration
+    sam_model: Literal["sam1", "sam2"] = "sam2"
+    """Which SAM model to use for mask generation.  ``"sam1"`` uses the
+    original Segment Anything Model (ViT-H by default) matching the original
+    LangSplatV2 pipeline.  ``"sam2"`` uses SAM2 (Hiera-Large by default)."""
+
+    sam1: SAM1Config = field(default_factory=SAM1Config)
+    """Configuration for SAM1 mask generation (used when ``sam_model="sam1"``)."""
+
     sam2: SAM2Config = field(default_factory=SAM2Config)
-    """Configuration for SAM2 mask generation."""
+    """Configuration for SAM2 mask generation (used when ``sam_model="sam2"``)."""
 
     compute_sam_masks: bool = True
-    """Whether to compute SAM2 segmentation masks."""
+    """Whether to compute SAM segmentation masks."""
 
     # CLIP configuration
     clip: OpenCLIPConfig = field(default_factory=OpenCLIPConfig)
@@ -137,6 +214,15 @@ class LangSplatV2PreprocessConfig:
 
     compute_clip_features: bool = True
     """Whether to compute CLIP features for masked regions."""
+
+    # Import original features (bypasses SAM2 + CLIP)
+    original_features_dir: Path | None = None
+    """Path to the original LangSplatV2 ``language_features/`` directory.
+
+    When set, imports pre-computed ``_f.npy`` / ``_s.npy`` files from the
+    original LangSplatV2 ``preprocess.py`` instead of running SAM2 mask
+    generation and CLIP feature encoding.  Useful for A/B testing against
+    the original pipeline."""
 
     # Device
     device: torch.device | str = "cuda"
@@ -155,9 +241,10 @@ class LangSplatV2PreprocessConfig:
         2. Point cloud percentile filtering
         3. Image downsampling
         4. Image filtering by visible points
-        5. Multi-scale SAM2 mask generation
-        6. CLIP feature encoding
-        7. Scene cropping (optional)
+        5a. Multi-scale SAM1/SAM2 mask generation + CLIP feature encoding, OR
+        5b. Import original LangSplatV2 features (when ``original_features_dir``
+            is set)
+        6. Scene cropping (optional)
 
         Args:
             normalization_transform: Optional 4x4 transformation matrix
@@ -184,28 +271,26 @@ class LangSplatV2PreprocessConfig:
                 rescaled_jpeg_quality=self.rescale_jpeg_quality,
             ),
             FilterImagesWithLowPoints(min_num_points=self.min_points_per_image),
-            # SAM2 mask generation
-            (
-                ComputeMultiScaleSAM2Masks(
-                    checkpoint=self.sam2.checkpoint,
-                    points_per_side=self.sam2.points_per_side,
-                    points_per_batch=self.sam2.points_per_batch,
-                    pred_iou_thresh=self.sam2.pred_iou_thresh,
-                    stability_score_thresh=self.sam2.stability_score_thresh,
-                    crop_n_layers=self.sam2.crop_n_layers,
-                    crop_n_points_downscale_factor=self.sam2.crop_n_points_downscale_factor,
-                    min_mask_region_area=self.sam2.min_mask_region_area,
-                    box_nms_thresh=self.sam2.box_nms_thresh,
-                    nms_iou_thr=self.sam2.nms_iou_thr,
-                    nms_score_thr=self.sam2.nms_score_thr,
-                    nms_inner_thr=self.sam2.nms_inner_thr,
-                    device=self.device,
+        ]
+
+        if self.original_features_dir is not None:
+            # Import pre-computed features from original LangSplatV2
+            transforms.append(
+                ImportOriginalLangSplatV2Features(
+                    original_features_dir=self.original_features_dir,
+                    clip_n_dims=self.clip.clip_n_dims,
                 )
-                if self.compute_sam_masks
-                else Identity()
-            ),
-            # CLIP feature encoding
-            (
+            )
+        else:
+            # Standard pipeline: SAM masks then CLIP features
+            if self.compute_sam_masks:
+                if self.sam_model == "sam1":
+                    transforms.append(self.build_sam1_transform())
+                else:
+                    transforms.append(self.build_sam2_transform())
+            else:
+                transforms.append(Identity())
+            transforms.append(
                 ComputeCLIPFeatures(
                     clip_model_type=self.clip.clip_model_type,
                     clip_model_pretrained=self.clip.clip_model_pretrained,
@@ -214,8 +299,7 @@ class LangSplatV2PreprocessConfig:
                 )
                 if self.compute_clip_features
                 else Identity()
-            ),
-        ]
+            )
 
         # Optional scene cropping
         if self.crop_bbox is not None:
@@ -224,6 +308,29 @@ class LangSplatV2PreprocessConfig:
             transforms.append(CropSceneToPoints(margin=0.0))
 
         return Compose(*transforms)
+
+    def build_sam1_transform(self):
+        """
+        Build only the SAM1 mask generation transform.
+
+        Returns:
+            ComputeMultiScaleSAM1Masks transform.
+        """
+        return ComputeMultiScaleSAM1Masks(
+            checkpoint=self.sam1.checkpoint,
+            points_per_side=self.sam1.points_per_side,
+            points_per_batch=self.sam1.points_per_batch,
+            pred_iou_thresh=self.sam1.pred_iou_thresh,
+            stability_score_thresh=self.sam1.stability_score_thresh,
+            crop_n_layers=self.sam1.crop_n_layers,
+            crop_n_points_downscale_factor=self.sam1.crop_n_points_downscale_factor,
+            min_mask_region_area=self.sam1.min_mask_region_area,
+            box_nms_thresh=self.sam1.box_nms_thresh,
+            nms_iou_thr=self.sam1.nms_iou_thr,
+            nms_score_thr=self.sam1.nms_score_thr,
+            nms_inner_thr=self.sam1.nms_inner_thr,
+            device=self.device,
+        )
 
     def build_sam2_transform(self):
         """
@@ -277,7 +384,9 @@ class LangSplatV2ModelConfig:
     """Dimensionality of CLIP embeddings."""
 
     topk: int = 4
-    """Number of non-zero sparse coefficients per VQ layer."""
+    """Number of non-zero sparse coefficients per VQ layer.
+
+    The original LangSplatV2 uses topk=4 for both training and evaluation."""
 
 
 @dataclass
@@ -317,6 +426,11 @@ class LangSplatV2TrainingConfig:
 
     normalize_features: bool = False
     """Whether to L2-normalize predicted features before computing loss."""
+
+    init_codebooks_all_levels: bool = True
+    """If True, initialize codebooks using features from ALL scale levels
+    (matching original LangSplatV2).  If False, use only the target
+    ``feature_level``."""
 
     model: LangSplatV2ModelConfig = field(default_factory=LangSplatV2ModelConfig)
     """Model architecture configuration."""
