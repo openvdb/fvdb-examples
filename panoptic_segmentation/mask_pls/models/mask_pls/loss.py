@@ -38,14 +38,14 @@ class SemLoss(torch.nn.Module):
         if self.input_mode == MaskPLS.DecoderInputMode.GRID:
             # If the input to the loss function (which is the same as the input/output from the decoder) is the grid centers,
             # (i.e. not the original xyz coordinates), we need to convert the targets to the grid centers as well.
-            input_vdbtensor = targets["vdbtensor"]
+            input_grid = targets["grid"]
 
             # map target semantic labels to the grid
             points = targets["xyz"]
 
             # get mapping of the coordinates to the grid for feature mapping
-            coord_ijks = input_vdbtensor.grid.world_to_grid(points).round().int()
-            inv_idx = input_vdbtensor.grid.ijk_to_inv_index(coord_ijks, cumulative=True)
+            coord_ijks = input_grid.world_to_voxel(points).round().int()
+            inv_idx = input_grid.ijk_to_inv_index(coord_ijks, cumulative=True)
             sem_labels = sem_labels[inv_idx.jdata]
 
         sem_targets = sem_labels

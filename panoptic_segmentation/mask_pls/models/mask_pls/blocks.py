@@ -1,13 +1,14 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 import fvdb
 import fvdb.nn
+from fvdb import ConvolutionPlan, GridBatch, JaggedTensor
 
 
 class SelfAttentionLayer(torch.nn.Module):
@@ -120,19 +121,14 @@ class FFNLayer(torch.nn.Module):
 
 
 class MLP(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim_list, output_dim, use_fvdb: bool = False):
+    def __init__(self, input_dim, hidden_dim_list, output_dim):
         super().__init__()
-        if use_fvdb:
-            linear_cls = fvdb.nn.Linear
-            relu_cls = fvdb.nn.ReLU
-        else:
-            linear_cls = torch.nn.Linear
-            relu_cls = torch.nn.ReLU
-
         self.num_layers = len(hidden_dim_list) + 1
         h = hidden_dim_list
-        self.layers = torch.nn.ModuleList(linear_cls(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-        self.relu = relu_cls()
+        self.layers = torch.nn.ModuleList(
+            torch.nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
+        )
+        self.relu = torch.nn.ReLU()
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
@@ -143,46 +139,42 @@ class MLP(torch.nn.Module):
 
 
 class BasicConvolutionBlock(torch.nn.Module):
-    def __init__(
-        self,
-        inc,
-        outc,
-        ks=3,
-        stride=1,
-        dilation=1,
-        bn_mom=0.1,
-        non_lin=fvdb.nn.ReLU,
-    ):
+    def __init__(self, inc, outc, ks=3, stride=1, dilation=1, bn_mom=0.1):
         super().__init__()
         if dilation != 1:
             raise NotImplementedError("Dilation not implemented for fVDB SparseConv3d")
-        self.net = torch.nn.Sequential(
-            fvdb.nn.SparseConv3d(inc, outc, kernel_size=ks, stride=stride),
-            fvdb.nn.BatchNorm(outc, momentum=bn_mom),
-            non_lin(inplace=True),
-        )
+        self.ks = ks
+        self.stride = stride
+        self.conv = fvdb.nn.SparseConv3d(inc, outc, kernel_size=ks, stride=stride)
+        self.bn = fvdb.nn.BatchNorm(outc, momentum=bn_mom)
 
-    def forward(self, x):
-        out = self.net(x)
-        return out
+    def forward(self, data: JaggedTensor, grid: GridBatch) -> Tuple[JaggedTensor, GridBatch]:
+        target_grid = grid if self.stride == 1 else grid.conv_grid(kernel_size=self.ks, stride=self.stride)
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.ks, stride=self.stride, source_grid=grid, target_grid=target_grid
+        )
+        data = self.conv(data, plan)
+        data = self.bn(data, target_grid)
+        data = fvdb.relu(data)
+        return data, target_grid
 
 
 class BasicDeconvolutionBlock(torch.nn.Module):
-    def __init__(self, inc, outc, ks=3, stride=1, bn_mom=0.1, non_lin=fvdb.nn.LeakyReLU):
+    def __init__(self, inc, outc, ks=3, stride=1, bn_mom=0.1):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            fvdb.nn.SparseConv3d(inc, outc, kernel_size=ks, stride=stride, transposed=True),
-            fvdb.nn.BatchNorm(outc, momentum=bn_mom),
-            non_lin(inplace=True),
-        )
+        self.ks = ks
+        self.stride = stride
+        self.deconv = fvdb.nn.SparseConvTranspose3d(inc, outc, kernel_size=ks, stride=stride)
+        self.bn = fvdb.nn.BatchNorm(outc, momentum=bn_mom)
 
-    def forward(self, x, out_grid=None):
-        for module in self.net:
-            if isinstance(module, fvdb.nn.SparseConv3d):
-                x = module(x, out_grid=out_grid)
-            else:
-                x = module(x)
-        return x
+    def forward(self, data: JaggedTensor, source_grid: GridBatch, target_grid: GridBatch) -> JaggedTensor:
+        plan = ConvolutionPlan.from_grid_batch_transposed(
+            kernel_size=self.ks, stride=self.stride, source_grid=source_grid, target_grid=target_grid
+        )
+        data = self.deconv(data, plan)
+        data = self.bn(data, target_grid)
+        data = target_grid.jagged_like(F.leaky_relu(data.jdata))
+        return data
 
 
 class ResidualBlock(torch.nn.Module):
@@ -190,25 +182,45 @@ class ResidualBlock(torch.nn.Module):
         super().__init__()
         if dilation != 1:
             raise NotImplementedError("Dilation not implemented for fVDB SparseConv3d")
-        self.net = torch.nn.Sequential(
-            fvdb.nn.SparseConv3d(inc, outc, kernel_size=ks, stride=stride),
-            fvdb.nn.BatchNorm(outc, momentum=bn_mom),
-            fvdb.nn.ReLU(inplace=True),
-            fvdb.nn.SparseConv3d(outc, outc, kernel_size=ks, stride=1),
-            fvdb.nn.BatchNorm(outc, momentum=bn_mom),
-        )
+        self.ks = ks
+        self.stride = stride
 
-        self.downsample = (
-            torch.nn.Sequential()
-            if (inc == outc and stride == 1)
-            else torch.nn.Sequential(
-                fvdb.nn.SparseConv3d(inc, outc, kernel_size=1, stride=stride),
-                fvdb.nn.BatchNorm(outc, momentum=bn_mom),
+        self.conv1 = fvdb.nn.SparseConv3d(inc, outc, kernel_size=ks, stride=stride)
+        self.bn1 = fvdb.nn.BatchNorm(outc, momentum=bn_mom)
+        self.conv2 = fvdb.nn.SparseConv3d(outc, outc, kernel_size=ks, stride=1)
+        self.bn2 = fvdb.nn.BatchNorm(outc, momentum=bn_mom)
+
+        if inc == outc and stride == 1:
+            self.downsample_conv = None
+            self.downsample_bn = None
+        else:
+            self.downsample_conv = fvdb.nn.SparseConv3d(inc, outc, kernel_size=1, stride=stride)
+            self.downsample_bn = fvdb.nn.BatchNorm(outc, momentum=bn_mom)
+
+    def forward(self, data: JaggedTensor, grid: GridBatch) -> Tuple[JaggedTensor, GridBatch]:
+        target_grid = grid if self.stride == 1 else grid.conv_grid(kernel_size=self.ks, stride=self.stride)
+
+        plan1 = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.ks, stride=self.stride, source_grid=grid, target_grid=target_grid
+        )
+        out = self.conv1(data, plan1)
+        out = self.bn1(out, target_grid)
+        out = fvdb.relu(out)
+
+        plan2 = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.ks, stride=1, source_grid=target_grid, target_grid=target_grid
+        )
+        out = self.conv2(out, plan2)
+        out = self.bn2(out, target_grid)
+
+        if self.downsample_conv is not None:
+            ds_plan = ConvolutionPlan.from_grid_batch(
+                kernel_size=1, stride=self.stride, source_grid=grid, target_grid=target_grid
             )
-        )
+            residual = self.downsample_conv(data, ds_plan)
+            residual = self.downsample_bn(residual, target_grid)
+        else:
+            residual = data
 
-        self.relu = fvdb.nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        out = self.relu(self.net(x) + self.downsample(x))
-        return out
+        out = fvdb.relu(out + residual)
+        return out, target_grid

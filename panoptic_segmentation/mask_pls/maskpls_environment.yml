@@ -3,14 +3,13 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
-  - python=3.11
-  - pytorch-gpu=2.4.1[build=cuda120*]
+  - python=3.12
+  - pytorch-gpu=2.8.0[build=cuda129*]
   - pip
   - git
   - gitpython
   - ipython
   - tqdm
-  - numpy<2
   - tyro
   - scikit-learn
   - py-opencv

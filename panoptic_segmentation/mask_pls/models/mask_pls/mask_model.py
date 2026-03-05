@@ -7,9 +7,6 @@ from typing import Dict, Tuple
 import torch
 import torch.nn
 
-import fvdb
-import fvdb.nn
-
 from .backbone import MaskPLSEncoderDecoder
 from .blocks import MLP
 from .decoder import MaskedTransformerDecoder
@@ -47,11 +44,7 @@ class MaskPLS(torch.nn.Module):
 
         self.backbone = MaskPLSEncoderDecoder(output_feature_levels=[3])
 
-        self.sem_head = (
-            fvdb.nn.Linear(self.backbone.channels[-1], num_classes)
-            if self.decoder_input_mode == MaskPLS.DecoderInputMode.GRID
-            else torch.nn.Linear(self.backbone.channels[-1], num_classes)
-        )
+        self.sem_head = torch.nn.Linear(self.backbone.channels[-1], num_classes)
 
         self.semantic_embedding_distil = False
         if self.semantic_embedding_distil:
@@ -60,7 +53,6 @@ class MaskPLS(torch.nn.Module):
                 self.backbone.channels[-1],
                 semantic_embedding_hidden_dims[:-1],
                 semantic_embedding_hidden_dims[-1],
-                use_fvdb=(self.decoder_input_mode == MaskPLS.DecoderInputMode.GRID),
             )
 
         if not self.segmentation_only:
@@ -71,36 +63,36 @@ class MaskPLS(torch.nn.Module):
     def forward(self, x: Dict):
         outputs = {}
 
+        logits_sem_embed_grid = None
+
         ###### Backbone ######
         out_feats_grids = self.backbone(x)
-        # out_feats_grids is a List[fvdb.nn.VDBTensor]
-        #    where each VDBTensor corresponds to the `ouput_feature_levels`
+        # out_feats_grids is a List[Tuple[JaggedTensor, GridBatch]]
+        #    where each tuple corresponds to the `output_feature_levels`
         #    plus 1 additional entry which is the last/full-resolution feature level run through the conv mask projection
 
         ###### v2p ######
         # NOTE: Matching MaskPLS paper which performs v2p before sem_head
         #    In SAL, features are at voxel centers throughout, so we provide an option to try either
         if self.decoder_input_mode == MaskPLS.DecoderInputMode.XYZ:
-            # If decoder inputs are the original points, we need to sample the features in the grid and pad them for form
-            #    a minibatch for the semantic head and decoder
             xyz = x["xyz"]
-            feats = [feats_grid.sample_trilinear(xyz).unbind() for feats_grid in out_feats_grids]
+            feats = [grid.sample_trilinear(xyz, data).unbind() for data, grid in out_feats_grids]
 
             # pad batch
             feats, coords, pad_masks = pad_batch(feats, [xyz.unbind() for _ in feats])  # type: ignore
+
+            logits = [self.sem_head(feats[-1])]
         else:
-            feats = out_feats_grids
+            # GRID mode: apply sem_head to the raw JaggedTensor features, then unpack into padded batches
+            last_data, last_grid = out_feats_grids[-1]
+            logits_jt = last_grid.jagged_like(self.sem_head(last_data.jdata))
 
-        logits = [self.sem_head(feats[-1])]
+            if self.semantic_embedding_distil:
+                logits_sem_embed_grid = last_grid.jagged_like(self.sem_embed(last_data.jdata))
 
-        if self.semantic_embedding_distil:
-            logits_sem_embed_grid = self.sem_embed(feats[-1])
-
-        if self.decoder_input_mode == MaskPLS.DecoderInputMode.GRID:
-            # produce a padded batch for the decoder and loss
-            coords = [feat.grid.grid_to_world(feat.ijk.float()).unbind() for feat in out_feats_grids]
-            feats = [feat.data.unbind() for feat in out_feats_grids]
-            logits = [ls.data.unbind() for ls in logits]
+            coords = [grid.voxel_to_world(grid.ijk.float()).unbind() for data, grid in out_feats_grids]
+            feats = [data.unbind() for data, grid in out_feats_grids]
+            logits = [logits_jt.unbind()]
             feats, coords, pad_masks, logits = pad_batch(feats, coords, additional_feats=logits)  # type: ignore
 
         ###### Decoder ######

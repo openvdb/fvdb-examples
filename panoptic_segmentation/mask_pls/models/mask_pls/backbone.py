@@ -1,12 +1,13 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-from typing import List, Type
+from typing import List, Tuple
 
 import torch
 
 import fvdb
 import fvdb.nn
+from fvdb import ConvolutionPlan, GridBatch, JaggedTensor
 
 from .blocks import BasicConvolutionBlock, BasicDeconvolutionBlock, ResidualBlock
 
@@ -20,151 +21,79 @@ class MaskPLSEncoderDecoder(torch.nn.Module):
         input_dim: int = 4,
         stem_blocks: int = 1,
         output_feature_levels: List[int] = [3],
-        conv_deconv_non_lin: Type = fvdb.nn.ReLU,
         bn_momentum: float = 0.02,
     ):
         super().__init__()
         self.output_feature_levels = output_feature_levels
         down_res_blocks = [2, 3, 4, 6]
 
-        self.stem = [
-            fvdb.nn.SparseConv3d(input_dim, self.channels[0], kernel_size=3),
-            fvdb.nn.BatchNorm(self.channels[0], momentum=bn_momentum),
-            fvdb.nn.ReLU(inplace=True),
-        ]
+        # Stem: stride=1, ks=3 convolutions
+        self.stem_convs = torch.nn.ModuleList()
+        self.stem_bns = torch.nn.ModuleList()
+        self.stem_convs.append(fvdb.nn.SparseConv3d(input_dim, self.channels[0], kernel_size=3))
+        self.stem_bns.append(fvdb.nn.BatchNorm(self.channels[0], momentum=bn_momentum))
         for _ in range(1, stem_blocks):
-            self.stem.extend(
-                [
-                    fvdb.nn.SparseConv3d(self.channels[0], self.channels[0], kernel_size=3),
-                    fvdb.nn.BatchNorm(self.channels[0], momentum=bn_momentum),
-                    fvdb.nn.ReLU(inplace=True),
-                ]
-            )
-        self.stem = torch.nn.Sequential(*self.stem)
+            self.stem_convs.append(fvdb.nn.SparseConv3d(self.channels[0], self.channels[0], kernel_size=3))
+            self.stem_bns.append(fvdb.nn.BatchNorm(self.channels[0], momentum=bn_momentum))
 
-        self.stage1 = [
-            BasicConvolutionBlock(
-                self.channels[0], self.channels[0], ks=2, stride=2, bn_mom=bn_momentum, non_lin=conv_deconv_non_lin
-            ),
+        # Encoder stages: each starts with a stride-2 downsample then residual blocks
+        self.stage1 = torch.nn.ModuleList([
+            BasicConvolutionBlock(self.channels[0], self.channels[0], ks=2, stride=2, bn_mom=bn_momentum),
             ResidualBlock(self.channels[0], self.channels[1], ks=3, bn_mom=bn_momentum),
-        ]
-        self.stage1.extend(
-            [
-                ResidualBlock(self.channels[1], self.channels[1], ks=3, bn_mom=bn_momentum)
-                for _ in range(1, down_res_blocks[0])
-            ]
-        )
-        self.stage1 = torch.nn.Sequential(*self.stage1)
+        ] + [
+            ResidualBlock(self.channels[1], self.channels[1], ks=3, bn_mom=bn_momentum)
+            for _ in range(1, down_res_blocks[0])
+        ])
 
-        self.stage2 = [
-            BasicConvolutionBlock(
-                self.channels[1], self.channels[1], ks=2, stride=2, bn_mom=bn_momentum, non_lin=conv_deconv_non_lin
-            ),
+        self.stage2 = torch.nn.ModuleList([
+            BasicConvolutionBlock(self.channels[1], self.channels[1], ks=2, stride=2, bn_mom=bn_momentum),
             ResidualBlock(self.channels[1], self.channels[2], ks=3, bn_mom=bn_momentum),
-        ]
-        self.stage2.extend(
-            [
-                ResidualBlock(self.channels[2], self.channels[2], ks=3, bn_mom=bn_momentum)
-                for _ in range(1, down_res_blocks[1])
-            ]
-        )
-        self.stage2 = torch.nn.Sequential(*self.stage2)
+        ] + [
+            ResidualBlock(self.channels[2], self.channels[2], ks=3, bn_mom=bn_momentum)
+            for _ in range(1, down_res_blocks[1])
+        ])
 
-        self.stage3 = [
-            BasicConvolutionBlock(
-                self.channels[2], self.channels[2], ks=2, stride=2, bn_mom=bn_momentum, non_lin=conv_deconv_non_lin
-            ),
+        self.stage3 = torch.nn.ModuleList([
+            BasicConvolutionBlock(self.channels[2], self.channels[2], ks=2, stride=2, bn_mom=bn_momentum),
             ResidualBlock(self.channels[2], self.channels[3], ks=3, bn_mom=bn_momentum),
-        ]
-        self.stage3.extend(
-            [
-                ResidualBlock(self.channels[3], self.channels[3], ks=3, bn_mom=bn_momentum)
-                for _ in range(1, down_res_blocks[2])
-            ]
-        )
-        self.stage3 = torch.nn.Sequential(*self.stage3)
+        ] + [
+            ResidualBlock(self.channels[3], self.channels[3], ks=3, bn_mom=bn_momentum)
+            for _ in range(1, down_res_blocks[2])
+        ])
 
-        self.stage4 = [
-            BasicConvolutionBlock(
-                self.channels[3], self.channels[3], ks=2, stride=2, bn_mom=bn_momentum, non_lin=conv_deconv_non_lin
-            ),
+        self.stage4 = torch.nn.ModuleList([
+            BasicConvolutionBlock(self.channels[3], self.channels[3], ks=2, stride=2, bn_mom=bn_momentum),
             ResidualBlock(self.channels[3], self.channels[4], ks=3, bn_mom=bn_momentum),
-        ]
-        self.stage4.extend(
-            [
-                ResidualBlock(self.channels[4], self.channels[4], ks=3, bn_mom=bn_momentum)
-                for _ in range(1, down_res_blocks[3])
-            ]
-        )
-        self.stage4 = torch.nn.Sequential(*self.stage4)
+        ] + [
+            ResidualBlock(self.channels[4], self.channels[4], ks=3, bn_mom=bn_momentum)
+            for _ in range(1, down_res_blocks[3])
+        ])
 
-        self.up1 = torch.nn.ModuleList(
-            [
-                BasicDeconvolutionBlock(
-                    self.channels[4],
-                    self.channels[5],
-                    ks=2,
-                    stride=2,
-                    bn_mom=bn_momentum,
-                ),
-                torch.nn.Sequential(
-                    ResidualBlock(self.channels[5] + self.channels[3], self.channels[5], ks=3, bn_mom=bn_momentum),
-                    ResidualBlock(self.channels[5], self.channels[5], ks=3, bn_mom=bn_momentum),
-                ),
-            ]
-        )
+        # Decoder: each level has a deconv block + residual blocks after skip concatenation
+        self.up1_deconv = BasicDeconvolutionBlock(self.channels[4], self.channels[5], ks=2, stride=2, bn_mom=bn_momentum)
+        self.up1_res = torch.nn.ModuleList([
+            ResidualBlock(self.channels[5] + self.channels[3], self.channels[5], ks=3, bn_mom=bn_momentum),
+            ResidualBlock(self.channels[5], self.channels[5], ks=3, bn_mom=bn_momentum),
+        ])
 
-        self.up2 = torch.nn.ModuleList(
-            [
-                BasicDeconvolutionBlock(
-                    self.channels[5],
-                    self.channels[6],
-                    ks=2,
-                    stride=2,
-                    bn_mom=bn_momentum,
-                ),
-                torch.nn.Sequential(
-                    ResidualBlock(self.channels[6] + self.channels[2], self.channels[6], ks=3, bn_mom=bn_momentum),
-                    ResidualBlock(self.channels[6], self.channels[6], ks=3, bn_mom=bn_momentum),
-                ),
-            ]
-        )
+        self.up2_deconv = BasicDeconvolutionBlock(self.channels[5], self.channels[6], ks=2, stride=2, bn_mom=bn_momentum)
+        self.up2_res = torch.nn.ModuleList([
+            ResidualBlock(self.channels[6] + self.channels[2], self.channels[6], ks=3, bn_mom=bn_momentum),
+            ResidualBlock(self.channels[6], self.channels[6], ks=3, bn_mom=bn_momentum),
+        ])
 
-        self.up3 = torch.nn.ModuleList(
-            [
-                BasicDeconvolutionBlock(
-                    self.channels[6],
-                    self.channels[7],
-                    ks=2,
-                    stride=2,
-                    bn_mom=bn_momentum,
-                ),
-                torch.nn.Sequential(
-                    ResidualBlock(self.channels[7] + self.channels[1], self.channels[7], ks=3, bn_mom=bn_momentum),
-                    ResidualBlock(self.channels[7], self.channels[7], ks=3, bn_mom=bn_momentum),
-                ),
-            ]
-        )
+        self.up3_deconv = BasicDeconvolutionBlock(self.channels[6], self.channels[7], ks=2, stride=2, bn_mom=bn_momentum)
+        self.up3_res = torch.nn.ModuleList([
+            ResidualBlock(self.channels[7] + self.channels[1], self.channels[7], ks=3, bn_mom=bn_momentum),
+            ResidualBlock(self.channels[7], self.channels[7], ks=3, bn_mom=bn_momentum),
+        ])
 
-        self.up4 = torch.nn.ModuleList(
-            [
-                BasicDeconvolutionBlock(
-                    self.channels[7],
-                    self.channels[8],
-                    ks=2,
-                    stride=2,
-                    bn_mom=bn_momentum,
-                ),
-                torch.nn.Sequential(
-                    ResidualBlock(self.channels[8] + self.channels[0], self.channels[8], ks=3, bn_mom=bn_momentum),
-                    ResidualBlock(self.channels[8], self.channels[8], ks=3, bn_mom=bn_momentum),
-                ),
-            ]
-        )
+        self.up4_deconv = BasicDeconvolutionBlock(self.channels[7], self.channels[8], ks=2, stride=2, bn_mom=bn_momentum)
+        self.up4_res = torch.nn.ModuleList([
+            ResidualBlock(self.channels[8] + self.channels[0], self.channels[8], ks=3, bn_mom=bn_momentum),
+            ResidualBlock(self.channels[8], self.channels[8], ks=3, bn_mom=bn_momentum),
+        ])
 
-        levels = [self.channels[-i] for i in range(4, 0, -1)]
-
-        # conv mask projection
         self.mask_feat = fvdb.nn.SparseConv3d(
             self.channels[-1],
             self.channels[-1],
@@ -172,43 +101,76 @@ class MaskPLSEncoderDecoder(torch.nn.Module):
             stride=1,
         )
 
-        self.out_bnorm = torch.nn.ModuleList([torch.nn.Sequential() for _ in levels])
+    def _run_stage(
+        self, stage: torch.nn.ModuleList, data: JaggedTensor, grid: GridBatch
+    ) -> Tuple[JaggedTensor, GridBatch]:
+        for block in stage:
+            data, grid = block(data, grid)
+        return data, grid
 
-    def forward(self, x) -> List[fvdb.nn.VDBTensor]:
+    def _run_decoder_level(
+        self,
+        deconv: BasicDeconvolutionBlock,
+        res_blocks: torch.nn.ModuleList,
+        data: JaggedTensor,
+        source_grid: GridBatch,
+        skip_data: JaggedTensor,
+        skip_grid: GridBatch,
+    ) -> Tuple[JaggedTensor, GridBatch]:
+        data = deconv(data, source_grid, skip_grid)
+        data = fvdb.jcat([data, skip_data], dim=1)
+        grid = skip_grid
+        for block in res_blocks:
+            data, grid = block(data, grid)
+        return data, grid
 
-        sparse_input = x["vdbtensor"]
+    def forward(self, x) -> List[Tuple[JaggedTensor, GridBatch]]:
+        data: JaggedTensor = x["features"]
+        grid: GridBatch = x["grid"]
 
-        x0 = self.stem(sparse_input)  # type: ignore
-        x1 = self.stage1(x0)  # type: ignore
-        x2 = self.stage2(x1)  # type: ignore
-        x3 = self.stage3(x2)  # type: ignore
-        x4 = self.stage4(x3)  # type: ignore
+        # Stem: stride=1, ks=3 convolutions (grid topology unchanged)
+        stem_plan = ConvolutionPlan.from_grid_batch(kernel_size=3, stride=1, source_grid=grid, target_grid=grid)
+        for conv, bn in zip(self.stem_convs, self.stem_bns):
+            data = conv(data, stem_plan)
+            data = bn(data, grid)
+            data = fvdb.relu(data)
+        x0_data, x0_grid = data, grid
 
-        y1 = self.up1[0](x4, out_grid=x3.grid)
-        y1 = fvdb.jcat([y1, x3], dim=1)
-        y1 = self.up1[1](y1)
+        # Encoder
+        x1_data, x1_grid = self._run_stage(self.stage1, x0_data, x0_grid)
+        x2_data, x2_grid = self._run_stage(self.stage2, x1_data, x1_grid)
+        x3_data, x3_grid = self._run_stage(self.stage3, x2_data, x2_grid)
+        x4_data, x4_grid = self._run_stage(self.stage4, x3_data, x3_grid)
 
-        y2 = self.up2[0](y1, out_grid=x2.grid)
-        y2 = fvdb.jcat([y2, x2], dim=1)
-        y2 = self.up2[1](y2)
+        # Decoder
+        y1_data, y1_grid = self._run_decoder_level(
+            self.up1_deconv, self.up1_res, x4_data, x4_grid, x3_data, x3_grid
+        )
+        y2_data, y2_grid = self._run_decoder_level(
+            self.up2_deconv, self.up2_res, y1_data, y1_grid, x2_data, x2_grid
+        )
+        y3_data, y3_grid = self._run_decoder_level(
+            self.up3_deconv, self.up3_res, y2_data, y2_grid, x1_data, x1_grid
+        )
+        y4_data, y4_grid = self._run_decoder_level(
+            self.up4_deconv, self.up4_res, y3_data, y3_grid, x0_data, x0_grid
+        )
 
-        y3 = self.up3[0](y2, out_grid=x1.grid)
-        y3 = fvdb.jcat([y3, x1], dim=1)
-        y3 = self.up3[1](y3)
-
-        y4 = self.up4[0](y3, out_grid=x0.grid)
-        y4 = fvdb.jcat([y4, x0], dim=1)
-        y4 = self.up4[1](y4)
-
-        out_feats = [y1, y2, y3, y4]
+        out_feats = [
+            (y1_data, y1_grid),
+            (y2_data, y2_grid),
+            (y3_data, y3_grid),
+            (y4_data, y4_grid),
+        ]
 
         feat_levels = self.output_feature_levels + [3]
+        out_feats = [out_feats[i] for i in feat_levels]
 
-        out_feats = [out_feats[feats] for feats in feat_levels]
-
-        out_feats[-1] = self.mask_feat(out_feats[-1])
-
-        # batch norm
-        out_feats = [bn(feat) for feat, bn in zip(out_feats, self.out_bnorm)]
+        # Apply mask projection conv to the last feature level
+        last_data, last_grid = out_feats[-1]
+        mask_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=3, stride=1, source_grid=last_grid, target_grid=last_grid
+        )
+        out_feats[-1] = (self.mask_feat(last_data, mask_plan), last_grid)
 
         return out_feats
