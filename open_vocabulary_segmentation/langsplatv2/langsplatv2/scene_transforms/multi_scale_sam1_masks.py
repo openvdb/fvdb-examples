@@ -172,7 +172,7 @@ class ComputeMultiScaleSAM1Masks(BaseTransform):
             if not hasattr(self, '_diag_count'):
                 self._diag_count = 0
             self._diag_count += 1
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after predict: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -184,7 +184,7 @@ class ComputeMultiScaleSAM1Masks(BaseTransform):
             all_l = cross_crop_nms(all_l, iou_threshold=self._box_nms_thresh)
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after cross-crop NMS: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -197,7 +197,7 @@ class ComputeMultiScaleSAM1Masks(BaseTransform):
             all_l = postprocess_small_regions(all_l, self._min_mask_region_area, nms_thresh)
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after postprocess_small_regions: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -213,7 +213,7 @@ class ComputeMultiScaleSAM1Masks(BaseTransform):
         )
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after masks_update: default=%d, s=%d, m=%d, l=%d",
                 len(masks_default), len(masks_s), len(masks_m), len(masks_l),
             )

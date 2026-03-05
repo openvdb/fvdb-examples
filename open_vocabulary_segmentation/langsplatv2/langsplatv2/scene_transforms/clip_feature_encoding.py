@@ -310,7 +310,7 @@ class ComputeCLIPFeatures(BaseTransform):
                 # Report per-scale mask coverage for the first few images
                 if image_meta.image_id < 3:
                     coverage = {sn: int((seg_maps[i] >= 0).sum()) for i, sn in enumerate(scale_names)}
-                    self._logger.info(
+                    self._logger.debug(
                         f"Image {image_meta.image_id}: {total_masks} masks, "
                         f"lengths={lengths}, pixel coverage={coverage}"
                     )

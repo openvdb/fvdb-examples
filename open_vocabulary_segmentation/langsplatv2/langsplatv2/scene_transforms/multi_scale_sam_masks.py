@@ -157,7 +157,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             if not hasattr(self, '_diag_count'):
                 self._diag_count = 0
             self._diag_count += 1
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after predict: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -170,7 +170,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             all_l = cross_crop_nms(all_l, iou_threshold=self._box_nms_thresh)
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after cross-crop NMS: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -185,7 +185,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             all_l = postprocess_small_regions(all_l, self._min_mask_region_area, nms_thresh)
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after postprocess_small_regions: default=%d, s=%d, m=%d, l=%d",
                 len(all_default), len(all_s), len(all_m), len(all_l),
             )
@@ -202,7 +202,7 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
         )
 
         if log_diag:
-            self._logger.info(
+            self._logger.debug(
                 "[diag] after masks_update: default=%d, s=%d, m=%d, l=%d",
                 len(masks_default), len(masks_s), len(masks_m), len(masks_l),
             )
@@ -303,8 +303,8 @@ class ComputeMultiScaleSAM2Masks(BaseTransform):
             _prev_self = self._logger.level
             _sam2_model_logger = logging.getLogger("fvdb_reality_capture.foundation_models.sam2.SAM2Model")
             _prev_sam2_model = _sam2_model_logger.level
-            self._logger.setLevel(logging.DEBUG)
-            _sam2_model_logger.setLevel(logging.DEBUG)
+            self._logger.setLevel(logging.INFO)
+            _sam2_model_logger.setLevel(logging.INFO)
             _root.setLevel(logging.WARNING)
 
             try:
