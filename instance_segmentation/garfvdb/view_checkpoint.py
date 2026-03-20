@@ -450,16 +450,27 @@ class ViewCheckpoint:
                 # (eye_direction points FROM camera TOWARD center)
                 position = center - eye_direction * radius
 
-                # Forward = eye_direction (already the look direction)
-                forward = eye_direction / np.linalg.norm(eye_direction)
+                # Guard against degenerate camera states (zero-length vectors
+                # produce NaN and ultimately a singular matrix).
+                eye_norm = np.linalg.norm(eye_direction)
+                if eye_norm < 1e-8:
+                    return
+
+                forward = eye_direction / eye_norm
 
                 # Right vector = forward x up_world
                 right = np.cross(forward, up_world)
-                right = right / np.linalg.norm(right)
+                right_norm = np.linalg.norm(right)
+                if right_norm < 1e-8:
+                    return
+                right = right / right_norm
 
                 # Up vector = right x forward
                 up = np.cross(right, forward)
-                up = up / np.linalg.norm(up)
+                up_norm = np.linalg.norm(up)
+                if up_norm < 1e-8:
+                    return
+                up = up / up_norm
 
                 # Build OpenGL-style camera-to-world (X-right, Y-up, Z-backward)
                 # In OpenGL, camera looks along -Z, so Z column = -forward
@@ -473,7 +484,10 @@ class ViewCheckpoint:
                 c2w_opencv = c2w_opengl @ opengl_to_opencv
 
                 camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
-                world_to_camera = torch.linalg.inv(camera_to_world).contiguous()
+                try:
+                    world_to_camera = torch.linalg.inv(camera_to_world).contiguous()
+                except torch._C._LinAlgError:
+                    return
 
                 # Render at lower resolution for performance
                 rgba_image = renderer.render_segmentation_image(
