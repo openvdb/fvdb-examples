@@ -7,7 +7,7 @@ dependencies:
   - blas=*=mkl
   - python=3.12
   - pytorch-gpu=2.10.0
-  - cuda-version=12.9
+  - cuda-version=13.0
   - pip
   - git
   - gitpython
