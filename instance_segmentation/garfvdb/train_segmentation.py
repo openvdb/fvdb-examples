@@ -244,7 +244,10 @@ def main(
             from garfvdb.training.dataset import GARfVDBInput
 
             # Render at lower resolution for performance
-            world_to_camera = torch.inverse(camera_to_world).contiguous()
+            try:
+                world_to_camera = torch.linalg.inv(camera_to_world).contiguous()
+            except torch.linalg.LinAlgError:
+                return None
             model_input = GARfVDBInput(
                 {
                     "projection": reference_projection.unsqueeze(0),
