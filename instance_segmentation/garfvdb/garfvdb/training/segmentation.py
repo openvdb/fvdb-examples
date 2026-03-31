@@ -292,6 +292,17 @@ class GaussianSplatScaleConditionedSegmentation:
             return torch.device(dev)
         return dev
 
+    @property
+    def viz_callback(self) -> Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None:
+        """Get or set the visualization callback invoked at epoch boundaries."""
+        return self._viz_callback
+
+    @viz_callback.setter
+    def viz_callback(
+        self, callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None
+    ) -> None:
+        self._viz_callback = callback
+
     @staticmethod
     def _init_model(
         model_config: GARfVDBModelConfig,

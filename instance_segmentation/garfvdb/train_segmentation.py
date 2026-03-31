@@ -107,22 +107,6 @@ def main(
     gs_model, metadata = load_splats_from_file(reconstruction_path, device)
     normalization_transform = metadata.get("normalization_transform", None)
 
-    # ---- Create the runner (SAM2 masks + model init) ----
-    writer = GaussianSplatSegmentationWriter(run_name=run_name, save_path=log_path, config=io, exist_ok=False)
-    runner = GaussianSplatScaleConditionedSegmentation.new(
-        sfm_scene=tx.build_scene_transforms(gs_model, normalization_transform)(sfm_scene),
-        gs_model=gs_model,
-        gs_model_path=reconstruction_path,
-        writer=writer,
-        config=config,
-        device=device,
-        use_every_n_as_val=use_every_n_as_val,
-        viewer_update_interval_epochs=visualize_every,
-        log_interval_steps=log_every,
-        viz_callback=None,
-        cache_dataset=cache_dataset,
-    )
-
     # ---- Start the viewer ----
     viz_scene = None
     image_view = None
@@ -315,8 +299,22 @@ def main(
             image_view.update(frame.flatten())
             logger.debug(f"Updated segmentation overlay at epoch {epoch}")
 
-    if image_view is not None:
-        runner._viz_callback = update_visualization
+# ---- Create the runner (SAM2 masks + model init) ----
+    # ---- Create the runner (SAM2 masks + model init) ----
+    writer = GaussianSplatSegmentationWriter(run_name=run_name, save_path=log_path, config=io, exist_ok=False)
+    runner = GaussianSplatScaleConditionedSegmentation.new(
+        sfm_scene=tx.build_scene_transforms(gs_model, normalization_transform)(sfm_scene),
+        gs_model=gs_model,
+        gs_model_path=reconstruction_path,
+        writer=writer,
+        config=config,
+        device=device,
+        use_every_n_as_val=use_every_n_as_val,
+        viewer_update_interval_epochs=visualize_every,
+        log_interval_steps=log_every,
+        viz_callback=update_visualization if image_view is not None else None,
+        cache_dataset=cache_dataset,
+    )
 
     # ---- Train ----
     runner.train()
