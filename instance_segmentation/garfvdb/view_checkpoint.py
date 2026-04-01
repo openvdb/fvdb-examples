@@ -233,10 +233,10 @@ class ViewCheckpoint:
     device: str | torch.device = "cuda"
     """Device for computation (e.g., "cuda" or "cpu")."""
 
-    initial_scale: float = 0.1
+    mask_scale: float = 0.1
     """Initial segmentation scale as a fraction of max scale."""
 
-    initial_blend: float = 0.5
+    mask_blend: float = 0.5
     """Initial mask blend factor (0=beauty only, 1=mask only)."""
 
     camera_check_interval: float = 0.5
@@ -245,11 +245,13 @@ class ViewCheckpoint:
     no_overlay: bool = False
     """Disable the segmentation overlay (show Gaussian splats only)."""
 
-    overlay_width: int = 1920
-    """Width of the segmentation overlay in pixels."""
+    overlay_width: int = 1440
+    """Width of the segmentation overlay in pixels.  Must match the
+    nanovdb-editor viewport width for correct alignment (default 1440)."""
 
-    overlay_height: int = 1080
-    """Height of the segmentation overlay in pixels."""
+    overlay_height: int = 720
+    """Height of the segmentation overlay in pixels.  Must match the
+    nanovdb-editor viewport height for correct alignment (default 720)."""
 
     overlay_downsample: int = 2
     """Downsample factor for rendering (renders at overlay_size/downsample)."""
@@ -259,6 +261,11 @@ class ViewCheckpoint:
         log_level = logging.DEBUG if self.verbose else logging.INFO
         logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
         logger = logging.getLogger(__name__)
+
+        # Initialize fvdb.viz
+        logger.info(f"Starting viewer server on {self.viewer_ip_address}:{self.viewer_port}")
+        fviz.init(ip_address=self.viewer_ip_address, port=self.viewer_port, verbose=self.verbose)
+        viz_scene = fviz.get_scene("GarfVDB Segmentation Viewer")
 
         device = torch.device(self.device)
 
@@ -299,13 +306,8 @@ class ViewCheckpoint:
             segmentation_model=segmentation_model,
             device=device,
         )
-        renderer.scale = self.initial_scale * float(segmentation_model.max_grouping_scale.item())
-        renderer.mask_blend = self.initial_blend
-
-        # Initialize fvdb.viz
-        logger.info(f"Starting viewer server on {self.viewer_ip_address}:{self.viewer_port}")
-        fviz.init(ip_address=self.viewer_ip_address, port=self.viewer_port, verbose=self.verbose)
-        viz_scene = fviz.get_scene("GarfVDB Segmentation Viewer")
+        renderer.scale = self.mask_scale * float(segmentation_model.max_grouping_scale.item())
+        renderer.mask_blend = self.mask_blend
 
         # Set initial camera position
         scene_centroid = gs_model.means.mean(dim=0).cpu().numpy()
@@ -338,11 +340,6 @@ class ViewCheckpoint:
                 image_sizes=image_sizes,
             )
 
-        # Get original training image size for projection scaling
-        assert image_sizes is not None
-        orig_img_w = int(image_sizes[0, 0].item())
-        orig_img_h = int(image_sizes[0, 1].item())
-
         # Compute render dimensions (smaller for performance)
         render_w = self.overlay_width // self.overlay_downsample
         render_h = self.overlay_height // self.overlay_downsample
@@ -351,29 +348,10 @@ class ViewCheckpoint:
         # Add the Gaussian splat model to the scene
         viz_scene.add_gaussian_splat_3d("Gaussian Splats", gs_model)
 
-        # Set up the segmentation overlay if enabled
+        # Overlay is created lazily on first render to avoid the C++ viewer
+        # render thread touching an image grid before we have real content.
         image_view = None
-        if not self.no_overlay:
-            try:
-                # Create an initial blank image at full overlay resolution
-                initial_image = np.zeros((self.overlay_height, self.overlay_width, 4), dtype=np.uint8)
-                initial_image[..., 3] = 128  # Semi-transparent
-
-                # Add the image overlay using the add_image API
-                image_view = viz_scene.add_image(  # type: ignore[call-arg]
-                    name="Segmentation Overlay",
-                    width=self.overlay_width,
-                    height=self.overlay_height,
-                    rgba_image=initial_image.flatten(),
-                )
-                logger.info("Segmentation overlay enabled")
-
-            except AttributeError as e:
-                logger.warning(f"add_image API not available: {e}")
-                logger.info("Running without segmentation overlay")
-            except Exception as e:
-                logger.warning(f"Failed to set up segmentation overlay: {e}")
-                logger.info("Running without segmentation overlay")
+        overlay_enabled = not self.no_overlay
 
         logger.info("=" * 60)
         logger.info("Viewer running... Ctrl+C to exit.")
@@ -382,7 +360,7 @@ class ViewCheckpoint:
         logger.info("Segmentation settings:")
         logger.info(f"  - Scale: {renderer.scale:.4f} (max: {segmentation_model.max_grouping_scale:.4f})")
         logger.info(f"  - Mask blend: {renderer.mask_blend:.2f}")
-        if image_view is not None:
+        if overlay_enabled:
             logger.info(f"  - Overlay: {self.overlay_width}x{self.overlay_height} (render: {render_w}x{render_h})")
             logger.info(f"  - Update interval: {self.camera_check_interval}s")
         else:
@@ -396,15 +374,17 @@ class ViewCheckpoint:
         prev_direction = None
         prev_radius = None
         prev_up = None
+        prev_fov = None
 
         def camera_changed() -> bool:
             """Check if camera state changed using documented fvdb.viz.Scene properties."""
-            nonlocal prev_center, prev_direction, prev_radius, prev_up
+            nonlocal prev_center, prev_direction, prev_radius, prev_up, prev_fov
             try:
-                center = viz_scene.camera_orbit_center
-                direction = viz_scene.camera_orbit_direction
+                fov = viz_scene.camera_fov
+                center = viz_scene.camera_orbit_center.clone().cpu().numpy()
+                direction = viz_scene.camera_orbit_direction.clone().cpu().numpy()
                 radius = viz_scene.camera_orbit_radius
-                up = viz_scene.camera_up_direction
+                up = viz_scene.camera_up_direction.clone().cpu().numpy()
 
                 # First time - always update
                 if prev_center is None:
@@ -412,6 +392,7 @@ class ViewCheckpoint:
                     prev_direction = direction
                     prev_radius = radius
                     prev_up = up
+                    prev_fov = fov
                     return True
 
                 assert prev_center is not None and prev_direction is not None and prev_up is not None
@@ -420,6 +401,7 @@ class ViewCheckpoint:
                     or not np.allclose(direction, prev_direction)
                     or radius != prev_radius
                     or not np.allclose(up, prev_up)
+                    or fov != prev_fov
                 )
 
                 if changed:
@@ -427,23 +409,28 @@ class ViewCheckpoint:
                     prev_direction = direction
                     prev_radius = radius
                     prev_up = up
+                    prev_fov = fov
 
                 return changed
             except Exception:
                 return False
 
-        # Get reference projection from SfmScene and scale for render resolution
-        sfm_projection = torch.from_numpy(sfm_scene.projection_matrices).float()
-        orig_projection = sfm_projection[0]
-        # Scale the projection matrix from original training image size to render resolution
-        scale_x = render_w / orig_img_w
-        scale_y = render_h / orig_img_h
-        scaled_projection = orig_projection.clone()
-        scaled_projection[0, 0] *= scale_x  # fx
-        scaled_projection[1, 1] *= scale_y  # fy
-        scaled_projection[0, 2] *= scale_x  # cx
-        scaled_projection[1, 2] *= scale_y  # cy
-        reference_projection = scaled_projection.to(device)
+        # Build intrinsic matrix from the viewer's FOV to match its perspective
+        # camera.  Recomputed whenever the FOV changes.
+        cx = render_w / 2.0
+        cy = render_h / 2.0
+        cached_fov: float | None = None
+        reference_projection: torch.Tensor | None = None
+
+        def _update_projection(fov_y_rad: float) -> torch.Tensor:
+            nonlocal cached_fov, reference_projection
+            fy = render_h / (2.0 * np.tan(fov_y_rad / 2.0))
+            reference_projection = torch.tensor(
+                [[fy, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+            ).to(device)
+            cached_fov = fov_y_rad
+            return reference_projection
 
         # OpenGL to OpenCV conversion matrix (applied to camera axes)
         # OpenGL: X-right, Y-up, Z-backward
@@ -451,33 +438,45 @@ class ViewCheckpoint:
         opengl_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 
         def update_overlay() -> None:
-            """Render and update the segmentation overlay."""
-            if image_view is None:
+            """Render segmentation and lazily create/update the image overlay."""
+            nonlocal image_view, overlay_enabled
+            if not overlay_enabled:
                 return
             try:
-                # Get orbit camera state from viewer
+                fov_y_rad = viz_scene.camera_fov
+                if reference_projection is None or fov_y_rad != cached_fov:
+                    _update_projection(fov_y_rad)
+
                 # NOTE: Despite the Python API name "camera_orbit_direction", the C++ implementation
                 # returns eye_direction which is the direction the camera is LOOKING (toward scene).
                 # Camera position = center - eye_direction * distance (see Camera.h line 387-390)
-                center = np.array(viz_scene.camera_orbit_center.cpu().numpy())
-                eye_direction = np.array(viz_scene.camera_orbit_direction.cpu().numpy())
+                center = viz_scene.camera_orbit_center.clone().cpu().numpy()
+                eye_direction = viz_scene.camera_orbit_direction.clone().cpu().numpy()
                 radius = viz_scene.camera_orbit_radius
-                up_world = np.array(viz_scene.camera_up_direction.cpu().numpy())
-
-                # Camera position: center - eye_direction * radius
-                # (eye_direction points FROM camera TOWARD center)
+                up_world = viz_scene.camera_up_direction.clone().cpu().numpy()
                 position = center - eye_direction * radius
 
-                # Forward = eye_direction (already the look direction)
-                forward = eye_direction / np.linalg.norm(eye_direction)
+                # Guard against degenerate camera states (zero-length vectors
+                # produce NaN and ultimately a singular matrix).
+                eye_norm = np.linalg.norm(eye_direction)
+                if eye_norm < 1e-8:
+                    return
 
-                # Right vector = forward × up_world
+                forward = eye_direction / eye_norm
+
+                # Right vector = forward x up_world
                 right = np.cross(forward, up_world)
-                right = right / np.linalg.norm(right)
+                right_norm = np.linalg.norm(right)
+                if right_norm < 1e-8:
+                    return
+                right = right / right_norm
 
-                # Up vector = right × forward
+                # Up vector = right x forward
                 up = np.cross(right, forward)
-                up = up / np.linalg.norm(up)
+                up_norm = np.linalg.norm(up)
+                if up_norm < 1e-8:
+                    return
+                up = up / up_norm
 
                 # Build OpenGL-style camera-to-world (X-right, Y-up, Z-backward)
                 # In OpenGL, camera looks along -Z, so Z column = -forward
@@ -491,8 +490,13 @@ class ViewCheckpoint:
                 c2w_opencv = c2w_opengl @ opengl_to_opencv
 
                 camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
-                world_to_camera = torch.linalg.inv(camera_to_world)
+                try:
+                    world_to_camera = torch.linalg.inv(camera_to_world).contiguous()
+                except torch._C._LinAlgError:
+                    return
+
                 # Render at lower resolution for performance
+                assert reference_projection is not None
                 rgba_image = renderer.render_segmentation_image(
                     camera_to_world, world_to_camera, reference_projection, render_w, render_h
                 )
@@ -501,7 +505,25 @@ class ViewCheckpoint:
                     rgba_image = cv2.resize(
                         rgba_image, (self.overlay_width, self.overlay_height), interpolation=cv2.INTER_LINEAR
                     )
-                image_view.update(rgba_image.flatten())  # type: ignore[attr-defined]
+
+                flat_rgba = rgba_image.flatten()
+
+                if image_view is None:
+                    # Lazily create the image overlay on first render
+                    try:
+                        image_view = viz_scene.add_image(  # type: ignore[call-arg]
+                            name="Segmentation Overlay",
+                            width=self.overlay_width,
+                            height=self.overlay_height,
+                            rgba_image=flat_rgba,
+                        )
+                    except Exception as e:
+                        logger.warning(f"add_image API not available or failed: {e}")
+                        overlay_enabled = False
+                        return
+                else:
+                    image_view.update(flat_rgba)  # type: ignore[attr-defined]
+
                 logger.debug(
                     f"Updated segmentation overlay ({render_w}x{render_h} -> {self.overlay_width}x{self.overlay_height})"
                 )
@@ -515,7 +537,7 @@ class ViewCheckpoint:
             while True:
                 time.sleep(self.camera_check_interval)
 
-                if image_view is not None and camera_changed():
+                if overlay_enabled and camera_changed():
                     logger.debug("Camera changed, updating overlay...")
                     update_overlay()
 

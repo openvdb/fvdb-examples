@@ -576,7 +576,12 @@ class GARfVDBModel(torch.nn.Module):
             if not self.model_config.enc_feats_one_idx_per_ray:
                 # Weighted sum of the enc_feats and transmittance weights
                 enc_feats.jdata = enc_feats.jdata * weights.jdata.unsqueeze(-1)
-                enc_feats = enc_feats.jsum(dim=0, keepdim=True)
+                # When every pixel has exactly 1 contributor, fvdb returns a
+                # 1-level JaggedTensor [C,[R]] instead of 2-level [C,[R,[K]]].
+                # jsum(dim=0) on a 1-level tensor would collapse pixels within
+                # each camera rather than depth samples within each pixel.
+                if isinstance(enc_feats.lshape[0], list):
+                    enc_feats = enc_feats.jsum(dim=0, keepdim=True)
 
             epsilon = 1e-6
             enc_feats.jdata = enc_feats.jdata / (torch.linalg.norm(enc_feats.jdata, dim=-1, keepdim=True) + epsilon)

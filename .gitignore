@@ -1,3 +1,6 @@
+# Data
+*.ply
+
 # Generated version file
 fvdb/version.py
 
