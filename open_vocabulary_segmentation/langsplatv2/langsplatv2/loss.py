@@ -105,3 +105,69 @@ def calculate_langsplatv2_loss(
 
     loss_dict["total_loss"] = total_loss
     return loss_dict
+
+
+def calculate_langsplatv2_loss_sparse(
+    pred_valid: torch.Tensor,
+    gt_valid: torch.Tensor,
+    num_pixels: int,
+    use_cosine_loss: bool = True,
+    use_l1_loss: bool = False,
+    normalize_features: bool = False,
+    compute_valid_metric: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Sparse equivalent of :func:`calculate_langsplatv2_loss`.
+
+    Operates only on the valid (masked) pixels, avoiding the dense
+    ``[B, H, W, C]`` feature maps entirely. This is numerically identical to
+    the dense version because unmapped pixels contribute exactly zero to the
+    dense loss (their GT features are zero and the per-pixel loss is multiplied
+    by the mask), and the dense normalisation divides by ``mask.numel()`` -- so
+    ``sum_over_valid / num_pixels`` reproduces the same value and gradients.
+
+    Args:
+        pred_valid: Predicted features at valid pixels, shape ``[N_valid, C]``.
+        gt_valid: Ground-truth features at the same pixels, shape ``[N_valid, C]``.
+        num_pixels: Total pixel count of the dense map (``mask.numel()``), used
+            as the normalisation denominator to match the dense loss exactly.
+        use_cosine_loss: Whether to include cosine similarity loss.
+        use_l1_loss: Whether to include L1 loss.
+        normalize_features: Whether to L2-normalize predicted features.
+        compute_valid_metric: If True, also compute the ``cosine_loss_valid``
+            diagnostic (mean over valid pixels). Off by default since it is only
+            used for occasional logging.
+
+    Returns:
+        Dictionary with the same keys as :func:`calculate_langsplatv2_loss`.
+    """
+    assert use_cosine_loss or use_l1_loss, "At least one loss type must be enabled"
+
+    if normalize_features:
+        pred_valid = pred_valid / (pred_valid.norm(dim=-1, keepdim=True) + 1e-10)
+
+    loss_dict: dict[str, torch.Tensor] = {}
+    total_loss = torch.tensor(0.0, device=pred_valid.device)
+    has_valid = pred_valid.shape[0] > 0
+
+    if use_cosine_loss:
+        if has_valid:
+            per_valid = 1.0 - F.cosine_similarity(pred_valid, gt_valid, dim=-1)  # [N_valid]
+            cos_loss_all = per_valid.sum() / num_pixels
+        else:
+            cos_loss_all = total_loss
+        loss_dict["cosine_loss"] = cos_loss_all
+        total_loss = total_loss + cos_loss_all
+
+        if compute_valid_metric:
+            loss_dict["cosine_loss_valid"] = per_valid.mean() if has_valid else cos_loss_all
+
+    if use_l1_loss:
+        if has_valid:
+            l1 = torch.abs(pred_valid - gt_valid).sum() / num_pixels
+        else:
+            l1 = total_loss
+        loss_dict["l1_loss"] = l1
+        total_loss = total_loss + l1
+
+    loss_dict["total_loss"] = total_loss
+    return loss_dict

@@ -20,7 +20,7 @@ from fvdb import GaussianSplat3d
 from fvdb_reality_capture.sfm_scene import SfmScene
 
 from ..config import LangSplatV2ModelConfig, LangSplatV2TrainingConfig
-from ..loss import calculate_langsplatv2_loss
+from ..loss import calculate_langsplatv2_loss, calculate_langsplatv2_loss_sparse
 from ..model import LangSplatV2Model
 from ..util import calculate_pca_projection, cosine_error_map, pca_projection_fast
 from ..vq_utils import (
@@ -33,6 +33,7 @@ from .dataset import (
     LangSplatV2CollateFn,
     LangSplatV2Dataset,
     build_feature_map,
+    build_sparse_gt_features,
 )
 from .langsplatv2_writer import LangSplatV2Writer
 
@@ -278,11 +279,15 @@ class LangSplatV2Trainer:
 
         logger.info(f"Model initialized with {gs_model.num_gaussians:,} Gaussians")
 
-        # Create optimizer (only optimize language feature parameters)
+        # Create optimizer (only optimize language feature parameters). Use the
+        # fused CUDA implementation when available -- it is numerically
+        # equivalent but noticeably faster for the large per-Gaussian logits
+        # tensor (the optimizer step is otherwise ~5% of each training step).
         optimizer = torch.optim.Adam(
             params=[model.logits, model.codebooks],
             lr=config.learning_rate,
             eps=1e-15,
+            fused=(torch.device(device).type == "cuda"),
         )
 
         # No scheduler needed for constant LR (matching original LangSplatV2)
@@ -358,11 +363,12 @@ class LangSplatV2Trainer:
             for param in model.parameters():
                 param.requires_grad_(False)
 
-        # Restore optimizer
+        # Restore optimizer (fused CUDA Adam when available; see `new`)
         optimizer = torch.optim.Adam(
             params=[model.logits, model.codebooks],
             lr=config.learning_rate,
             eps=1e-15,
+            fused=(torch.device(device).type == "cuda"),
         )
         if not eval_only:
             optimizer.load_state_dict(state_dict["optimizer"])
@@ -502,9 +508,11 @@ class LangSplatV2Trainer:
             with nvtx.range("data_to_device"):
                 minibatch = minibatch.to(self.device)
 
-            # Build dense feature map on GPU from compact data
-            with nvtx.range("build_feature_map"):
-                gt_features, feature_mask = build_feature_map(
+            # Gather GT features only at valid pixels (sparse). Avoids the dense
+            # [B,H,W,512] GT map; the returned mask drives the matching gather of
+            # predicted features below.
+            with nvtx.range("build_sparse_gt"):
+                gt_valid, feature_mask = build_sparse_gt_features(
                     features=minibatch["features"],
                     seg_map=minibatch["seg_map"],
                     clip_n_dims=self._cfg.model.clip_n_dims,
@@ -519,25 +527,33 @@ class LangSplatV2Trainer:
                 layer_num - 1,
             )
 
-            # Forward pass
+            # Whether this step logs metrics/images (drives optional dense work)
+            is_log_step = (self._global_step + 1) % self._log_interval_steps == 0
+            want_dense = is_log_step and self._cfg.log_test_images
+
+            # Forward pass: render full weight maps, then decode only the valid
+            # pixels into CLIP features (sparse), keeping memory proportional to
+            # the number of mapped pixels rather than the full image.
             with nvtx.range("forward_pass"):
-                predicted_features, alpha = self._model(
+                weight_maps, alpha = self._model.render_weight_maps(
                     world_to_camera=minibatch["world_to_camera"],
                     projection=minibatch["projection"],
                     image_width=img_w,
                     image_height=img_h,
-                    layer_idx=layer_idx,
                 )
+                pred_valid = self._model.decode_weight_maps(weight_maps[feature_mask], layer_idx)
 
-            # Compute loss
+            # Compute loss on the sparse valid set (numerically identical to the
+            # dense loss; see calculate_langsplatv2_loss_sparse).
             with nvtx.range("loss_computation"):
-                loss_dict = calculate_langsplatv2_loss(
-                    predicted_features=predicted_features,
-                    gt_features=gt_features,
-                    mask=feature_mask,
+                loss_dict = calculate_langsplatv2_loss_sparse(
+                    pred_valid=pred_valid,
+                    gt_valid=gt_valid,
+                    num_pixels=feature_mask.numel(),
                     use_cosine_loss=self._cfg.use_cosine_loss,
                     use_l1_loss=self._cfg.use_l1_loss,
                     normalize_features=self._cfg.normalize_features,
+                    compute_valid_metric=is_log_step,
                 )
                 loss = loss_dict["total_loss"]
 
@@ -580,13 +596,18 @@ class LangSplatV2Trainer:
                     if key != "total_loss":
                         self._writer.log_metric(self._global_step, f"train/{key}", val.item())
 
-                # Log training images when enabled
-                if self._cfg.log_test_images:
-                    self._log_training_images(
-                        predicted_features.detach(),
-                        gt_features.detach(),
-                        feature_mask,
-                    )
+                # Log training images when enabled. The training step runs in
+                # the sparse regime, so reconstruct the dense maps here (only on
+                # logging steps) for the PCA / error visualizations.
+                if want_dense:
+                    with torch.no_grad():
+                        dense_pred = self._model.decode_weight_maps(weight_maps, layer_idx)
+                        dense_gt, dense_mask = build_feature_map(
+                            features=minibatch["features"],
+                            seg_map=minibatch["seg_map"],
+                            clip_n_dims=self._cfg.model.clip_n_dims,
+                        )
+                    self._log_training_images(dense_pred, dense_gt, dense_mask)
 
             pbar.update(1)
 
