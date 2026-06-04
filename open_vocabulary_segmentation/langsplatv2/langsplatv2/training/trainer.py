@@ -279,11 +279,15 @@ class LangSplatV2Trainer:
 
         logger.info(f"Model initialized with {gs_model.num_gaussians:,} Gaussians")
 
-        # Create optimizer (only optimize language feature parameters)
+        # Create optimizer (only optimize language feature parameters). Use the
+        # fused CUDA implementation when available -- it is numerically
+        # equivalent but noticeably faster for the large per-Gaussian logits
+        # tensor (the optimizer step is otherwise ~5% of each training step).
         optimizer = torch.optim.Adam(
             params=[model.logits, model.codebooks],
             lr=config.learning_rate,
             eps=1e-15,
+            fused=(torch.device(device).type == "cuda"),
         )
 
         # No scheduler needed for constant LR (matching original LangSplatV2)
@@ -359,11 +363,12 @@ class LangSplatV2Trainer:
             for param in model.parameters():
                 param.requires_grad_(False)
 
-        # Restore optimizer
+        # Restore optimizer (fused CUDA Adam when available; see `new`)
         optimizer = torch.optim.Adam(
             params=[model.logits, model.codebooks],
             lr=config.learning_rate,
             eps=1e-15,
+            fused=(torch.device(device).type == "cuda"),
         )
         if not eval_only:
             optimizer.load_state_dict(state_dict["optimizer"])
