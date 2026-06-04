@@ -23,8 +23,19 @@ Usage:
     done
 """
 import logging
+import os
 import pathlib
 from typing import Literal
+
+# Use expandable CUDA memory segments to avoid caching-allocator fragmentation.
+# Training renders a fixed-size weight map but decodes/loss-computes only the
+# valid (masked) pixels, whose count varies per image. Those variable-size
+# allocations fragment the default allocator (reserved memory grows step over
+# step, e.g. ~17 GB -> ~44 GB), even though peak *allocated* memory stays ~13 GB.
+# Expandable segments keep reserved memory tracking actual usage. Must be set
+# before CUDA initializes (i.e. before the first CUDA allocation), so we set it
+# here at import time. A user-provided value is respected.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import tyro

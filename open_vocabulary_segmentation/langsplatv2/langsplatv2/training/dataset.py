@@ -291,6 +291,64 @@ def build_feature_map(
     return gt_features, feature_mask
 
 
+def build_sparse_gt_features(
+    features: JaggedTensor | torch.Tensor,
+    seg_map: torch.Tensor,
+    clip_n_dims: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only the valid GT features, without building a dense ``[H,W,C]`` map.
+
+    This is the sparse counterpart to :func:`build_feature_map`. It returns the
+    GT features for valid pixels in the row-major order of a boolean index over
+    ``[B, H, W]`` (i.e. matching ``weight_maps[mask]``), so the predicted and GT
+    features stay aligned. The returned mask reflects any out-of-bounds dropping,
+    exactly as :func:`build_feature_map` does.
+
+    Args:
+        features: CLIP features as a :class:`JaggedTensor` (batched) or a plain
+            ``torch.Tensor`` ``[N_masks, clip_n_dims]`` (unbatched).
+        seg_map: Segmentation map ``[B, H, W]`` or ``[H, W]`` (-1 = no feature).
+        clip_n_dims: Feature dimensionality (for the empty-output fallback).
+
+    Returns:
+        Tuple of (gt_valid, mask):
+            - gt_valid: ``[N_valid, clip_n_dims]`` GT features at valid pixels.
+            - mask: ``[B, H, W]`` or ``[H, W]`` bool, post out-of-bounds filtering.
+    """
+    if isinstance(features, torch.Tensor):
+        mask = seg_map >= 0  # [H, W]
+        idx = seg_map[mask].long()
+        in_bounds = idx < features.shape[0]
+        if not bool(in_bounds.all()):
+            positions = mask.nonzero(as_tuple=False)[in_bounds]
+            mask = torch.zeros_like(mask)
+            mask[positions[:, 0], positions[:, 1]] = True
+            idx = idx[in_bounds]
+        return features[idx], mask
+
+    # Batched JaggedTensor path
+    B = seg_map.shape[0] if seg_map.dim() == 3 else 1
+    device = features.jdata.device
+    dtype = features.jdata.dtype
+    mask = seg_map >= 0  # [B, H, W]
+    parts: list[torch.Tensor] = []
+    for b in range(B):
+        mask_b = mask[b]
+        feat_b = features[b].jdata
+        idx = seg_map[b][mask_b].long()
+        in_bounds = idx < feat_b.shape[0]
+        if not bool(in_bounds.all()):
+            positions = mask_b.nonzero(as_tuple=False)[in_bounds]
+            new_mask_b = torch.zeros_like(mask_b)
+            new_mask_b[positions[:, 0], positions[:, 1]] = True
+            mask[b] = new_mask_b
+            idx = idx[in_bounds]
+        parts.append(feat_b[idx])
+
+    gt_valid = torch.cat(parts, dim=0) if parts else torch.zeros(0, clip_n_dims, device=device, dtype=dtype)
+    return gt_valid, mask
+
+
 class LangSplatV2Input(dict):
     """Batched input dictionary for the LangSplatV2 model.
 
