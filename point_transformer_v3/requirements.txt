@@ -1,4 +1,4 @@
-# fvdb requirements
+# # fvdb requirements
 --extra-index-url https://download.pytorch.org/whl/cu129
 --extra-index-url https://d36m13axqqhiit.cloudfront.net/simple
 fvdb-core==0.3.0+pt28.cu129
@@ -11,6 +11,7 @@ peft
 wandb
 tensorboard
 tensorboardx
+yapf
 
 # flash-attn is only needed when patch_size > 0 (default config uses patch_size=1024)
 # While PyTorch 2.8+ has built-in flash attention, flash-attn provides optimized varlen functions
