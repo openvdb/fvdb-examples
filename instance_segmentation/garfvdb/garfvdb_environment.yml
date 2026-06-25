@@ -1,4 +1,4 @@
-name: fvdb_garfvdb_test
+name: fvdb_garfvdb
 channels:
   - conda-forge
   - nodefaults
