@@ -56,7 +56,7 @@ def _has_vertex_colors(vertex_colors: np.ndarray | None) -> bool:
     return vertex_colors is not None and vertex_colors.size > 0 and vertex_colors.shape[0] > 0
 
 
-def _normalize_vertex_colors(colors: np.ndarray) -> np.ndarray:
+def _as_float_vertex_colors(colors: np.ndarray) -> np.ndarray:
     """Convert vertex colors to float RGB(A) in [0, 1] for point_cloud_utils I/O."""
     colors = np.asarray(colors)
     if colors.dtype == np.uint8:
