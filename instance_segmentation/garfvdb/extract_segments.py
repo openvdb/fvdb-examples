@@ -5,7 +5,7 @@
 
 Loads a Gaussian splat reconstruction and segmentation checkpoint, clusters
 per-Gaussian affinity features at a chosen scale, filters clusters, then writes
-``n`` segment ``.ply`` files (one per selected cluster).
+``n`` segment ``.ply`` Gaussian splat scenes (one per selected cluster).
 
 Example::
 
