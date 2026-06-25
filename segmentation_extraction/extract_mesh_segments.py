@@ -61,11 +61,7 @@ def _reproject_vertex_colors(
 
 def _has_vertex_colors(vertex_colors: np.ndarray | None) -> bool:
     """Return True if the mesh has a non-empty per-vertex color array."""
-    return (
-        vertex_colors is not None
-        and vertex_colors.size > 0
-        and vertex_colors.shape[0] > 0
-    )
+    return vertex_colors is not None and vertex_colors.size > 0 and vertex_colors.shape[0] > 0
 
 
 def _as_float_vertex_colors(colors: np.ndarray) -> np.ndarray:
@@ -123,16 +119,13 @@ def extract_segment_mesh(
     tree = cKDTree(segment_means)
 
     # Find mesh vertices within distance threshold of any segment Gaussian
-    logger.info(
-        f"Finding mesh vertices within {distance_threshold:.3f} units of segment..."
-    )
+    logger.info(f"Finding mesh vertices within {distance_threshold:.3f} units of segment...")
     distances, _ = tree.query(vertices, k=1, distance_upper_bound=distance_threshold)
     close_vertex_mask = distances < distance_threshold
     num_close_vertices = close_vertex_mask.sum()
 
     logger.info(
-        f"Found {num_close_vertices:,} vertices ({100 * num_close_vertices / len(vertices):.1f}%) "
-        f"within threshold"
+        f"Found {num_close_vertices:,} vertices ({100 * num_close_vertices / len(vertices):.1f}%) " f"within threshold"
     )
 
     if num_close_vertices == 0:
@@ -157,8 +150,7 @@ def extract_segment_mesh(
 
     if num_extracted_faces == 0:
         raise ValueError(
-            "No complete faces found within the distance threshold. "
-            "Try increasing --distance-threshold."
+            "No complete faces found within the distance threshold. " "Try increasing --distance-threshold."
         )
 
     # Reindex faces to use new vertex indices
@@ -167,9 +159,7 @@ def extract_segment_mesh(
     # Extract the corresponding vertices and colors
     extracted_vertices = vertices[close_vertex_mask]
     extracted_colors = (
-        _as_float_vertex_colors(vertex_colors[close_vertex_mask])
-        if _has_vertex_colors(vertex_colors)
-        else None
+        _as_float_vertex_colors(vertex_colors[close_vertex_mask]) if _has_vertex_colors(vertex_colors) else None
     )
 
     if not no_gap_fill:
@@ -180,9 +170,7 @@ def extract_segment_mesh(
         logger.info("Harmonic Laplacian gap fill on extracted patch...")
         num_faces_before = len(extracted_faces_reindexed)
         num_vertices_before = len(extracted_vertices)
-        extracted_vertices, extracted_faces_reindexed = fill_mesh_gaps(
-            extracted_vertices, extracted_faces_reindexed
-        )
+        extracted_vertices, extracted_faces_reindexed = fill_mesh_gaps(extracted_vertices, extracted_faces_reindexed)
         if len(extracted_faces_reindexed) != num_faces_before:
             logger.info(
                 "Harmonic fill added %d faces and %d vertices (%d -> %d faces)",
@@ -191,9 +179,7 @@ def extract_segment_mesh(
                 num_faces_before,
                 len(extracted_faces_reindexed),
             )
-        effective_resolution = int(
-            min(resolution, max(2_000, len(extracted_faces_reindexed) // 2))
-        )
+        effective_resolution = int(min(resolution, max(2_000, len(extracted_faces_reindexed) // 2)))
         if effective_resolution != resolution:
             logger.info(
                 "Capped watertight resolution %d -> %d for segment size",
@@ -217,9 +203,7 @@ def extract_segment_mesh(
         )
         # Reproject colors onto the new mesh vertices if colors are available
         if color_source_colors is not None:
-            extracted_colors = _reproject_vertex_colors(
-                extracted_vertices, color_source_vertices, color_source_colors
-            )
+            extracted_colors = _reproject_vertex_colors(extracted_vertices, color_source_vertices, color_source_colors)
 
     # Save the extracted mesh
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,9 +217,7 @@ def extract_segment_mesh(
             extracted_colors,
         )
     else:
-        pcu.save_mesh_vf(
-            str(output_path), extracted_vertices, extracted_faces_reindexed
-        )
+        pcu.save_mesh_vf(str(output_path), extracted_vertices, extracted_faces_reindexed)
 
     logger.info(
         f"Successfully saved mesh with {len(extracted_vertices):,} vertices "
@@ -280,10 +262,7 @@ def fill_mesh_gaps(
         vertices = np.vstack([vertices, centroid])
 
         cap_faces = np.array(
-            [
-                [cap_idx, int(loop[i]), int(loop[(i + 1) % loop.size])]
-                for i in range(loop.size)
-            ],
+            [[cap_idx, int(loop[i]), int(loop[(i + 1) % loop.size])] for i in range(loop.size)],
             dtype=np.int32,
         )
         faces = np.vstack([faces, cap_faces])
@@ -312,12 +291,8 @@ def main() -> None:
             "as a spatial mask. Segment PLY can come from any segmentation pipeline."
         ),
     )
-    parser.add_argument(
-        "--input-splat", type=Path, help="Input splat segment file (PLY format)"
-    )
-    parser.add_argument(
-        "--input-mesh", type=Path, help="Input full scene mesh file (PLY/OBJ format)"
-    )
+    parser.add_argument("--input-splat", type=Path, help="Input splat segment file (PLY format)")
+    parser.add_argument("--input-mesh", type=Path, help="Input full scene mesh file (PLY/OBJ format)")
     parser.add_argument("--output-path", type=Path, required=True, help="Output path")
     parser.add_argument(
         "--no-gap-fill",
