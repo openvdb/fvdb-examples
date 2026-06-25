@@ -19,7 +19,7 @@ Ripping objects from large scenes can result in holes where the object was lying
 ## Installation
 
 ```bash
-conda env create -f segmentation_extraction_environment.yml
+conda env create -f segment_mesh_extraction_environment.yml
 conda activate fvdb_segment_mesh
 pip install -e .
 ```
