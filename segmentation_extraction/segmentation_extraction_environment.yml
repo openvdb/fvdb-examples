@@ -1,0 +1,17 @@
+name: fvdb_segment_mesh
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - fvdb-core>=0.4.2,<0.5.0
+  - cxx-compiler
+  - blas=*=mkl
+  - python
+  - pytorch-gpu=2.10.0
+  - cuda-version>=12.9
+  - pip
+  - scipy
+  - numpy
+  - pip:
+    - libigl
+    - point-cloud-utils

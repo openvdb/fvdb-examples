@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "segment-mesh-extraction"
+version = "0.1.0"
+description = "Extract a scene mesh patch from a Gaussian splat segment"
+requires-python = ">=3.11"
+dependencies = [
+    "fvdb-core>=0.4.2,<0.5.0",
+    "libigl",
+    "point-cloud-utils",
+    "scipy",
+    "numpy",
+]
+
+[project.scripts]
+extract-mesh-segments = "extract_mesh_segments:main"
+
+[tool.setuptools]
+py-modules = ["extract_mesh_segments"]

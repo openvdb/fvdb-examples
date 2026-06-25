@@ -14,7 +14,7 @@ Example::
         -r frgs_logs/safety_park_1/checkpoints/00024800/reconstruct_ckpt.pt \\
         -o segments/ \\
         --n 5 \\
-        --scale 0.1
+        --cluster-scale 0.1
 """
 
 from __future__ import annotations
@@ -29,8 +29,7 @@ import torch
 from fvdb import GaussianSplat3d
 from scipy.spatial import cKDTree
 
-# Import directly to avoid fvdb_reality_capture.tools.__init__ pulling optional deps (e.g. DLNR).
-from fvdb_reality_capture.tools._filter_splats import (
+from fvdb_reality_capture.tools import (
     filter_splats_above_scale,
     filter_splats_by_mean_percentile,
     filter_splats_by_opacity_percentile,
@@ -163,8 +162,8 @@ def rip_segments(
     reconstruction_path: Path,
     out_dir: Path,
     n: int,
-    scale: float,
-    scale_is_fraction_of_max: bool,
+    cluster_scale: float,
+    cluster_scale_unit: Literal["fraction", "world"],
     seed: int,
     device: str,
     min_splat_scale: float,
@@ -220,14 +219,17 @@ def rip_segments(
     segmentation_model = runner.model
 
     max_scale = float(segmentation_model.max_grouping_scale.item())
-    scale_abs = float(scale) * max_scale if scale_is_fraction_of_max else float(scale)
+    if cluster_scale_unit == "fraction":
+        scale_abs = float(cluster_scale) * max_scale
+    else:
+        scale_abs = float(cluster_scale)
     logger.info("Segmentation model max scale: %.6f", max_scale)
     logger.info("Clustering at scale: %.6f", scale_abs)
 
     clustering_gs_model = gs_model
     subsample_mask: torch.Tensor | None = None
     if max_gaussians_for_clustering > 0 and gs_model.num_gaussians > max_gaussians_for_clustering:
-        logger.warning(
+        logger.info(
             "Scene has %s gaussians (> %s); subsampling for clustering, then mapping labels back.",
             f"{gs_model.num_gaussians:,}",
             f"{max_gaussians_for_clustering:,}",
@@ -296,7 +298,7 @@ def rip_segments(
             )
 
     if not cluster_splats:
-        raise RuntimeError("No clusters remaining after filtering; relax filters or try a different --scale.")
+        raise RuntimeError("No clusters remaining after filtering; relax filters or try a different --cluster-scale.")
 
     labels = sorted(cluster_splats.keys())
     n_to_export = min(n, len(labels))
@@ -373,16 +375,19 @@ def main() -> None:
 
     parser.add_argument("--n", type=int, default=10, help="Number of segments to export")
     parser.add_argument(
-        "--scale",
+        "--cluster-scale",
         type=float,
         default=0.1,
-        help="Clustering scale (absolute or fraction of max; see --scale-is-fraction-of-max)",
+        help="Scale passed to GarfVDB affinity clustering (see --cluster-scale-unit)",
     )
     parser.add_argument(
-        "--scale-is-fraction-of-max",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Interpret --scale as a fraction of model.max_grouping_scale",
+        "--cluster-scale-unit",
+        choices=["fraction", "world"],
+        default="fraction",
+        help=(
+            "How to interpret --cluster-scale: 'fraction' multiplies by max_grouping_scale "
+            "(e.g. 0.1 = 10%% of max); 'world' treats the value as scene world units"
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling/subsampling")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
@@ -392,7 +397,7 @@ def main() -> None:
         "--min-splat-scale",
         type=float,
         default=0.1,
-        help="Drop Gaussians with scale below this value (0 disables)",
+        help="Drop Gaussians whose max axis scale exceeds this fraction of scene extent (0 disables)",
     )
     parser.add_argument(
         "--opacity-percentile",
@@ -412,7 +417,7 @@ def main() -> None:
         "--min-cluster-gaussians",
         type=int,
         default=200,
-        help="Drop clusters smaller than this (0 disables)",
+        help="Drop clusters with fewer than this many member Gaussians (0 disables)",
     )
     parser.add_argument(
         "--filter-high-variance",
@@ -446,8 +451,8 @@ def main() -> None:
         reconstruction_path=args.reconstruction_path,
         out_dir=args.out_dir,
         n=args.n,
-        scale=args.scale,
-        scale_is_fraction_of_max=args.scale_is_fraction_of_max,
+        cluster_scale=args.cluster_scale,
+        cluster_scale_unit=args.cluster_scale_unit,
         seed=args.seed,
         device=args.device,
         min_splat_scale=args.min_splat_scale,
