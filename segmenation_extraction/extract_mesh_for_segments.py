@@ -206,7 +206,7 @@ def extract_segment_mesh(
             str(output_path),
             extracted_vertices,
             extracted_faces_reindexed,
-            _normalize_vertex_colors(extracted_colors),
+            extracted_colors,
         )
     else:
         pcu.save_mesh_vf(str(output_path), extracted_vertices, extracted_faces_reindexed)
