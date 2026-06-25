@@ -46,12 +46,17 @@ def load_segmentation_runner_from_checkpoint(
     gs_model_path: Path,
     device: str | torch.device = "cuda",
 ) -> GaussianSplatScaleConditionedSegmentation:
-    """Restore a segmentation runner from a training checkpoint.
+    """
+    Restore a GARfVDB segmentation runner from a training checkpoint.
+
     Args:
-        checkpoint_path: Path to the segmentation checkpoint.
-        gs_model: The Gaussian splat model to use for the segmentation.
-        gs_model_path: Path to the Gaussian splat reconstruction.
-        device: The device to use for the segmentation.
+        checkpoint_path (Path): Path to the segmentation checkpoint (``.pt`` / ``.pth``).
+        gs_model (GaussianSplat3d): Gaussian splat reconstruction to segment.
+        gs_model_path (Path): Path to the Gaussian splat reconstruction file.
+        device (str | torch.device): Torch device for loading weights and inference.
+
+    Returns:
+        GaussianSplatScaleConditionedSegmentation: Eval-only segmentation runner.
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     runner = GaussianSplatScaleConditionedSegmentation.from_state_dict(
@@ -67,9 +72,14 @@ def load_segmentation_runner_from_checkpoint(
 
 
 def _is_gpu_oom_error(exc: BaseException) -> bool:
-    """Return whether an exception indicates GPU out-of-memory.
+    """
+    Return whether an exception indicates GPU out-of-memory during clustering.
+
     Args:
-        exc: The exception raised during clustering.
+        exc (BaseException): Exception raised while running GPU clustering code.
+
+    Returns:
+        bool: ``True`` when ``exc`` looks like an OOM error.
     """
     return "out_of_memory" in str(exc).lower() or isinstance(exc, MemoryError)
 
@@ -79,11 +89,13 @@ def _drop_clusters(
     cluster_coherence: dict[int, float],
     keys: list[int],
 ) -> None:
-    """Remove clusters from the splat and coherence maps in place.
+    """
+    Remove clusters from the splat and coherence maps in place.
+
     Args:
-        cluster_splats: Cluster label to Gaussian splat mapping.
-        cluster_coherence: Cluster label to coherence score mapping.
-        keys: Cluster labels to remove.
+        cluster_splats (dict[int, GaussianSplat3d]): Cluster label to Gaussian splat mapping.
+        cluster_coherence (dict[int, float]): Cluster label to coherence score mapping.
+        keys (list[int]): Cluster labels to remove.
     """
     for key in keys:
         cluster_splats.pop(key, None)
@@ -96,12 +108,17 @@ def _subsample_gaussians(
     seed: int,
     device: torch.device,
 ) -> tuple[GaussianSplat3d, torch.Tensor]:
-    """Randomly subsample Gaussians for memory-bounded clustering.
+    """
+    Randomly subsample Gaussians for memory-bounded clustering.
+
     Args:
-        gs_model: Full-scene Gaussian splat model.
-        max_gaussians: Maximum number of Gaussians to keep.
-        seed: Random seed for reproducible subsampling.
-        device: Torch device for the returned mask.
+        gs_model (GaussianSplat3d): Full-scene Gaussian splat model.
+        max_gaussians (int): Maximum number of Gaussians to keep.
+        seed (int): Random seed for reproducible subsampling.
+        device (torch.device): Torch device for the returned mask tensor.
+
+    Returns:
+        tuple[GaussianSplat3d, torch.Tensor]: Subsampled model and a boolean mask over the full scene.
     """
     rng = np.random.default_rng(seed)
     indices = rng.choice(gs_model.num_gaussians, size=max_gaussians, replace=False)
@@ -117,13 +134,18 @@ def _map_cluster_labels_to_full_scene(
     clustering_gs_model: GaussianSplat3d,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map cluster labels from a subsampled set back to the full scene.
+    """
+    Map cluster labels from a subsampled Gaussian set back to the full scene.
+
     Args:
-        cluster_labels_sub: Cluster labels on the subsampled Gaussians.
-        cluster_probs_sub: Cluster probabilities on the subsampled Gaussians.
-        gs_model: Full-scene Gaussian splat model.
-        clustering_gs_model: Subsampled model used for clustering.
-        device: Torch device for returned tensors.
+        cluster_labels_sub (torch.Tensor): Cluster labels on the subsampled Gaussians.
+        cluster_probs_sub (torch.Tensor): Cluster probabilities on the subsampled Gaussians.
+        gs_model (GaussianSplat3d): Full-scene Gaussian splat model.
+        clustering_gs_model (GaussianSplat3d): Subsampled model used for clustering.
+        device (torch.device): Torch device for returned tensors.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Cluster labels and probabilities aligned to ``gs_model``.
     """
     tree = cKDTree(clustering_gs_model.means.cpu().numpy())
     _, nearest_indices = tree.query(gs_model.means.cpu().numpy(), k=1, workers=-1)
@@ -136,11 +158,16 @@ def _filter_high_variance_clusters(
     cluster_coherence: dict[int, float],
     variance_threshold: float,
 ) -> list[int]:
-    """Find spatially incoherent clusters by normalized variance.
+    """
+    Find spatially incoherent clusters by normalized positional variance.
+
     Args:
-        cluster_splats: Cluster label to Gaussian splat mapping.
-        cluster_coherence: Cluster label to coherence score mapping.
-        variance_threshold: Normalized variance cutoff (variance / extent^2).
+        cluster_splats (dict[int, GaussianSplat3d]): Cluster label to Gaussian splat mapping.
+        cluster_coherence (dict[int, float]): Cluster label to coherence score mapping.
+        variance_threshold (float): Normalized variance cutoff (variance divided by extent squared).
+
+    Returns:
+        list[int]: Cluster labels that exceed ``variance_threshold``.
     """
     removed: list[int] = []
     for label, splat in list(cluster_splats.items()):
@@ -176,7 +203,33 @@ def rip_segments(
     max_gaussians_for_clustering: int,
     verbose: bool,
 ) -> None:
-    """Cluster Gaussians and export ``n`` segment PLY files."""
+    """
+    Cluster Gaussians at a chosen scale and export segment ``.ply`` Gaussian splat scenes.
+
+    Loads a reconstruction and GARfVDB segmentation checkpoint, optionally pre-filters splats,
+    computes affinity features at ``cluster_scale``, clusters them, filters clusters, then writes
+    up to ``n`` segment ``.ply`` files (one per selected cluster).
+
+    Args:
+        segmentation_path (Path): GARfVDB segmentation checkpoint (``.pt`` / ``.pth``).
+        reconstruction_path (Path): Gaussian splat reconstruction (``.pt`` / ``.ply``).
+        out_dir (Path): Output directory for segment ``.ply`` files.
+        n (int): Maximum number of segments to export.
+        cluster_scale (float): Scale passed to affinity clustering (see ``cluster_scale_unit``).
+        cluster_scale_unit (Literal["fraction", "world"]): Whether ``cluster_scale`` is a fraction of
+            ``max_grouping_scale`` or a world-unit value.
+        seed (int): Random seed for subsampling and cluster selection.
+        device (str): Torch device (for example ``"cuda"``).
+        min_splat_scale (float): Drop Gaussians larger than this fraction of scene extent (``0`` disables).
+        opacity_percentile (float): Keep Gaussians above this opacity percentile (``0`` disables).
+        mean_percentile (tuple[float, ...]): Per-channel mean percentiles for splat pre-filtering.
+        min_cluster_gaussians (int): Drop clusters with fewer member Gaussians than this (``0`` disables).
+        filter_high_variance (bool): Remove spatially incoherent clusters before export.
+        variance_threshold (float): Normalized variance cutoff when ``filter_high_variance`` is enabled.
+        sample_by (Literal["random", "coherence"]): How to choose which clusters to export.
+        max_gaussians_for_clustering (int): Subsample before clustering when the scene is larger (``0`` disables).
+        verbose (bool): Enable debug logging.
+    """
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
 
@@ -345,7 +398,7 @@ def rip_segments(
 
 
 def main() -> None:
-    """Parse CLI arguments and run segment extraction."""
+    """Parse CLI arguments and run :func:`rip_segments`."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

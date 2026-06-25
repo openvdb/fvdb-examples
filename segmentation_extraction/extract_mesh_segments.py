@@ -34,13 +34,16 @@ def _reproject_vertex_colors(
     source_vertices: np.ndarray,
     source_colors: np.ndarray,
 ) -> np.ndarray:
-    """Copy colors onto new mesh vertices via nearest-neighbor lookup.
+    """
+    Copy vertex colors onto a new mesh via nearest-neighbor lookup.
+
     Args:
-        target_vertices: The vertices of the new mesh.
-        source_vertices: The vertices of the source mesh.
-        source_colors: The colors of the source mesh.
+        target_vertices (np.ndarray): Vertex positions of the destination mesh, shape ``(#V, 3)``.
+        source_vertices (np.ndarray): Vertex positions of the source mesh, shape ``(#V, 3)``.
+        source_colors (np.ndarray): Per-vertex colors on the source mesh, shape ``(#V, 3)`` or ``(#V, 4)``.
+
     Returns:
-        The colors of the new mesh.
+        np.ndarray: Colors for ``target_vertices``, same channel count as ``source_colors``.
     """
     finite_mask = np.isfinite(source_vertices).all(axis=1)
     if not finite_mask.all():
@@ -60,12 +63,28 @@ def _reproject_vertex_colors(
 
 
 def _has_vertex_colors(vertex_colors: np.ndarray | None) -> bool:
-    """Return True if the mesh has a non-empty per-vertex color array."""
+    """
+    Return whether a mesh carries a non-empty per-vertex color array.
+
+    Args:
+        vertex_colors (np.ndarray | None): Per-vertex colors loaded from mesh I/O, or ``None``.
+
+    Returns:
+        bool: ``True`` when ``vertex_colors`` has at least one vertex color.
+    """
     return vertex_colors is not None and vertex_colors.size > 0 and vertex_colors.shape[0] > 0
 
 
 def _as_float_vertex_colors(colors: np.ndarray) -> np.ndarray:
-    """Convert vertex colors to float RGB(A) in [0, 1] for point_cloud_utils I/O."""
+    """
+    Convert vertex colors to float RGB(A) in ``[0, 1]`` for ``point_cloud_utils`` I/O.
+
+    Args:
+        colors (np.ndarray): Input colors as ``uint8`` or float; values above ``1.0`` are treated as 8-bit.
+
+    Returns:
+        np.ndarray: Float32 colors clipped to ``[0, 1]``.
+    """
     colors = np.asarray(colors)
     if colors.dtype == np.uint8:
         colors = colors.astype(np.float64) / 255.0
@@ -87,17 +106,22 @@ def extract_segment_mesh(
     device: str,
     verbose: bool,
 ) -> None:
-    """Extract a mesh region corresponding to a Gaussian segment.
+    """
+    Extract a mesh patch from a full-scene mesh using a Gaussian splat segment as a spatial mask.
+
+    Mesh vertices within ``distance_threshold`` of any segment Gaussian are kept. Faces whose
+    three vertices all lie in that set are exported. Unless ``no_gap_fill`` is set, boundary holes
+    are closed with harmonic Laplacian fill and the patch is made watertight for simulation.
 
     Args:
-        full_mesh_path: Path to the full scene mesh (.ply).
-        segment_ply_path: Path to the segment Gaussian splats (.ply).
-        output_path: Path to save the extracted segment mesh.
-        distance_threshold: Maximum distance from segment Gaussians to include mesh vertices (in world units).
-        no_gap_fill: Skip watertight + harmonic gap fill on the extracted patch
-        resolution: Manifold octree resolution for pcu.make_mesh_watertight (capped to segment size)
-        device: Device for loading Gaussian splats.
-        verbose: Enable verbose logging.
+        full_mesh_path (Path): Path to the full-scene triangle mesh (``.ply`` or other ``point_cloud_utils`` format).
+        segment_ply_path (Path): Path to the segment Gaussian splat scene (``.ply``).
+        output_path (Path): Output path for the extracted segment mesh.
+        distance_threshold (float): Maximum distance in world units from segment Gaussians to include mesh vertices.
+        no_gap_fill (bool): When ``True``, skip harmonic hole fill and watertight remeshing.
+        resolution (int): Octree resolution passed to ``pcu.make_mesh_watertight`` (capped to segment size).
+        device (str): Torch device for loading the segment splat PLY (for example ``"cuda"``).
+        verbose (bool): Enable debug logging.
     """
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
@@ -231,19 +255,20 @@ def fill_mesh_gaps(
     *,
     k: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Close boundary holes with fan caps and harmonic Laplacian fairing.
+    """
+    Close boundary holes with fan caps and harmonic Laplacian fairing.
 
-    Each open boundary loop is triangulated with a Steiner vertex at the loop
-    centroid. Cap vertex positions are then relaxed by solving a k-harmonic
-    PDE (k=1: Laplacian, k=2: biharmonic) with the original mesh vertices fixed.
+    Each open boundary loop is triangulated with a Steiner vertex at the loop centroid. Cap vertex
+    positions are relaxed by solving a k-harmonic PDE (``k=1``: Laplacian, ``k=2``: biharmonic)
+    with the original mesh vertices fixed.
 
     Args:
-        vertices: Mesh vertex positions, shape (#V, 3).
-        faces: Triangle indices, shape (#F, 3).
-        k: Order of the harmonic operator (1 = harmonic/Laplacian, 2 = biharmonic).
+        vertices (np.ndarray): Mesh vertex positions, shape ``(#V, 3)``.
+        faces (np.ndarray): Triangle indices, shape ``(#F, 3)``.
+        k (int): Order of the harmonic operator (``1`` = harmonic/Laplacian, ``2`` = biharmonic).
 
     Returns:
-        Updated (vertices, faces) with holes capped.
+        tuple[np.ndarray, np.ndarray]: Updated ``(vertices, faces)`` with holes capped.
     """
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int32)
@@ -283,6 +308,7 @@ def fill_mesh_gaps(
 
 
 def main() -> None:
+    """Parse CLI arguments and run :func:`extract_segment_mesh`."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(
