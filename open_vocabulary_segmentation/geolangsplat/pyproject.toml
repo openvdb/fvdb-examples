@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fvdb-geolangsplat"
+version = "0.0.1"
+description = "Training-free, open-vocabulary 3D segmentation for Gaussian splats"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Amrik Krishnakumar" }]
+
+dependencies = [
+    "fvdb-reality-capture",
+    "numpy",
+    "pandas",
+    "pillow",
+    "torch",
+    "tyro",
+]
+
+# SAM3 is the promptable 2D segmenter used at query time. It is not on PyPI;
+# install it from its source checkout (see README) and make it importable.
+
+[project.optional-dependencies]
+test = ["pytest"]
+notebook = ["ipywidgets"]  # interactive SegmentCatalog.browse() picker
+
+[project.scripts]
+gls = "geolangsplat.cli:gls"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["geolangsplat*"]

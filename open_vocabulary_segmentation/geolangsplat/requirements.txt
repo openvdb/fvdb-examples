@@ -1,0 +1,10 @@
+# Lightweight dependencies, safe to pip/uv-install into your fvdb environment.
+#
+# NOT listed here (they come from the prebuilt fvdb environment, see README "Setup"):
+#   - torch                         (built/installed with fvdb)
+#   - fvdb / fvdb-reality-capture   (the fvdb monorepo build; not on PyPI)
+#   - sam3                          (install from its source checkout; query-time only)
+numpy
+pandas
+pillow
+tyro
