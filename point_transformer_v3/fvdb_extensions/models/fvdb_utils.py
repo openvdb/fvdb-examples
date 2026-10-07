@@ -62,28 +62,30 @@ def jagged_cumulative_argsort(unsorted_jt: fvdb.JaggedTensor) -> fvdb.JaggedTens
 
 
 def morton_from_jagged_ijk(jagged_ijk: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
-    ijk_j = jagged_ijk.jdata
-    morton_j = fvdb.morton(ijk_j)
+    ijk_j: torch.Tensor = jagged_ijk.jdata
+    kji_j = ijk_j[:, [2, 1, 0]].contiguous()
+    morton_j = fvdb.morton(kji_j)
     return jagged_ijk.jagged_like(morton_j)
 
 
 def morton_flipped_from_jagged_ijk(jagged_ijk: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
     ijk_j: torch.Tensor = jagged_ijk.jdata
-    kji_j = ijk_j.flip(dims=[-1])
-    morton_j = fvdb.morton(kji_j)
+    kij_j = ijk_j[:, [2, 0, 1]].contiguous()
+    morton_j = fvdb.morton(kij_j)
     return jagged_ijk.jagged_like(morton_j)
 
 
 def hilbert_from_jagged_ijk(jagged_ijk: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
-    ijk_j = jagged_ijk.jdata
-    hilbert_j = fvdb.hilbert(ijk_j)
+    ijk_j: torch.Tensor = jagged_ijk.jdata
+    jki_j = ijk_j[:, [1, 2, 0]].contiguous()
+    hilbert_j = fvdb.hilbert(jki_j)
     return jagged_ijk.jagged_like(hilbert_j)
 
 
 def hilbert_flipped_from_jagged_ijk(jagged_ijk: fvdb.JaggedTensor) -> fvdb.JaggedTensor:
     ijk_j: torch.Tensor = jagged_ijk.jdata
-    kji_j = ijk_j.flip(dims=[-1])
-    hilbert_j = fvdb.hilbert(kji_j)
+    ikj_j = ijk_j[:, [0, 2, 1]].contiguous()
+    hilbert_j = fvdb.hilbert(ikj_j)
     return jagged_ijk.jagged_like(hilbert_j)
 
 
@@ -259,7 +261,10 @@ def jagged_attention(
             out_b = cast(
                 Any,
                 flash_attn.flash_attn_qkvpacked_func(
-                    qkv_b.half(), dropout_p=0.0, softmax_scale=scale, window_size=window_size
+                    qkv_b.half(),
+                    dropout_p=0.0,
+                    softmax_scale=scale,
+                    window_size=window_size,
                 ),
             ).reshape(
                 Li, hidden_size
@@ -303,7 +308,7 @@ def jagged_attention(
             feats_out_j = cast(
                 Any,
                 flash_attn.flash_attn_varlen_qkvpacked_func(
-                    qkv_j.half(),
+                    qkv_j.to(dtype=torch.bfloat16),
                     cu_seqlens,
                     max_seqlen=patch_size,
                     dropout_p=0.0,  # TODO: implement attention dropout in the future. By default, it is 0.
@@ -311,7 +316,7 @@ def jagged_attention(
                 ),
             ).reshape(
                 num_voxels, hidden_size
-            )  # dtype: float16
+            )  # dtype: bfloat16
 
             feats_out_j = feats_out_j.to(feats_j.dtype)
     else:
