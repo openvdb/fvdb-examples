@@ -1,0 +1,50 @@
+[project]
+name = "modsim-toolbox"
+version = "0.1.0"
+description = "Accelerated and differentiable sensor simulation"
+readme = "README.md"
+authors = [
+    { name = "Gabriel Casselman", email = "gcasselman@nvidia.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+  # fvdb-core wheels are built against one exact torch minor (encoded in the
+  # "+ptXYZ.cuNNN" local version), so torch must be pinned to match. Bumping
+  # fvdb-core means bumping torch in lockstep:
+  #   fvdb-core 0.4.x -> torch 2.10   fvdb-core 0.5.x -> torch 2.11
+  "torch==2.10.*",
+  "fvdb-core==0.4.2",
+  "numpy",
+  "viser>=1.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130"}
+fvdb-core = { index = "fvdb-release"}
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "fvdb-release"
+url = "https://d36m13axqqhiit.cloudfront.net/simple"
+explicit = true
+
+
+[build-system]
+requires = ["uv_build>=0.11.17,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint.isort]
+# The car example imports its own modules by bare name, as a flat script does.
+known-local-folder = ["loader", "radiometry"]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
