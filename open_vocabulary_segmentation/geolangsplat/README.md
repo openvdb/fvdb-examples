@@ -59,9 +59,25 @@ GeoLangSplat runs inside an existing **fVDB** environment with `torch`, `fvdb-co
    pip install -e .                     # registers the `gls` command
    ```
 
-2. **Add SAM3** — the 2D segmenter used by `segment`/`bake`. It is not on PyPI: install it from
-   source so that `import sam3` works. It loads lazily, so it is *not* needed to import the
-   package, run the tests (SAM3 is mocked), or run `gls check`.
+2. **Add SAM3** — the 2D segmenter used by `segment`/`bake`. It loads lazily, so it is *not*
+   needed to import the package, run the tests (SAM3 is mocked), or run `gls check`.
+
+   ```bash
+   git clone https://github.com/facebookresearch/sam3.git
+   pip install --no-deps -e sam3        # --no-deps keeps the fVDB env's torch
+   pip install pycocotools              # imported by SAM3 but not declared
+   ```
+
+   SAM3's `model_builder.py` imports `pkg_resources`, which setuptools 82+ no longer ships.
+   On a newer setuptools, replace each `pkg_resources.resource_filename("sam3", p)` with
+   `str(importlib.resources.files("sam3") / p)`.
+
+   The checkpoint is gated. Accept the license on the `facebook/sam3.1` Hugging Face page, then:
+
+   ```bash
+   hf auth login
+   hf download facebook/sam3.1 sam3.1_multiplex.pt --local-dir sam3/ckpt
+   ```
 
 3. **Point at a checkpoint and run the preflight:**
 
