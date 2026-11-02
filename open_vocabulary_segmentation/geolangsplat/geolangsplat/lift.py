@@ -76,6 +76,7 @@ def view_contrib(model, v: View, cfg, device: torch.device):
         near=0.01,
         far=1e12,
         top_k_contributors=cfg.top_k,
+        **v.camera_kwargs(),
     )
     ids = ids_j.jdata.reshape(-1).long()
     w = w_j.jdata.reshape(-1).float()
@@ -417,6 +418,7 @@ def build_band_cache(model, views: list[View], cfg, device: torch.device) -> Ban
             image_height=H,
             near=0.01,
             far=1e12,
+            **v.camera_kwargs(),
         )
         depth = img[0, ..., 3]
         a0 = alpha[0, ..., 0]

@@ -41,6 +41,19 @@ class View:
     K: torch.Tensor  # [3, 3] float
     height: int
     width: int
+    camera_model: int = 0  # fvdb_reality_capture.CameraModel value; 0 is PINHOLE
+    distortion_coeffs: torch.Tensor | None = None  # [12] float, used when not PINHOLE
+
+    def camera_kwargs(self) -> dict:
+        """Extra render kwargs for a distorted camera; empty for a pinhole view."""
+        if self.camera_model == 0:
+            return {}
+        from fvdb_reality_capture import CameraModel
+
+        return {
+            "camera_model": CameraModel(self.camera_model),
+            "distortion_coeffs": self.distortion_coeffs.unsqueeze(0).float(),
+        }
 
 
 def scene_span(means: torch.Tensor) -> float:
@@ -457,6 +470,45 @@ def match_metadata_to_colmap(meta_c2w: np.ndarray, col_c2w: np.ndarray, nt: np.n
     return d.argmin(axis=1)
 
 
+def _photos_by_image_id(sfm: pathlib.Path) -> dict[int, pathlib.Path] | None:
+    """Map reality-capture image ids to photo paths, or ``None`` if the scene won't load."""
+    try:
+        from fvdb_reality_capture.sfm_scene import SfmScene
+
+        scene = SfmScene.from_colmap(sfm)
+    except Exception as e:
+        print(f"[views] could not load {sfm} with fvdb-reality-capture ({e}); matching photos by position", flush=True)
+        return None
+    return {int(im.image_id): pathlib.Path(im.image_path) for im in scene.images}
+
+
+def _match_photos(sfm: pathlib.Path, metadata: dict, meta_c2w: np.ndarray, nt: np.ndarray) -> list[pathlib.Path]:
+    """Photo path for each metadata camera.
+
+    Uses the ``image_ids`` that reality-capture saves with each training camera.
+    Splats without them fall back to nearest-position matching against COLMAP.
+    """
+    image_ids = metadata.get("image_ids")
+    photos = _photos_by_image_id(sfm) if image_ids is not None else None
+    if photos is not None:
+        ids = _to_np(image_ids).astype(np.int64).reshape(-1)
+        missing = [int(i) for i in ids if int(i) not in photos]
+        if missing:
+            raise GeoLangSplatError(
+                f"{len(missing)} training image ids (e.g. {missing[:3]}) are not in the scene at {sfm}; "
+                "pass the same --sfm folder the splat was trained from"
+            )
+        return [photos[int(i)] for i in ids]
+
+    _cam_path, img_path, img_dir = _find_colmap(sfm)
+    recs = sorted(_read_colmap_images(img_path), key=lambda d: d["name"])
+    if not recs:
+        raise GeoLangSplatError(f"no images found in {img_path}")
+    col_c2w = np.stack([_colmap_c2w(r) for r in recs], axis=0)
+    match = match_metadata_to_colmap(meta_c2w, col_c2w, nt)
+    return [img_dir / recs[int(j)]["name"] for j in match]
+
+
 def _load_metadata_image_views(cfg, device: torch.device, metadata: dict) -> list[View]:
     """Build views from the splat's *own* training cameras (correct frame).
 
@@ -476,22 +528,19 @@ def _load_metadata_image_views(cfg, device: torch.device, metadata: dict) -> lis
     sfm = pathlib.Path(cfg.sfm)
     if not sfm.is_dir():
         raise GeoLangSplatError(f"--sfm path does not exist or is not a directory: {sfm}")
-    _cam_path, img_path, img_dir = _find_colmap(sfm)
-
     meta_c2w = _to_np(metadata["camera_to_world_matrices"]).astype(np.float64)  # [M, 4, 4]
     Kall = _to_np(metadata["projection_matrices"]).astype(np.float64)  # [M, 3, 3]
     isz = _to_np(metadata["image_sizes"]).astype(np.int64)  # [M, 2] = (H, W)
     nt = metadata.get("normalization_transform")
     nt = _to_np(nt).astype(np.float64) if nt is not None else np.eye(4)
-
-    recs = sorted(_read_colmap_images(img_path), key=lambda d: d["name"])
-    if not recs:
-        raise GeoLangSplatError(f"no images found in {img_path}")
-    names = [r["name"] for r in recs]
-    col_c2w = np.stack([_colmap_c2w(r) for r in recs], axis=0)
-    match = match_metadata_to_colmap(meta_c2w, col_c2w, nt)
-
     M = meta_c2w.shape[0]
+    cam_models = metadata.get("camera_models")
+    cam_models = _to_np(cam_models).astype(np.int64).reshape(-1) if cam_models is not None else np.zeros(M, np.int64)
+    dist = metadata.get("distortion_coeffs")
+    dist = _to_np(dist).astype(np.float32).reshape(M, -1) if dist is not None else None
+
+    photos = _match_photos(sfm, metadata, meta_c2w, nt)
+
     n = min(cfg.n_views, M) if cfg.n_views > 0 else M
     pick = np.unique(np.linspace(0, M - 1, n).round().astype(int))
 
@@ -499,9 +548,10 @@ def _load_metadata_image_views(cfg, device: torch.device, metadata: dict) -> lis
     for i in pick:
         H, W = int(isz[i][0]), int(isz[i][1])
         w2c = np.linalg.inv(meta_c2w[i])
-        pil = Image.open(img_dir / names[int(match[i])]).convert("RGB")
+        pil = Image.open(photos[i]).convert("RGB")
         if pil.size != (W, H):
             pil = pil.resize((W, H), Image.BILINEAR)
+        model_id = int(cam_models[i])
         views.append(
             View(
                 pil=pil,
@@ -509,10 +559,14 @@ def _load_metadata_image_views(cfg, device: torch.device, metadata: dict) -> lis
                 K=torch.from_numpy(Kall[i]).float().to(device),
                 height=H,
                 width=W,
+                camera_model=model_id,
+                distortion_coeffs=(
+                    torch.from_numpy(dist[i]).to(device) if model_id != 0 and dist is not None else None
+                ),
             )
         )
     print(
-        f"[views] loaded {len(views)} ground-truth views (metadata cameras, photos from {img_dir})",
+        f"[views] loaded {len(views)} ground-truth views (metadata cameras, photos from {photos[0].parent})",
         flush=True,
     )
     return views

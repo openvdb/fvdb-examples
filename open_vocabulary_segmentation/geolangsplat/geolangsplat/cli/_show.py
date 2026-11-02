@@ -68,7 +68,9 @@ class Show(BaseCommand):
         model, _meta = _load_model(self.model_path, dev)
         viz.init(ip_address=self.ip, port=self.viewer_port, vk_device_id=self.vk_device_id)
         scene = viz.get_scene("GeoLangSplat Viewer")
-        scene.add_gaussian_splat_3d("splat", model)
+        from fvdb_reality_capture import gaussian_splat_to_view_data
+
+        scene.add_gaussian_splat_3d("splat", gaussian_splat_to_view_data(model))
         # Orient + frame the camera (object/COLMAP plys aren't z-up, and the default
         # near clip is too far to zoom into small scenes).
         try:

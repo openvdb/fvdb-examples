@@ -9,9 +9,13 @@ COLMAP poses live in the original (e.g. UTM) frame. We must match each metadata
 camera to its source photo *through* that transform.
 """
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
+import geolangsplat.views as views_mod
+from geolangsplat.config import GeoLangSplatConfig
+from geolangsplat.errors import GeoLangSplatError
 from geolangsplat.views import (
     dome_radius_scale,
     dome_view_metrics,
@@ -98,3 +102,59 @@ def test_dome_view_metrics_coverage_and_occlusion():
     near = torch.full((H, W), 0.2 * radius)
     cov, occ, _ = dome_view_metrics(pil, near, torch.ones(H, W), radius)
     assert cov > 0.9 and occ > 0.9
+
+
+# -- reality-capture metadata cameras ------------------------------------------
+
+
+def _rc_metadata(n: int, *, image_ids=None, camera_models=None, dist=None) -> dict:
+    meta = {
+        "camera_to_world_matrices": torch.eye(4).repeat(n, 1, 1),
+        "projection_matrices": torch.tensor([[10.0, 0, 4], [0, 10.0, 3], [0, 0, 1]]).repeat(n, 1, 1),
+        "image_sizes": torch.tensor([[6, 8]]).repeat(n, 1),
+    }
+    if image_ids is not None:
+        meta["image_ids"] = torch.tensor(image_ids, dtype=torch.uint32)
+    if camera_models is not None:
+        meta["camera_models"] = torch.tensor(camera_models, dtype=torch.int32)
+    if dist is not None:
+        meta["distortion_coeffs"] = dist
+    return meta
+
+
+def _photo(path, value: int):
+    Image.new("RGB", (8, 6), (value, value, value)).save(path)
+    return path
+
+
+def test_metadata_views_match_photos_by_image_id(monkeypatch, tmp_path):
+    photos = {7: _photo(tmp_path / "a.png", 10), 3: _photo(tmp_path / "b.png", 200)}
+    monkeypatch.setattr(views_mod, "_photos_by_image_id", lambda sfm: photos)
+    cfg = GeoLangSplatConfig(device="cpu", sfm=str(tmp_path), n_views=0)
+
+    out = views_mod._load_metadata_image_views(cfg, torch.device("cpu"), _rc_metadata(2, image_ids=[3, 7]))
+
+    assert [v.pil.getpixel((0, 0))[0] for v in out] == [200, 10]
+
+
+def test_metadata_views_reject_unknown_image_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(views_mod, "_photos_by_image_id", lambda sfm: {0: _photo(tmp_path / "a.png", 0)})
+    cfg = GeoLangSplatConfig(device="cpu", sfm=str(tmp_path), n_views=0)
+
+    with pytest.raises(GeoLangSplatError, match="image ids"):
+        views_mod._load_metadata_image_views(cfg, torch.device("cpu"), _rc_metadata(1, image_ids=[5]))
+
+
+def test_metadata_views_carry_distortion(monkeypatch, tmp_path):
+    photos = {0: _photo(tmp_path / "a.png", 0), 1: _photo(tmp_path / "b.png", 0)}
+    monkeypatch.setattr(views_mod, "_photos_by_image_id", lambda sfm: photos)
+    dist = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+    meta = _rc_metadata(2, image_ids=[0, 1], camera_models=[0, 1], dist=dist)
+    cfg = GeoLangSplatConfig(device="cpu", sfm=str(tmp_path), n_views=0)
+
+    pinhole, opencv = views_mod._load_metadata_image_views(cfg, torch.device("cpu"), meta)
+
+    assert pinhole.camera_kwargs() == {}
+    kw = opencv.camera_kwargs()
+    assert int(kw["camera_model"]) == 1
+    assert torch.equal(kw["distortion_coeffs"], dist[1:2])

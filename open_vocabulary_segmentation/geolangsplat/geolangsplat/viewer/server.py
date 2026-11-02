@@ -157,10 +157,27 @@ class _VizEngine(GeoLangSplatEngine):
         self._cat_word = ""
         self._show(torch.zeros(self.N, dtype=torch.bool, device=self.device))
 
+    def _push(self, sh0: torch.Tensor, shN: torch.Tensor, keep: torch.Tensor | None = None) -> None:
+        """Replace the viewer splat with the given colours, optionally keeping only ``keep``.
+
+        Re-adding under the same name swaps the splat in place. ``scene.reset()``
+        would snap the camera back to center.
+        """
+        geom = [self.means, self.model.quats, self.model.log_scales, self.model.logit_opacities]
+        geom = [t.detach() if keep is None else t.detach()[keep] for t in geom]
+        means, quats, log_scales, logit_opacities = geom
+        self.scene.add_gaussian_splat_tensors(
+            "scene",
+            means=means,
+            quats=quats,
+            log_scales=log_scales,
+            logit_opacities=logit_opacities,
+            sh0=sh0,
+            shN=shN,
+        )
+
     def _show(self, sel: torch.Tensor) -> None:
         """Show the full scene with ``sel`` Gaussians tinted (everything stays)."""
-        from fvdb_reality_capture import GaussianSplat3d
-
         cfg = self.cfg
         sh0 = self.model.sh0.detach().clone()
         shN = self.model.shN.detach().clone()
@@ -170,22 +187,10 @@ class _VizEngine(GeoLangSplatEngine):
             tgt = torch.tensor(cfg.highlight_color, device=self.device).view(1, 1, 3)
             sh0[sel] = ((1 - a) * cur + a * tgt - 0.5) / SH_C0
             shN[sel] = shN[sel] * (1 - a)
-        disp = GaussianSplat3d.from_tensors(
-            means=self.means,
-            quats=self.model.quats.detach(),
-            log_scales=self.model.log_scales.detach(),
-            logit_opacities=self.model.logit_opacities.detach(),
-            sh0=sh0,
-            shN=shN,
-        )
-        # Re-add under the same name to swap in place (no scene.reset(), which would
-        # snap the camera back to center).
-        self.scene.add_gaussian_splat_3d("scene", disp)
+        self._push(sh0, shN)
 
     def _show_labels(self, labels: torch.Tensor) -> None:
         """Recolour the full scene by object id -- each instance gets its own colour."""
-        from fvdb_reality_capture import GaussianSplat3d
-
         cfg = self.cfg
         sh0 = self.model.sh0.detach().clone()
         shN = self.model.shN.detach().clone()
@@ -198,15 +203,7 @@ class _VizEngine(GeoLangSplatEngine):
             cur = 0.5 + SH_C0 * sh0[m]
             sh0[m] = ((1 - a) * cur + a * tgt - 0.5) / SH_C0
             shN[m] = shN[m] * (1 - a)
-        disp = GaussianSplat3d.from_tensors(
-            means=self.means,
-            quats=self.model.quats.detach(),
-            log_scales=self.model.log_scales.detach(),
-            logit_opacities=self.model.logit_opacities.detach(),
-            sh0=sh0,
-            shN=shN,
-        )
-        self.scene.add_gaussian_splat_3d("scene", disp)
+        self._push(sh0, shN)
 
     def _show_cutout(self, mask: torch.Tensor) -> None:
         """Swap the scene to *only* the masked Gaussians (a clean object cutout).
@@ -215,20 +212,10 @@ class _VizEngine(GeoLangSplatEngine):
         tight on the object so it's easy to orbit/zoom -- otherwise the camera stays
         parked at the whole-scene distance and the cutout looks tiny and far.
         """
-        from fvdb_reality_capture import GaussianSplat3d
-
         m = mask.to(self.device)
         if int(m.sum()) == 0:
             return
-        disp = GaussianSplat3d.from_tensors(
-            means=self.means[m],
-            quats=self.model.quats.detach()[m],
-            log_scales=self.model.log_scales.detach()[m],
-            logit_opacities=self.model.logit_opacities.detach()[m],
-            sh0=self.model.sh0.detach()[m],
-            shN=self.model.shN.detach()[m],
-        )
-        self.scene.add_gaussian_splat_3d("scene", disp)
+        self._push(self.model.sh0.detach()[m], self.model.shN.detach()[m], keep=m)
         self._frame_on(self.means[m])
 
     def _frame_on(self, pts: torch.Tensor) -> None:
