@@ -470,6 +470,26 @@ def match_metadata_to_colmap(meta_c2w: np.ndarray, col_c2w: np.ndarray, nt: np.n
     return d.argmin(axis=1)
 
 
+def splat_frame_w2c(sfm: pathlib.Path, metadata: dict | None) -> np.ndarray:
+    """World-to-camera matrices ``[P, 4, 4]`` for the scene's real cameras, in the splat's frame.
+
+    Uses the training cameras saved in ``metadata`` when present. Otherwise reads the
+    COLMAP poses and maps them through ``normalization_transform``, if there is one.
+    """
+    if metadata and "camera_to_world_matrices" in metadata:
+        c2w = _to_np(metadata["camera_to_world_matrices"]).astype(np.float64)
+    else:
+        _cam_path, img_path, _img_dir = _find_colmap(sfm)
+        recs = sorted(_read_colmap_images(img_path), key=lambda d: d["name"])
+        if not recs:
+            raise GeoLangSplatError(f"no images found in {img_path}")
+        c2w = np.stack([_colmap_c2w(r) for r in recs], axis=0)
+        nt = (metadata or {}).get("normalization_transform")
+        if nt is not None:
+            c2w = _to_np(nt).astype(np.float64)[None] @ c2w
+    return np.linalg.inv(c2w)
+
+
 def _photos_by_image_id(sfm: pathlib.Path) -> dict[int, pathlib.Path] | None:
     """Map reality-capture image ids to photo paths, or ``None`` if the scene won't load."""
     try:

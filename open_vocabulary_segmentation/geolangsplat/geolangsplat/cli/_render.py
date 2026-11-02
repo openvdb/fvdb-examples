@@ -102,7 +102,7 @@ class Render(BaseCommand):
             out = (pathlib.Path(base) / name) if base else self.model_path.with_name(name)
 
         dev = resolve_device(self.device)
-        model, _meta = _load_model(self.model_path, dev)
+        model, meta = _load_model(self.model_path, dev)
         means = model.means.detach()
 
         stats = measure_geometry(means)
@@ -119,17 +119,16 @@ class Render(BaseCommand):
         #   orbit      : fixed --radius-frac at the user's --elevation rings
         grid_cols = None  # when set, montage lays out rows=elevation, cols=azimuth
         if self.sfm is not None:
-            # Render from the scene's real COLMAP poses (sampled evenly across the
-            # trajectory). No view synthesis, no up-axis guessing -- this is what the
-            # splat actually looks like from where it was captured.
-            from ..views import _colmap_c2w, _find_colmap, _read_colmap_images
+            # Render from the scene's real camera poses, in the splat's frame, sampled
+            # evenly across the trajectory. No view synthesis, no up-axis guessing --
+            # this is what the splat actually looks like from where it was captured.
+            from ..views import splat_frame_w2c
 
-            _cam, img_path, _img_dir = _find_colmap(self.sfm)
-            recs = sorted(_read_colmap_images(img_path), key=lambda d: d["name"])
+            all_w2c = splat_frame_w2c(self.sfm, meta)
             n = max(1, self.n_views * len(elevs))
-            idx = np.linspace(0, len(recs) - 1, num=min(n, len(recs))).round().astype(int)
+            idx = np.linspace(0, len(all_w2c) - 1, num=min(n, len(all_w2c))).round().astype(int)
             fov = self.fov
-            cams = [np.linalg.inv(_colmap_c2w(recs[i])) for i in idx]
+            cams = [all_w2c[i] for i in idx]
             elevs = []  # not a ring layout
         elif self.inside_out:
             center = means.float().median(0).values.cpu().numpy().astype(np.float64)

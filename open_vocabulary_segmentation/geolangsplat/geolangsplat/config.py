@@ -5,12 +5,13 @@
 
 A single :class:`GeoLangSplatConfig` drives both aerial and satellite captures.
 :data:`RECIPES` are named presets that fill sensible defaults for a capture
-type; :func:`apply_recipe` only fills fields the caller left at their default, so
-an explicitly set value always wins over the preset.
+type; :func:`apply_recipe` only fills fields the caller did not set, so an explicitly
+set value always wins over the preset.
 """
 from __future__ import annotations
 
 import difflib
+import functools
 import os
 from dataclasses import dataclass, field, fields
 from typing import Literal
@@ -51,6 +52,31 @@ class Tier:
     num_azimuth: int = 1
 
 
+def _track_set_fields(cls):
+    """Record which dataclass fields were set by a constructor argument or assignment.
+
+    Presets use this to fill only the fields nobody chose, even when a chosen value
+    happens to equal the default.
+    """
+    init = cls.__init__
+    names = [f.name for f in fields(cls)]
+
+    @functools.wraps(init)
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.__dict__["_set_fields"] = set(names[: len(args)]) | set(kwargs)
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if "_set_fields" in self.__dict__ and name in cls.__dataclass_fields__:
+            self._set_fields.add(name)
+
+    cls.__init__ = __init__
+    cls.__setattr__ = __setattr__
+    return cls
+
+
+@_track_set_fields
 @dataclass
 class GeoLangSplatConfig:
     """All knobs for the unified open-vocabulary segmentation pipeline.
@@ -278,9 +304,22 @@ def list_recipes() -> list[str]:
     return sorted(RECIPES)
 
 
+def is_set(cfg: GeoLangSplatConfig, name: str) -> bool:
+    """True if ``name`` was passed to the constructor or assigned since.
+
+    A config without tracking (e.g. unpickled from an older version) falls back to
+    comparing against the default.
+    """
+    set_fields = cfg.__dict__.get("_set_fields")
+    if set_fields is None:
+        return getattr(cfg, name) != getattr(GeoLangSplatConfig(), name)
+    return name in set_fields
+
+
 def apply_recipe(cfg: GeoLangSplatConfig, name: str | None) -> list[str]:
     """Fill recipe presets into ``cfg`` in place, but only for fields the caller
-    left at their default. An explicitly set value always wins over the preset.
+    did not set. An explicitly set value always wins over the preset, even when it
+    equals the default.
 
     Returns the list of field names actually overwritten by the preset.
     """
@@ -290,12 +329,11 @@ def apply_recipe(cfg: GeoLangSplatConfig, name: str | None) -> list[str]:
         hint = difflib.get_close_matches(name, list_recipes(), n=1)
         suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
         raise GeoLangSplatError(f"unknown recipe {name!r}{suggest}; choices: {list_recipes()}")
-    default = GeoLangSplatConfig()
     applied: list[str] = []
     for k, v in RECIPES[name].items():
         if not hasattr(cfg, k):
             raise KeyError(f"recipe {name!r} sets unknown field {k!r}")
-        if getattr(cfg, k) == getattr(default, k):
+        if not is_set(cfg, k):
             setattr(cfg, k, v)
             applied.append(k)
     return applied

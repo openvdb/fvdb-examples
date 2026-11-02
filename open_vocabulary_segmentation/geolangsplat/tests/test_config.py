@@ -81,3 +81,30 @@ def test_build_config_ignores_none():
 def test_config_field_names_nonempty():
     names = config_field_names()
     assert "select" in names and "view_source" in names and "lift" in names
+
+
+def test_explicit_default_value_wins_over_preset():
+    cfg = GeoLangSplatConfig(view_source="render")
+    applied = apply_recipe(cfg, "aerial")
+    assert "view_source" not in applied
+    assert cfg.view_source == "render"
+
+
+def test_assigned_default_value_wins_over_preset():
+    cfg = GeoLangSplatConfig()
+    cfg.select = GeoLangSplatConfig().select
+    apply_recipe(cfg, "satellite")
+    assert cfg.select == GeoLangSplatConfig().select
+
+
+def test_build_config_marks_only_provided_fields():
+    cfg = build_config(select=GeoLangSplatConfig().select, margin=None)
+    applied = apply_recipe(cfg, "satellite")
+    assert "select" not in applied and "margin" in applied
+
+
+def test_set_fields_survive_deepcopy():
+    import copy
+
+    cfg = copy.deepcopy(GeoLangSplatConfig(view_source="render"))
+    assert "view_source" not in apply_recipe(cfg, "aerial")

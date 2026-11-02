@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from .cameras import up_vector
-from .config import GeoLangSplatConfig, Tier
+from .config import GeoLangSplatConfig, Tier, is_set
 
 # --- up-axis (RANSAC ground-plane) estimation -----------------------------
 _UP_MIN_INLIERS = 0.3  # min inlier fraction to trust an estimated ground plane
@@ -366,10 +366,9 @@ def apply_auto_view_config(cfg: GeoLangSplatConfig, means) -> dict:
     stats = measure_geometry(means)
     budget = budget_views(cfg.max_views, cfg.vram_budget_gb)
     rec = recommend_view_config(stats, budget=budget)
-    default = GeoLangSplatConfig()
     applied: list[str] = []
     for k in ("view_source", "tiers", "select", "margin"):
-        if getattr(cfg, k) == getattr(default, k):
+        if not is_set(cfg, k):
             setattr(cfg, k, rec[k])
             applied.append(k)
     if str(cfg.up).lower() in ("", "auto", "none"):

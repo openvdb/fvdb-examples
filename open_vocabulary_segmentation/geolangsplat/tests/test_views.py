@@ -158,3 +158,25 @@ def test_metadata_views_carry_distortion(monkeypatch, tmp_path):
     kw = opencv.camera_kwargs()
     assert int(kw["camera_model"]) == 1
     assert torch.equal(kw["distortion_coeffs"], dist[1:2])
+
+
+def test_splat_frame_w2c_prefers_metadata_cameras(tmp_path):
+    c2w = torch.eye(4).repeat(2, 1, 1)
+    c2w[1, :3, 3] = torch.tensor([1.0, 2.0, 3.0])
+
+    w2c = views_mod.splat_frame_w2c(tmp_path, {"camera_to_world_matrices": c2w})
+
+    np.testing.assert_allclose(w2c[1, :3, 3], [-1.0, -2.0, -3.0])
+
+
+def test_splat_frame_w2c_normalizes_colmap_poses(monkeypatch, tmp_path):
+    # One COLMAP camera at x=100 in the original frame; normalization shifts by -100.
+    rec = {"name": "a.png", "qvec": np.array([1.0, 0, 0, 0]), "tvec": np.array([-100.0, 0, 0])}
+    monkeypatch.setattr(views_mod, "_find_colmap", lambda sfm: (None, tmp_path / "images.bin", tmp_path))
+    monkeypatch.setattr(views_mod, "_read_colmap_images", lambda path: [rec])
+    nt = torch.eye(4)
+    nt[0, 3] = -100.0
+
+    w2c = views_mod.splat_frame_w2c(tmp_path, {"normalization_transform": nt})
+
+    np.testing.assert_allclose(np.linalg.inv(w2c[0])[:3, 3], [0.0, 0.0, 0.0], atol=1e-9)
