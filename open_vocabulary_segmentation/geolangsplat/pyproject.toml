@@ -12,7 +12,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Amrik Krishnakumar" }]
 
 dependencies = [
-    "fvdb-reality-capture",
+    "fvdb-reality-capture>=0.6",
     "numpy",
     "pandas",
     "pillow",

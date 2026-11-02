@@ -11,10 +11,10 @@ recipe presets differ.
 
 Typical use::
 
-    from fvdb import GaussianSplat3d
+    from fvdb_reality_capture import GaussianSplat3d
     from geolangsplat import segment
 
-    model = GaussianSplat3d.from_ply("scene.ply")
+    model, metadata = GaussianSplat3d.from_ply("scene.ply")
     result = segment(model, "house", recipe="satellite", output="ply_overlay",
                      out_path="house.ply")
     print(result.num_selected)

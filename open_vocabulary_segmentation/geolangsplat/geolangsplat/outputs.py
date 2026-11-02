@@ -36,7 +36,7 @@ _PALETTE = np.array(
 
 
 def _gs():
-    from fvdb import GaussianSplat3d
+    from fvdb_reality_capture import GaussianSplat3d
 
     return GaussianSplat3d
 

@@ -3,9 +3,9 @@
 #
 """`gls doctor` - one-command environment preflight.
 
-Validates everything `gls segment`/`bake` needs on a fresh machine -- GPU, fvdb,
-SAM3, the SAM3 checkpoint, bf16 support -- and prints actionable hints for whatever
-is missing, instead of failing deep inside a build. (SAM3 weights + a working CUDA
+Validates everything `gls segment`/`bake` needs on a fresh machine -- GPU,
+fvdb-reality-capture, SAM3, the SAM3 checkpoint, bf16 support -- and prints
+actionable hints for whatever is missing, instead of failing deep inside a build. (SAM3 weights + a working CUDA
 stack are the usual pain when moving to a new box.)
 """
 from __future__ import annotations
@@ -58,21 +58,22 @@ class Doctor(BaseCommand):
             hard_ok = False
             print(f"{_FAIL} torch import failed: {e}")
 
-        # --- fvdb -----------------------------------------------------------
-        if importlib.util.find_spec("fvdb") is not None:
-            print(f"{_OK} fvdb importable")
-        else:
-            hard_ok = False
-            print(f"{_FAIL} fvdb not importable -- activate the env that has the fvdb build")
+        # --- fvdb-core + fvdb-reality-capture ------------------------------
+        from importlib.metadata import PackageNotFoundError, version
 
-        # --- fvdb-reality-capture (frgs integration / checkpoint IO) --------
-        if importlib.util.find_spec("fvdb_reality_capture") is not None:
-            print(f"{_OK} fvdb_reality_capture importable (frgs IO + .pt/.pth checkpoints)")
-        else:
-            print(
-                f"{_WARN} fvdb_reality_capture not importable -- .ply still works; "
-                ".pt/.pth checkpoint loading + frgs drop-in unavailable"
-            )
+        for dist in ("fvdb-core", "fvdb-reality-capture"):
+            try:
+                print(f"{_OK} {dist} {version(dist)}")
+            except PackageNotFoundError:
+                print(f"{_WARN} {dist} has no package metadata (source build?)")
+        try:
+            from fvdb_reality_capture import GaussianSplat3d  # noqa: F401
+
+            print(f"{_OK} fvdb_reality_capture.GaussianSplat3d importable")
+        except Exception as e:
+            hard_ok = False
+            print(f"{_FAIL} fvdb_reality_capture.GaussianSplat3d import failed: {e}")
+            print("       install fvdb-reality-capture>=0.6 in the active env")
 
         # --- SAM3 -----------------------------------------------------------
         if importlib.util.find_spec("sam3") is not None:

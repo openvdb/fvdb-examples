@@ -322,7 +322,7 @@ def _render_topdown(model, cfg, instances, *, size: int, device=None, highlight=
 
 def _highlight_model(model, mask: torch.Tensor):
     """A copy of the splat with ``mask`` Gaussians tinted bright and the rest dimmed."""
-    from fvdb import GaussianSplat3d
+    from fvdb_reality_capture import GaussianSplat3d
 
     from .outputs import _recolor_sh0
 

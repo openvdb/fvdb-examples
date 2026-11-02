@@ -48,8 +48,8 @@ views of the splat                             competition + cleanup  <--+
 
 ## Installation
 
-GeoLangSplat runs inside an existing **fVDB** environment (the fvdb monorepo build, with
-`torch` + `fvdb-reality-capture`; not on PyPI). It is light --> it adds only `numpy`, `pillow`,
+GeoLangSplat runs inside an existing **fVDB** environment with `torch`, `fvdb-core`, and
+`fvdb-reality-capture>=0.6` installed. It is light --> it adds only `numpy`, `pillow`,
 `tyro`, and the `gls` command.
 
 1. **Install into your fVDB env:**
@@ -67,7 +67,7 @@ GeoLangSplat runs inside an existing **fVDB** environment (the fvdb monorepo bui
 
    ```bash
    export GEOLANGSPLAT_SAM_CKPT=/path/to/sam3.1_multiplex.pt
-   gls doctor                           # checks GPU/bf16, fvdb, SAM3, checkpoint
+   gls doctor                           # checks GPU/bf16, fvdb versions, SAM3, checkpoint
    ```
 
 For a one-shot provision (e.g. baking a lab image), `setup.sh` downloads the checkpoint
@@ -102,7 +102,7 @@ or a path; every `GeoLangSplatConfig` field is settable (explicit fields beat a 
 ### Use as a post-processing step
 
 GeoLangSplat is a **self-contained post-processing stage** over any reconstruction: in goes a
-Gaussian splat (a `.ply` or in-memory `fvdb.GaussianSplat3d`, plus an optional COLMAP scene),
+Gaussian splat (a `.ply` or in-memory `fvdb_reality_capture.GaussianSplat3d`, plus an optional COLMAP scene),
 out come per-Gaussian labels in input order. With no per-scene training and no required upstream
 state, it drops in after a reconstruction step (e.g. fvdb-reality-capture) — consume
 `result.selected` / `result.label_ids` directly or persist `to_ply_*` / `to_report`.

@@ -159,7 +159,7 @@ class _VizEngine(GeoLangSplatEngine):
 
     def _show(self, sel: torch.Tensor) -> None:
         """Show the full scene with ``sel`` Gaussians tinted (everything stays)."""
-        from fvdb import GaussianSplat3d
+        from fvdb_reality_capture import GaussianSplat3d
 
         cfg = self.cfg
         sh0 = self.model.sh0.detach().clone()
@@ -184,7 +184,7 @@ class _VizEngine(GeoLangSplatEngine):
 
     def _show_labels(self, labels: torch.Tensor) -> None:
         """Recolour the full scene by object id -- each instance gets its own colour."""
-        from fvdb import GaussianSplat3d
+        from fvdb_reality_capture import GaussianSplat3d
 
         cfg = self.cfg
         sh0 = self.model.sh0.detach().clone()
@@ -215,7 +215,7 @@ class _VizEngine(GeoLangSplatEngine):
         tight on the object so it's easy to orbit/zoom -- otherwise the camera stays
         parked at the whole-scene distance and the cutout looks tiny and far.
         """
-        from fvdb import GaussianSplat3d
+        from fvdb_reality_capture import GaussianSplat3d
 
         m = mask.to(self.device)
         if int(m.sum()) == 0:

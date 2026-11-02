@@ -74,32 +74,25 @@ def resolve_device(requested) -> torch.device:
 def _load_model(model_or_path, device) -> tuple[object, dict]:
     """Load a splat and its metadata. Returns ``(model, metadata)``.
 
-    Prefers ``fvdb_reality_capture``'s loader so ``.ply`` AND training checkpoints
-    (``.pt``/``.pth``) work and metadata round-trips; falls back to a plain
-    ``GaussianSplat3d.from_ply`` when frc is not importable.
+    Paths go through ``fvdb_reality_capture``'s loader, so ``.ply`` files and
+    training checkpoints (``.pt``/``.pth``) both work and metadata round-trips.
+    A ``(model, metadata)`` tuple, as returned by ``GaussianSplat3d.from_ply``,
+    is accepted as-is.
     """
+    if isinstance(model_or_path, tuple):
+        if len(model_or_path) != 2 or not isinstance(model_or_path[1], dict):
+            raise TypeError("expected a GaussianSplat3d, a path, or a (GaussianSplat3d, metadata) tuple")
+        return model_or_path
     if not (isinstance(model_or_path, (str, bytes)) or hasattr(model_or_path, "__fspath__")):
-        return model_or_path, {}  # already a GaussianSplat3d
+        return model_or_path, {}
 
     path = pathlib.Path(str(model_or_path))
     if not path.exists():
         raise GeoLangSplatError(f"no such model file: {path}")
 
-    try:  # reuse frc's IO so `frgs segment` behaves identically (ply + checkpoints)
-        from fvdb_reality_capture.cli.frgs._common import load_splats_from_file
+    from fvdb_reality_capture.radiance_fields import load_splats_from_file
 
-        return load_splats_from_file(path, device)
-    except GeoLangSplatError:
-        raise
-    except Exception:
-        from fvdb import GaussianSplat3d
-
-        gs = GaussianSplat3d.from_ply(str(path), device=device)
-        if isinstance(gs, tuple):
-            model = gs[0]
-            meta = gs[1] if len(gs) > 1 and isinstance(gs[1], dict) else {}
-            return model, meta
-        return gs, {}
+    return load_splats_from_file(path, device)
 
 
 class GeoLangSplatEngine:

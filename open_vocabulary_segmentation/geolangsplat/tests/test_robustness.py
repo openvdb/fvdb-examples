@@ -97,3 +97,14 @@ def test_writer_falls_back_when_metadata_rejected(monkeypatch, fake_model, tmp_p
     p = tmp_path / "o.ply"
     out.write_ply_segmented(fake_model, sel, p, metadata={"nested": {"x": 1}})
     assert p.exists()  # written despite metadata rejection
+
+
+def test_load_model_accepts_from_ply_tuple():
+    sentinel = object()
+    meta = {"k": 1}
+    assert _load_model((sentinel, meta), torch.device("cpu")) == (sentinel, meta)
+
+
+def test_load_model_rejects_malformed_tuple():
+    with pytest.raises(TypeError):
+        _load_model((object(),), torch.device("cpu"))
