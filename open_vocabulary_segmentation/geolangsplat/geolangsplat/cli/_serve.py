@@ -9,6 +9,7 @@ the warm engine and answers instantly). This is the "engine" way to use
 GeoLangSplat: ``gls serve`` -> ``gls segment`` (many times) -> ``gls stop``. The
 engine auto-stops after ``--keep-alive`` idle minutes so it never lingers.
 """
+
 from __future__ import annotations
 
 import atexit

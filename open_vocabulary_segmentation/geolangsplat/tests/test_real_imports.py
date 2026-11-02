@@ -6,6 +6,7 @@
 The rest of the suite mocks fVDB, so it cannot catch API moves. These tests skip
 when fvdb-reality-capture is not installed.
 """
+
 import importlib
 import pathlib
 import pkgutil

@@ -3,6 +3,7 @@
 #
 """Typed errors so the CLI can print a clean, actionable message (no traceback)
 for the failures users actually hit: no GPU, missing SAM3 weights, bad inputs."""
+
 from __future__ import annotations
 
 

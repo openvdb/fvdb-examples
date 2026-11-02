@@ -15,6 +15,7 @@ So there are two ways to use GeoLangSplat: one-shot ``gls segment`` (above), or
 ``gls stop`` to free it. Fine-grained tuning beyond ``--select`` lives in the
 Python API.
 """
+
 from __future__ import annotations
 
 import pathlib

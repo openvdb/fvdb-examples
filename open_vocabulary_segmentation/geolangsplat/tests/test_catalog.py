@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """CPU tests for the multi-prompt segment catalog (clustering + dedup + table)."""
+
 from __future__ import annotations
 
 import importlib.util

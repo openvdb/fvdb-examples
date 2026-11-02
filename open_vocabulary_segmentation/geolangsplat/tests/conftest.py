@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Shared test fixtures: CPU-only fakes so the suite needs no GPU/SAM3/fVDB."""
+
 from __future__ import annotations
 
 import types

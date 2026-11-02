@@ -8,6 +8,7 @@ to a folder you can browse (``catalog.csv``) and pull single objects from
 (``objects/<id>_<label>.ply``) -- e.g. for import into a downstream tool. The
 notebook surface is :func:`geolangsplat.build_catalog` / ``engine.catalog``.
 """
+
 from __future__ import annotations
 
 import pathlib

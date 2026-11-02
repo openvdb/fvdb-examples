@@ -16,13 +16,13 @@ friendly result:
 The connected-components core (:func:`connected_components`) is pure tensor/numpy
 and runs on CPU; only the rendering helpers touch the GPU/fvdb.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-
 
 # --- connected components (pure, CPU-testable) -----------------------------
 

@@ -8,6 +8,7 @@ cache once, precomputes distractor scores, and then answers text queries cheaply
 (text encode + grounding decode + scatter). One engine serves aerial and
 satellite captures; only the recipe presets differ.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -23,7 +24,6 @@ from .errors import GeoLangSplatError
 from .sam3 import Sam3Scorer
 from .select import select_query, smooth_scores, spatial_cleanup
 from .views import generate_views
-
 
 _PERF_FLAGS_SET = False
 

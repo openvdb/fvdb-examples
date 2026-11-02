@@ -11,6 +11,7 @@ min-size knobs live, and Export all to dump per-object ``.ply``. Handy for eyeba
 curation -- the stable surface is `gls segment` / `gls catalog` and the `segment` &
 `build_catalog` APIs.
 """
+
 from __future__ import annotations
 
 import pathlib

@@ -10,6 +10,7 @@ encode, cache read/restore). The overhead (a couple of syncs per major step) is
 negligible next to the steps themselves, so it stays on by default -- the whole
 point of this exercise is to know where the seconds go.
 """
+
 from __future__ import annotations
 
 import time

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """`gls bake` - fixed-vocabulary multi-class labelling of every Gaussian."""
+
 from __future__ import annotations
 
 import pathlib

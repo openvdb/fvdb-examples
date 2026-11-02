@@ -13,6 +13,7 @@ Two ways to get the 2D views that SAM3 segments and that we back-project from:
 Both produce a list of :class:`View` (image + camera), which the lift consumes
 identically, so everything downstream is view-source agnostic.
 """
+
 from __future__ import annotations
 
 import math

@@ -8,6 +8,7 @@ on this machine (handy when you forgot what's running -- see `gls status`).
 Shutdown is guaranteed: polite IPC first, then SIGTERM/SIGKILL, then the socket
 and pidfile are cleaned up either way.
 """
+
 from __future__ import annotations
 
 import pathlib

@@ -8,6 +8,7 @@ as `frgs show`. Our `segment`/`bake` outputs are standard splats, so the overlay
 tint / recolouring shows up directly -- handy for confirming a query worked.
 For LIVE prompt-by-prompt exploration use `geolangsplat.viewer.run_viewer` instead.
 """
+
 from __future__ import annotations
 
 import pathlib

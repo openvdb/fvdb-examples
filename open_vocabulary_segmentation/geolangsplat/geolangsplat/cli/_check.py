@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """`gls check` - scene-readiness smoke test (no SAM3 weights required)."""
+
 from __future__ import annotations
 
 import pathlib

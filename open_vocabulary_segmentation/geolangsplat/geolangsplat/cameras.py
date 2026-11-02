@@ -15,6 +15,7 @@ Conventions
   +Y down, +Z forward), which is what ``project`` and
   ``GaussianSplat3d.render_*`` expect.
 """
+
 from __future__ import annotations
 
 import numpy as np

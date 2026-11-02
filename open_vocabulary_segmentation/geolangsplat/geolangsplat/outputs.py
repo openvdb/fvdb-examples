@@ -7,6 +7,7 @@ per-Gaussian reports (``.csv`` / ``.npz``).
 All per-Gaussian arrays stay in the input ``.ply`` order so a consumer (e.g. a
 co-worker holding the same ``.ply``) can index directly by row.
 """
+
 from __future__ import annotations
 
 import json

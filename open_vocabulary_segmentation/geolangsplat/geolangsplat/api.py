@@ -8,6 +8,7 @@ selection; with several prompts it returns a multi-class labelling (argmax with
 confidence/ambiguity gates). Results carry helpers to write the segmented ``.ply``,
 a highlight-overlay ``.ply``, or a per-Gaussian report.
 """
+
 from __future__ import annotations
 
 import copy

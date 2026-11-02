@@ -8,6 +8,7 @@ A single :class:`GeoLangSplatConfig` drives both aerial and satellite captures.
 type; :func:`apply_recipe` only fills fields the caller did not set, so an explicitly
 set value always wins over the preset.
 """
+
 from __future__ import annotations
 
 import difflib

@@ -7,6 +7,7 @@ These exercise ``Sam3Scorer``'s head-fusion helpers on synthetic grounding outpu
 so they run on CPU without loading SAM3 weights: we bypass ``__init__`` and set only
 the attributes the fusion path reads.
 """
+
 from types import SimpleNamespace
 
 import torch

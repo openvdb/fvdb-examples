@@ -3,6 +3,7 @@
 #
 """Robustness/edge-case tests: device resolution, missing weights, metadata
 round-trip, amp fallback. All CPU-only (no GPU/SAM3/fvdb needed)."""
+
 from __future__ import annotations
 
 import pytest
@@ -12,7 +13,6 @@ import geolangsplat.outputs as out
 from geolangsplat.engine import _load_model, resolve_device
 from geolangsplat.errors import GeoLangSplatError
 from geolangsplat.sam3 import Sam3Scorer, _resolve_amp_dtype
-
 
 # -- device resolution ------------------------------------------------------
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Shared CLI helpers."""
+
 from __future__ import annotations
 
 import pathlib

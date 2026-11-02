@@ -7,6 +7,7 @@ Like ``docker ps`` / ``ollama ps``: a quick answer to "is anything still loaded,
 and how do I stop it?" so a background engine is never a mystery. One-shot
 ``gls segment`` keeps no state, so if nothing shows here, nothing is running.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -19,6 +19,7 @@ Typical use::
                      out_path="house.ply")
     print(result.num_selected)
 """
+
 from __future__ import annotations
 
 import time as _time

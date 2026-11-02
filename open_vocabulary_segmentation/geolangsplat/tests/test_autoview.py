@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Geometry-driven view planning + up-axis estimation (CPU-only, no SAM3/GPU)."""
+
 from __future__ import annotations
 
 import numpy as np

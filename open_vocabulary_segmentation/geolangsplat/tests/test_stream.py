@@ -7,6 +7,7 @@ Two properties matter: (1) streaming the whole view set produces the SAME per-Ga
 scores as the cached path (it's the same math, just evicted per view), and (2) the
 early-stop fires once enough angularly-diverse views agree.
 """
+
 import numpy as np
 import torch
 from PIL import Image

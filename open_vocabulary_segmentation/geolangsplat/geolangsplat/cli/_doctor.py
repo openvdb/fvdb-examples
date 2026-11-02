@@ -8,6 +8,7 @@ fvdb-reality-capture, SAM3, the SAM3 checkpoint, bf16 support -- and prints
 actionable hints for whatever is missing, instead of failing deep inside a build. (SAM3 weights + a working CUDA
 stack are the usual pain when moving to a new box.)
 """
+
 from __future__ import annotations
 
 import importlib.util

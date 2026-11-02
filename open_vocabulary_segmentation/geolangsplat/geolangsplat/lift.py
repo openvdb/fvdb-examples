@@ -14,6 +14,7 @@ back-projection look splatty).
 A legacy depth-band lift (single visible Gaussian per pixel + multi-view
 consensus) is also provided for the rendered-orbit path.
 """
+
 from __future__ import annotations
 
 import math

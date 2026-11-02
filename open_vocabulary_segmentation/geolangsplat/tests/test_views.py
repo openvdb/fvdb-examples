@@ -8,6 +8,7 @@ a ``normalization_transform``, so its cameras live in a normalized frame while t
 COLMAP poses live in the original (e.g. UTM) frame. We must match each metadata
 camera to its source photo *through* that transform.
 """
+
 import numpy as np
 import pytest
 import torch

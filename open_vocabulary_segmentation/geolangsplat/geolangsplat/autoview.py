@@ -15,6 +15,7 @@ selection defaults, and :func:`apply_auto_view_config` fills them into a config
 This is deterministic, so ``gls check`` and ``gls segment`` derive the *same*
 config from a scene -- check just shows you what segment will do.
 """
+
 from __future__ import annotations
 
 import math

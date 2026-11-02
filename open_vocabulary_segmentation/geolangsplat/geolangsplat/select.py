@@ -7,6 +7,7 @@
 * :func:`spatial_cleanup` - voxel cull of isolated selected Gaussians (floaters).
 * :func:`assign_labels` - multi-class argmax with confidence/ambiguity/weight gates.
 """
+
 from __future__ import annotations
 
 import torch

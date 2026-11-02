@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """End-to-end API tests using an injected fake engine (no GPU/SAM3/fVDB)."""
+
 from __future__ import annotations
 
 import torch

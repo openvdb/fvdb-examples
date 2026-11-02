@@ -8,6 +8,7 @@ SAM3 is mixed precision and must run under autocast. The class is duck-typed so
 tests can substitute a lightweight stand-in (anything exposing ``encode`` and
 ``scoremap``); see ``tests/conftest.py``.
 """
+
 from __future__ import annotations
 
 import contextlib

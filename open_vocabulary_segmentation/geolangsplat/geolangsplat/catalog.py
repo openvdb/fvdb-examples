@@ -21,6 +21,7 @@ exist; only ``.ply`` extraction / rendering touches the splat tensors.
     cat.extract(3, "obj3.ply")     # pull one object out as a .ply
     cat.export_all("scene_catalog/")  # a folder of per-object .ply + catalog.csv
 """
+
 from __future__ import annotations
 
 import json

@@ -9,6 +9,7 @@ travelling, where the interactive `fvdb.viz` viewer isn't reachable. The up axis
 estimated from the scene's ground plane (same as the rest of the pipeline), so the
 montage comes out upright on object/COLMAP scenes too.
 """
+
 from __future__ import annotations
 
 import pathlib

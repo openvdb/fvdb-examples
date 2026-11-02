@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """CPU tests for the instance split (connected components + result API)."""
+
 from __future__ import annotations
 
 import numpy as np

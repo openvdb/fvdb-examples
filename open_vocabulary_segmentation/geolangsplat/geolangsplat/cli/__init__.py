@@ -7,6 +7,7 @@
 shared ``BaseCommand`` so they can be registered directly inside ``frgs`` later
 (e.g. as ``frgs segment "house"``).
 """
+
 from __future__ import annotations
 
 import sys

@@ -8,6 +8,7 @@ Backs the warm-engine daemon: ``gls serve`` holds the caches in one process, and
 optimization -- the daemon is a thin wrapper around the same stateless
 :func:`geolangsplat.api.segment`, so nothing about the public API depends on it.
 """
+
 from __future__ import annotations
 
 import glob

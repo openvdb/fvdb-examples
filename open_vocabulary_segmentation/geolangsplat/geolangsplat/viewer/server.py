@@ -15,6 +15,7 @@ The flow is one word at a time:
 An optional visual companion for eyeballing and curation; the stable surface is the
 ``segment`` / ``build_catalog`` APIs and the ``gls`` CLI.
 """
+
 from __future__ import annotations
 
 import json
