@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Local query/segmentation outputs and large data artifacts (never commit splats)
+*.ply
+*.npz
+*.csv
+*.png
+*.zip
+*.glscache
+outputs/
+runs/
+
+# ...but do ship the README example figures
+!examples/
+!examples/*.png
+
+# Local benchmark / evaluation run directories
+eval_out/
+fast_bench/
+id_bench/
+robust_out/
+routed_bench/
+frgs_logs/
+
+# Local design notes (not shipped)
+ARCHITECTURE.md
+SLIDES.md
+INTEGRATION.md
+BENCHMARKS.md
+
+# Deferred identity field (seed/click grouping) -- lands in a later change
+geolangsplat/identity.py
+tests/test_identity.py
+
+# Local benchmark / evaluation code and scripts (not part of this example)
+geolangsplat/eval/
+scripts/bench_inference.py
+scripts/bench_fast_query.py
+scripts/bench_identity.py
+scripts/bench_robustness.py
+scripts/bench_scenes_aerial_sat.json
+scripts/eval_scenes.py
+scripts/eval_benchmark.py
+scripts/run_lerf_eval.sh
+scripts/try_instances.py
+scripts/safety_park_demo.sh
+tests/test_eval_align.py
+tests/test_eval_lerf_ovs.py
+tests/test_eval_metrics.py
