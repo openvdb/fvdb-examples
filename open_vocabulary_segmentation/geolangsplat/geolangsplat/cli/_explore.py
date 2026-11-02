@@ -39,15 +39,6 @@ class Explore(BaseCommand):
     # Path to the input Gaussian splat .ply.
     model_path: tyro.conf.Positional[pathlib.Path]
 
-    # UI backend: catalog (GLS instance catalog) | refimg (REF_IMG open-vocab heatmap
-    # with live gate sliders). refimg builds a teacher bake + reference-photo prototypes
-    # at startup and imports the dev-tree field builder (see --backend-root).
-    backend: Annotated[str, arg(aliases=["-b"])] = "catalog"
-
-    # Root dir holding query_field.py / render_queries.py / distill_field.py (for
-    # --backend refimg). Defaults to $GLS_QUERY_ROOT or the current working directory.
-    backend_root: Optional[str] = None
-
     # Capture-type preset: auto (default) | satellite | satellite_dense | aerial.
     recipe: Annotated[Optional[RecipeName], arg(aliases=["-r"])] = None
 
@@ -85,19 +76,14 @@ class Explore(BaseCommand):
     vk_device_id: int = 0
 
     def execute(self) -> None:
-        import os
-
+        from ..config import apply_recipe
         from ..viewer import run_viewer
 
         if not self.model_path.exists():
             print(f"[explore] no such file: {self.model_path}", flush=True)
             return
 
-        if self.backend_root:
-            os.environ["GLS_QUERY_ROOT"] = self.backend_root
-
         cfg = build_config(
-            recipe=resolve_recipe(self.recipe, self.view_source),
             sfm=self.sfm or None,
             view_source=self.view_source,
             max_views=self.max_views,
@@ -110,6 +96,5 @@ class Explore(BaseCommand):
             web_port=self.web_port,
             vk_device_id=self.vk_device_id,
         )
-        # recipe already folded into cfg (recipe-first); pass recipe=None so run_viewer
-        # does not re-apply it and clobber the explicit --view-source override.
-        run_viewer(str(self.model_path), config=cfg, recipe=None, backend=self.backend)
+        apply_recipe(cfg, resolve_recipe(self.recipe, self.view_source))
+        run_viewer(str(self.model_path), config=cfg)

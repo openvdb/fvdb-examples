@@ -110,3 +110,20 @@ def test_doctor_render_explore_parse():
     assert type(tyro.cli(_UNION, args=["doctor"])).__name__ == "Doctor"
     assert type(tyro.cli(_UNION, args=["render", "m.ply", "-o", "x.png"])).__name__ == "Render"
     assert type(tyro.cli(_UNION, args=["explore", "m.ply"])).__name__ == "Explore"
+
+
+def test_explore_builds_config_and_applies_recipe(monkeypatch, tmp_path):
+    import geolangsplat.viewer as viewer
+    from geolangsplat.cli._explore import Explore
+
+    seen = {}
+    monkeypatch.setattr(viewer, "run_viewer", lambda path, config=None, recipe=None: seen.update(cfg=config))
+    model = tmp_path / "m.ply"
+    model.write_text("")
+
+    Explore(model_path=model, recipe="aerial", view_source="render", web_port=9001).execute()
+
+    cfg = seen["cfg"]
+    assert cfg.view_source == "render"  # explicit flag beats the aerial preset
+    assert cfg.n_views == 90  # filled by the aerial preset
+    assert cfg.web_port == 9001
