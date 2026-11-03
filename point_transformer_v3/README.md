@@ -1,6 +1,6 @@
 # Point Transformer V3 (PT-v3) - FVDB Implementation
 
-This repository contains a minimal implementation of Point Transformer V3 using the FVDB library for scalable 3D point cloud processing.
+This example trains and runs Point Transformer V3 with `fvdb.nn.PointTransformerV3` from fVDB, through Pointcept.
 
 ## Setup
 
@@ -40,8 +40,8 @@ python scripts/test/compute_difference.py --stats_path_1 data/scannet_samples_sm
 
 ## Project Structure
 
-- `fvdb_extensions/models/ptv3_fvdb.py` - Core FVDB implementation
-- `fvdb_extensions/models/point_transformer_v3m1_fvdb.py` - Pointcept framework adapter
+- `fvdb_extensions/models/point_transformer_v3m1_fvdb.py` - Pointcept backbone (`PT-v3fvdb`) wrapping `fvdb.nn.PointTransformerV3`
+- `fvdb_extensions/configs/` - Pointcept training configs for the fvdb backbone and the official PT-v3m1
 - `scripts/data/` - Data download and preprocessing scripts
 - `scripts/test/` - Inference and comparison scripts
 

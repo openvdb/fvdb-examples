@@ -22,102 +22,58 @@ from typing import Any
 import fvdb
 import numpy as np
 import torch
-from fvdb_extensions.models.fvdb_utils import NVTXRange
-from fvdb_extensions.models.ptv3_fvdb import PTV3
+import fvdb.nn as fvnn
 
 # Normal imports - no path manipulation needed when package is installed with pip install -e .
 
 
-def create_ptv3_model(args: argparse.Namespace, device: torch.device | str, num_classes: int) -> torch.nn.Module:
+# Model configurations for fvdb.nn.PointTransformerV3. Decoder lists run shallow to deep, as in Pointcept.
+# Every configuration uses a linear stem, layer norm and two serialization orders.
+_SMALL = dict(stride=(2, 2, 2), enc_depths=(2, 2, 2, 2), enc_channels=(32, 64, 128, 256))
+_SMALL_DEC = dict(dec_depths=(2, 2, 2), dec_channels=(32, 64, 128))
+_LARGE = dict(
+    stride=(2, 2, 2, 2),
+    enc_depths=(2, 2, 2, 6, 2),
+    enc_channels=(32, 64, 128, 256, 512),
+    enc_num_head=(2, 4, 8, 16, 32),
+    dec_depths=(2, 2, 2, 2),
+    dec_channels=(64, 64, 128, 256),
+    dec_num_head=(4, 4, 8, 16),
+)
+MODEL_MODES: dict[str, dict[str, Any]] = {
+    "enc": dict(_SMALL, enc_num_head=(1, 1, 1, 1), cls_mode=True, proj_drop=0.1),
+    "encdec": dict(_SMALL, **_SMALL_DEC, enc_num_head=(1, 1, 1, 1), dec_num_head=(1, 1, 1), proj_drop=0.1),
+    "enc_multihead": dict(_SMALL, enc_num_head=(1, 2, 4, 8), cls_mode=True, proj_drop=0.1),
+    "encdec_multihead": dict(_SMALL, **_SMALL_DEC, enc_num_head=(1, 2, 4, 8), dec_num_head=(1, 2, 4), proj_drop=0.1),
+    "encdec_multihead_large": dict(_LARGE, proj_drop=0.1),
+    "encdec_multihead_large_new_kmap": dict(_LARGE, proj_drop=0.1),
+    "encdec_multihead_large_droppath": dict(
+        _LARGE, proj_drop=0.0, drop_path=0.3, order=("z", "z-trans", "hilbert", "hilbert-trans")
+    ),
+}
+
+
+def create_ptv3_model(args: argparse.Namespace, device: torch.device | str) -> fvnn.PointTransformerV3:
     """Create a PT-v3 model.
 
     Args:
         args: Arguments object containing model configuration.
         device: Device to place the model on.
-        num_classes: Number of semantic classes.
 
     Returns:
-        A PTV3 model instance.
+        A :class:`fvdb.nn.PointTransformerV3` instance.
     """
-    if args.model_mode == "enc":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 2),
-            enc_channels=(32, 64, 128, 256),
-            enc_num_heads=(1, 1, 1, 1),
-            patch_size=args.patch_size,
-            proj_drop=0.1,
-        ).to(device)
-    elif args.model_mode == "encdec":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 2),
-            enc_channels=(32, 64, 128, 256),
-            enc_num_heads=(1, 1, 1, 1),
-            dec_depths=(2, 2, 2),
-            dec_channels=(128, 64, 32),
-            dec_num_heads=(1, 1, 1),
-            patch_size=args.patch_size,
-            proj_drop=0.1,
-        ).to(device)
-    elif args.model_mode == "enc_multihead":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 2),
-            enc_channels=(32, 64, 128, 256),
-            enc_num_heads=(1, 2, 4, 8),
-            patch_size=args.patch_size,
-            proj_drop=0.1,
-        ).to(device)
-    elif args.model_mode == "encdec_multihead":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 2),
-            enc_channels=(32, 64, 128, 256),
-            enc_num_heads=(1, 2, 4, 8),
-            dec_depths=(2, 2, 2),
-            dec_channels=(128, 64, 32),
-            dec_num_heads=(4, 2, 1),
-            patch_size=args.patch_size,
-            proj_drop=0.1,
-        ).to(device)
-    elif args.model_mode == "encdec_multihead_large" or args.model_mode == "encdec_multihead_large_new_kmap":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 6, 2),
-            enc_channels=(32, 64, 128, 256, 512),
-            enc_num_heads=(2, 4, 8, 16, 32),
-            # enc_num_heads=(1,1,1,1,1), # Raise an error: "RuntimeError: FlashAttention forward only supports head dimension at most 256"
-            dec_depths=(2, 2, 2, 2),
-            dec_channels=(256, 128, 64, 64),
-            dec_num_heads=(16, 8, 4, 4),
-            # dec_num_heads=(1,1,1,1),
-            patch_size=args.patch_size,
-            proj_drop=0.1,
-        ).to(device)
-    elif args.model_mode == "encdec_multihead_large_droppath":
-        model = PTV3(
-            num_classes=num_classes,
-            input_dim=6,  # xyz + rgb color
-            enc_depths=(2, 2, 2, 6, 2),
-            enc_channels=(32, 64, 128, 256, 512),
-            enc_num_heads=(2, 4, 8, 16, 32),
-            dec_depths=(2, 2, 2, 2),
-            dec_channels=(256, 128, 64, 64),
-            dec_num_heads=(16, 8, 4, 4),
-            patch_size=args.patch_size,
-            proj_drop=0.0,
-            drop_path=0.3,
-            order_type=("z", "z-trans", "hilbert", "hilbert-trans"),
-            # no_conv_in_cpe=True,
-            # embedding_mode="linear",
-        ).to(device)
-    return model
+    config = dict(
+        in_channels=6,  # ijk + rgb color
+        order=("z", "z-trans"),
+        embedding_mode="linear",
+        norm="layer",
+        drop_path=0.3,
+        enc_patch_size=args.patch_size,
+        dec_patch_size=args.patch_size,
+    )
+    config.update(MODEL_MODES[args.model_mode])
+    return fvnn.PointTransformerV3(**config).to(device)
 
 
 def prepare_batched_inputs_from_scannet_points(
@@ -166,7 +122,11 @@ def main():
     parser.add_argument("--patch-size", type=int, default=1024, help="Maximum points per sample")
     parser.add_argument("--batch-size", type=int, default=1, help="Number of samples per forward pass")
     parser.add_argument(
-        "--model-mode", type=str, default="encdec_multihead_large_droppath", help="The model configuration to choose."
+        "--model-mode",
+        type=str,
+        default="encdec_multihead_large_droppath",
+        choices=sorted(MODEL_MODES),
+        help="The model configuration to choose.",
     )
     args = parser.parse_args()
 
@@ -191,11 +151,9 @@ def main():
 
     scannet_data = json.load(open(args.data_path, "r"))
 
-    # Model parameters
-    num_classes = 20  # Number of semantic classes
     # Initialize PT-v3 model
     logger.info("Initializing PT-v3 model...")
-    model = create_ptv3_model(args, device, num_classes)
+    model = create_ptv3_model(args, device)
 
     # Initialize model with random weights. Print the name of the parameter. And the last few elements of the parameter flattened.
     with torch.no_grad():
@@ -228,12 +186,12 @@ def main():
 
         # Run inference
         logger.info("Running batched inference...")
-        with NVTXRange("inference"):
-            with NVTXRange("create_batched_grid_from_points"):
+        with torch.cuda.nvtx.range("inference"):
+            with torch.cuda.nvtx.range("create_batched_grid_from_points"):
                 init_feat, init_grid = prepare_batched_inputs_from_scannet_points(
                     batch, voxel_size=args.voxel_size, device=device
                 )
-            feats = model(init_feat, init_grid)
+            feats, _ = model(init_feat, init_grid)
 
         # Compute per-sample forward stats by splitting with offsets
         offsets = feats.joffsets.to(device=feats.jdata.device, dtype=torch.int64)
@@ -263,7 +221,7 @@ def main():
 
         # Test backward path - compute accumulated gradients for the entire batch
         logger.info("Testing backward path...")
-        with NVTXRange("backward"):
+        with torch.cuda.nvtx.range("backward"):
             batch_loss = feats.jdata.sum()  # Total loss for the entire batch
             batch_loss.backward()
 

@@ -1,7 +1,5 @@
-# # fvdb requirements
---extra-index-url https://download.pytorch.org/whl/cu129
---extra-index-url https://d36m13axqqhiit.cloudfront.net/simple
-fvdb-core==0.3.0+pt28.cu129
+# fvdb requirements: a fvdb-core release with fvdb.nn.PointTransformerV3 (openvdb/fvdb-core#808, #809)
+# and PyTorch >= 2.11, whose varlen_attn provides patch attention. Install fvdb-core separately.
 
 # Core dependencies for PT-v3 FVDB implementation
 timm
@@ -13,14 +11,10 @@ tensorboard
 tensorboardx
 yapf
 
-# flash-attn is only needed when patch_size > 0 (default config uses patch_size=1024)
-# While PyTorch 2.8+ has built-in flash attention, flash-attn provides optimized varlen functions
-# that are faster for variable-length sequences. The build is slow but worth it for performance.
-#
-# If pip install freezes or is very slow, try installing separately with:
-#   MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
-# Or check for pre-built wheels at: https://github.com/Dao-AILab/flash-attention/releases
-flash-attn==2.7.4.post1
+# The fvdb model itself needs neither flash-attn nor spconv. Pointcept imports spconv when its model
+# registry loads, so spconv is still required (below). flash-attn is needed only to run Pointcept's
+# official PT-v3m1 for comparison:
+#   MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 # Pointcept framework dependencies (only needed when using point_transformer_v3m1_fvdb.py)
 # Install from PyG wheels for PyTorch 2.8.0 + CUDA 12.9
